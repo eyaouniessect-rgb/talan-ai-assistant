@@ -1,0 +1,1 @@
+# Tests de l'Agent CRM (get_my_projects, generate_report).

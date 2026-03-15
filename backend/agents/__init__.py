@@ -1,0 +1,1 @@
+# Package des agents A2A — chaque agent est un serveur FastAPI indépendant

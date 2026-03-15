@@ -1,0 +1,1 @@
+# Client MCP Atlassian pour l'API Jira.

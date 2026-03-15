@@ -1,0 +1,1 @@
+# Serveur FastAPI de l'Agent CRM (même structure que Agent RH).

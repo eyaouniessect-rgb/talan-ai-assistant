@@ -1,0 +1,1 @@
+# Tests de l'Agent RH (create_leave, get_leaves, multi-hop vers Calendar+Slack).

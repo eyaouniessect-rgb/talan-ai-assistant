@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  body { 
+    @apply bg-slate-50 text-slate-800 font-sans;
+    font-feature-settings: 'ss01','ss02';
+  }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-slate-300 rounded-full; }
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-navy text-white font-medium px-5 py-2.5 rounded-xl 
+           hover:bg-navy-light transition-all duration-200 
+           active:scale-95 shadow-sm;
+  }
+  .btn-secondary {
+    @apply bg-white text-navy border border-slate-200 font-medium px-5 py-2.5 
+           rounded-xl hover:bg-slate-50 transition-all duration-200 active:scale-95;
+  }
+  .btn-cyan {
+    @apply bg-cyan text-white font-medium px-5 py-2.5 rounded-xl 
+           hover:bg-cyan-dark transition-all duration-200 active:scale-95;
+  }
+  .card {
+    @apply bg-white rounded-2xl border border-slate-100 shadow-sm;
+  }
+  .input-field {
+    @apply w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 
+           text-sm outline-none focus:border-cyan focus:ring-2 
+           focus:ring-cyan/10 transition-all placeholder:text-slate-400;
+  }
+  .badge-consultant {
+    @apply bg-blue-50 text-blue-700 text-xs font-medium px-2.5 py-0.5 rounded-full;
+  }
+  .badge-pm {
+    @apply bg-purple-50 text-purple-700 text-xs font-medium px-2.5 py-0.5 rounded-full;
+  }
+  .sidebar-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium
+           text-slate-600 hover:bg-slate-100 hover:text-navy
+           transition-all duration-150 cursor-pointer;
+  }
+  .sidebar-item.active {
+    @apply bg-navy text-white hover:bg-navy-light;
+  }
+  .thinking-step {
+    @apply flex items-center gap-2 text-sm py-1;
+  }
+  .message-user {
+    @apply bg-navy text-white rounded-2xl rounded-br-sm px-4 py-3 max-w-lg ml-auto;
+  }
+  .message-assistant {
+    @apply bg-white border border-slate-100 rounded-2xl rounded-bl-sm px-4 py-3 max-w-2xl shadow-sm;
+  }
+}
+
+@keyframes fadeInUp {
+  from { opacity:0; transform:translateY(12px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+@keyframes pulse-dot {
+  0%,100% { opacity:1; } 50% { opacity:0.3; }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes slideIn {
+  from { opacity:0; transform:translateX(-8px); }
+  to   { opacity:1; transform:translateX(0); }
+}
+
+.fade-in-up { animation: fadeInUp 0.3s ease forwards; }
+.slide-in   { animation: slideIn 0.25s ease forwards; }
+
+.skeleton {
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  @apply rounded-lg;
+}
+
+.dot-loading span {
+  @apply inline-block w-1.5 h-1.5 bg-cyan rounded-full mx-0.5;
+  animation: pulse-dot 1.2s infinite;
+}
+.dot-loading span:nth-child(2) { animation-delay:0.2s; }
+.dot-loading span:nth-child(3) { animation-delay:0.4s; }
+
+.notification-dot {
+  @apply absolute -top-0.5 -right-0.5 w-2 h-2 bg-red-500 rounded-full;
+}

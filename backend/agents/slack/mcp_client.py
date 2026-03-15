@@ -1,0 +1,1 @@
+# Client MCP Slack (Bot Token via MCP Server).

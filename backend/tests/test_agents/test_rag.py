@@ -1,0 +1,1 @@
+# Tests du module RAG (indexation, recherche, qualité des réponses).

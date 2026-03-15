@@ -1,0 +1,1 @@
+# Tests unitaires pour le RBAC (permissions par rôle).

@@ -1,0 +1,1 @@
+# Client MCP PostgreSQL pour le schéma `crm`.

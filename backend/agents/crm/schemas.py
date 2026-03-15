@@ -1,0 +1,1 @@
+# Schémas Pydantic CRM : ProjectResponse, ClientReportRequest.
