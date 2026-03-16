@@ -71,7 +71,8 @@ function TypingIndicator() {
 export default function Chat() {
   const [input, setInput] = useState('')
   const user = useAuthStore(s => s.user)
-  const { conversations, activeId, isTyping, setActive, newConversation, sendMessage } = useChatStore()
+  const { conversations, activeId, isTyping, setActive,
+        newConversation, sendMessage, loadConversations } = useChatStore()
   const bottomRef = useRef()
   const inputRef = useRef()
   const isPM = user?.role === 'pm'
@@ -87,11 +88,11 @@ export default function Chat() {
   console.log('isTyping:', isTyping)
   // ───────────────────────────────────────────────────────
 
+
+
+// ← charge les conversations depuis le backend au démarrage
 useEffect(() => {
-  const { conversations, activeId } = useChatStore.getState()
-  if (conversations.length === 0 || !activeId) {
-    newConversation()
-  }
+  loadConversations()
 }, [])
 
   useEffect(() => {

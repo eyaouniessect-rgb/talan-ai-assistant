@@ -1,7 +1,6 @@
-// src/store/index.js
 import { create } from 'zustand'
 import { loginApi } from '../api/auth'
-import { sendMessageApi } from '../api/chat'
+import { sendMessageApi, getConversationsApi, getMessagesApi } from '../api/chat'
 
 // ── Auth Store ────────────────────────────────────────────
 export const useAuthStore = create((set) => ({
@@ -55,39 +54,95 @@ export const useChatStore = create((set, get) => ({
   activeId: null,
   isTyping: false,
 
-  setActive: (id) => set({ activeId: id }),
+  // ── Charge les conversations depuis le backend ─────────
+  loadConversations: async () => {
+    try {
+      const data = await getConversationsApi()
+      const conversations = data.map(c => ({
+        id: c.id,
+        title: c.title,
+        date: new Date(c.created_at).toLocaleDateString('fr'),
+        agents: [],
+        messageCount: 0,
+        messages: [],        // ← vide au départ
+        loaded: false,       // ← messages pas encore chargés
+      }))
+      set({ conversations })
 
-  getActive: () => {
-    const { conversations, activeId } = get()
-    return conversations.find(c => c.id === activeId)
+      // Active la première conversation si elle existe
+      if (conversations.length > 0) {
+        set({ activeId: conversations[0].id })
+        await get().loadMessages(conversations[0].id)
+      }
+    } catch (error) {
+      console.error('Erreur chargement conversations:', error)
+    }
   },
 
-newConversation: () => {
-  const { conversations } = get()
-  // Ne crée pas si une conversation vide existe déjà
-  const hasEmpty = conversations.some(c => c.messages.length === 0)
-  if (hasEmpty) {
-    // Active la première conversation vide
-    const empty = conversations.find(c => c.messages.length === 0)
-    set({ activeId: empty.id })
-    return
+  // ── Charge les messages d'une conversation ─────────────
+loadMessages: async (conversationId) => {
+  try {
+    const data = await getMessagesApi(conversationId)
+    const messages = data.map(m => ({
+      role: m.role,
+      content: m.content,
+      time: new Date(m.timestamp).toLocaleTimeString('fr', {
+        hour: '2-digit', minute: '2-digit'
+      }),
+      // ← reconstruit les steps depuis intent + target_agent
+      steps: m.role === 'assistant' && m.intent ? [
+        { status: 'done', text: `Intention : ${m.intent}` },
+        { status: 'done', text: `Agent : ${m.target_agent}` },
+      ] : [],
+    }))
+    set(s => ({
+      conversations: s.conversations.map(c =>
+        c.id === conversationId
+          ? { ...c, messages, messageCount: messages.length, loaded: true }
+          : c
+      )
+    }))
+  } catch (error) {
+    console.error('Erreur chargement messages:', error)
   }
-  const id = Date.now()
-  set(s => ({
-    conversations: [{
-      id,
-      title: 'Nouvelle conversation',
-      date: 'Maintenant',
-      agents: [],
-      messageCount: 0,
-      messages: []
-    }, ...s.conversations],
-    activeId: id
-  }))
 },
 
+  // ── Change de conversation active ─────────────────────
+  setActive: async (id) => {
+    set({ activeId: id })
+    const conv = get().conversations.find(c => c.id === id)
+    // Charge les messages si pas encore chargés
+    if (conv && !conv.loaded) {
+      await get().loadMessages(id)
+    }
+  },
+
+  // ── Nouvelle conversation ──────────────────────────────
+  newConversation: () => {
+    const { conversations } = get()
+    const hasEmpty = conversations.some(c => c.messages.length === 0)
+    if (hasEmpty) {
+      const empty = conversations.find(c => c.messages.length === 0)
+      set({ activeId: empty.id })
+      return
+    }
+    const id = Date.now()
+    set(s => ({
+      conversations: [{
+        id,
+        title: 'Nouvelle conversation',
+        date: 'Maintenant',
+        agents: [],
+        messageCount: 0,
+        messages: [],
+        loaded: true,
+      }, ...s.conversations],
+      activeId: id
+    }))
+  },
+
+  // ── Envoie un message ──────────────────────────────────
   sendMessage: async (text) => {
-    // ← capture l'ID AVANT tout appel async
     const currentActiveId = get().activeId
 
     const userMsg = {
@@ -96,7 +151,6 @@ newConversation: () => {
       time: new Date().toLocaleTimeString('fr', { hour: '2-digit', minute: '2-digit' })
     }
 
-    // Ajoute le message utilisateur + active le typing
     set(s => ({
       conversations: s.conversations.map(c =>
         c.id === currentActiveId ? {
@@ -109,7 +163,7 @@ newConversation: () => {
     }))
 
     try {
-      const data = await sendMessageApi(text)
+      const data = await sendMessageApi(text, currentActiveId)
 
       const assistantMsg = {
         role: 'assistant',
@@ -121,16 +175,18 @@ newConversation: () => {
         ]
       }
 
-      // ← utilise currentActiveId partout
       set(s => ({
         conversations: s.conversations.map(c =>
           c.id === currentActiveId ? {
             ...c,
             messages: [...c.messages, assistantMsg],
             messageCount: c.messages.length + 1,
+            id: data.conversation_id,
+            loaded: true,
             agents: [...new Set([...c.agents, data.target_agent?.toUpperCase()])]
           } : c
         ),
+        activeId: data.conversation_id,
         isTyping: false
       }))
 

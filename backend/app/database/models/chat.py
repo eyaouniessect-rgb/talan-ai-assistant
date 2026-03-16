@@ -42,25 +42,12 @@ class Conversation(Base):
 class Message(Base):
     __tablename__ = "messages"
 
-    id = Column(Integer, primary_key=True)
+    id              = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
+    role            = Column(String)
+    content         = Column(Text)
+    intent          = Column(String, nullable=True)       # ← nouveau
+    target_agent    = Column(String, nullable=True)       # ← nouveau
+    timestamp       = Column(DateTime, server_default=func.now())
 
-    conversation_id = Column(
-        Integer,
-        ForeignKey("conversations.id"),
-        nullable=False
-    )
-
-    role = Column(String)  # user | assistant
-
-    content = Column(Text)
-
-    timestamp = Column(DateTime, server_default=func.now())
-
-    # ─────────────────────────
-    # Relations
-    # ─────────────────────────
-
-    conversation = relationship(
-        "Conversation",
-        back_populates="messages"
-    )
+    conversation = relationship("Conversation", back_populates="messages")
