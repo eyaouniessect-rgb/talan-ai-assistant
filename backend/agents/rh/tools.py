@@ -111,49 +111,45 @@ async def create_leave(user_id: int, start_date: str, end_date: str) -> dict:
         }
 
 
-async def get_my_leaves(user_id: int) -> dict:
+async def get_my_leaves(user_id: int, status_filter: str = None) -> dict:
     """
-    Retourne tous les congés d'un employé.
+    Retourne les congés d'un employé.
+    status_filter : "pending" | "approved" | "rejected" | None (tous)
     """
     async with AsyncSessionLocal() as db:
-        # Trouve l'employee
         result = await db.execute(
             select(Employee).where(Employee.user_id == user_id)
         )
         employee = result.scalar_one_or_none()
-
         if not employee:
-            return {"error": f"Employé introuvable pour user_id={user_id}"}
+            return {"error": "Employé introuvable"}
 
-        # Récupère les congés
-        result = await db.execute(
-            select(Leave).where(Leave.employee_id == employee.id)
-            .order_by(Leave.created_at.desc())
-        )
+        # ← filtre par status si spécifié
+        query = select(Leave).where(Leave.employee_id == employee.id)
+        if status_filter:
+            query = query.where(Leave.status == status_filter)
+        query = query.order_by(Leave.created_at.desc())
+
+        result = await db.execute(query)
         leaves = result.scalars().all()
 
         if not leaves:
-            return {
-                "success": True,
-                "leaves": [],
-                "message": "Vous n'avez aucun congé enregistré.",
-            }
-
-        leaves_list = [
-            {
-                "id": l.id,
-                "start_date": str(l.start_date),
-                "end_date": str(l.end_date),
-                "days_count": l.days_count,
-                "status": l.status,
-            }
-            for l in leaves
-        ]
+            msg = f"Aucun congé{' en attente' if status_filter == 'pending' else ''} trouvé."
+            return {"success": True, "leaves": [], "message": msg}
 
         return {
             "success": True,
-            "total": len(leaves_list),
-            "leaves": leaves_list,
+            "total": len(leaves),
+            "leaves": [
+                {
+                    "id": l.id,
+                    "start_date": str(l.start_date),
+                    "end_date": str(l.end_date),
+                    "days_count": l.days_count,
+                    "status": l.status,
+                }
+                for l in leaves
+            ],
         }
 
 

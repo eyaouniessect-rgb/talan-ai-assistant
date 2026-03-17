@@ -8,28 +8,18 @@
 #   - entities       : dict — entités extraites (dates, IDs, etc.)
 #   - is_authorized  : bool — résultat du Node 2 RBAC
 #   - final_response : str — réponse finale à streamer
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, Annotated
 from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 class AssistantState(TypedDict):
-    """
-    SHORT-TERM MEMORY — partagée entre les 3 nodes.
-    Réinitialisée à chaque nouvelle requête.
-    """
-    # Historique des messages de la conversation en cours
-    messages: List[BaseMessage]
+    # add_messages → ajoute au lieu d'écraser à chaque requête
+    messages: Annotated[list[BaseMessage], add_messages]
 
-    # Infos utilisateur (injectées par FastAPI)
     user_id: int
-    role: str              # consultant | pm
-
-    # Résultat du Node 1
-    intent: Optional[str]         # create_leave | get_projects | get_tickets...
-    target_agent: Optional[str]   # rh | crm | jira | slack | calendar | rag
-    entities: Optional[dict]      # ex: {"start_date": "2025-03-15", "end_date": "2025-03-21"}
-
-    # Résultat du Node 2
+    role: str
+    intent: Optional[str]
+    target_agent: Optional[str]
+    entities: Optional[dict]
     is_authorized: Optional[bool]
-
-    # Résultat du Node 3
     final_response: Optional[str]

@@ -10,18 +10,17 @@ from app.database.connection import AsyncSessionLocal
 
 async def node2_check_permission(state: AssistantState) -> AssistantState:
     """
-    Node 2 — Vérifie si le rôle de l'utilisateur
-    est autorisé à effectuer l'intention détectée.
-    Consulte la table `permissions` en base (RBAC).
-    Pas de LLM ici — logique purement déterministe.
+    Node 2 — Vérifie les permissions RBAC.
+    Pas de LLM — logique déterministe pure.
     """
     role   = state["role"]
     intent = state["intent"]
 
-    # Intentions toujours autorisées (pas besoin de vérifier)
-    if intent in ("unknown", "search_docs"):
+    # ── Intents toujours autorisés (pas de vérification) ──
+    if intent in ("unknown", "search_docs", "chat"):
         return {**state, "is_authorized": True}
 
+    # ── Vérifie en base pour les autres intents ───────────
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Permission).where(
