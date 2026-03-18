@@ -27,9 +27,12 @@ DB_URI = (
     f"?sslmode=disable"
 )
 
+# ── Instance globale — créée UNE SEULE FOIS ───────────
+assistant_graph = None
+
+
 def build_base_graph():
     graph = StateGraph(AssistantState)
-
     graph.add_node("node1_intent",   node1_detect_intent)
     graph.add_node("node2_rbac",     node2_check_permission)
     graph.add_node("node3_dispatch", node3_dispatch)
@@ -37,7 +40,6 @@ def build_base_graph():
         **state,
         "final_response": "Accès refusé — vous n'avez pas la permission."
     })
-
     graph.set_entry_point("node1_intent")
     graph.add_edge("node1_intent", "node2_rbac")
     graph.add_conditional_edges(
@@ -47,23 +49,29 @@ def build_base_graph():
     )
     graph.add_edge("node3_dispatch", END)
     graph.add_edge("blocked", END)
-
     return graph
 
 
-_base_graph = build_base_graph()
-
-
-async def get_graph():
+async def init_graph():
     """
-    Retourne le graphe compilé avec AsyncPostgresSaver.
-    Utilise psycopg async directement.
+    Initialise le graphe UNE SEULE FOIS au démarrage.
+    Appelé dans le lifespan de FastAPI.
     """
-    # connexion async psycopg avec autocommit
+    global assistant_graph
+    print("⚡ Initialisation du graphe LangGraph...")
+
     conn = await psycopg.AsyncConnection.connect(
-        DB_URI,
-        autocommit=True
+        DB_URI, autocommit=True
     )
     checkpointer = AsyncPostgresSaver(conn)
     await checkpointer.setup()
-    return _base_graph.compile(checkpointer=checkpointer)
+
+    assistant_graph = build_base_graph().compile(
+        checkpointer=checkpointer
+    )
+    print("✅ Graphe prêt.")
+
+
+def get_graph():
+    """Retourne l'instance globale du graphe."""
+    return assistant_graph

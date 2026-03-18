@@ -2,10 +2,10 @@
 # POST /chat           → reçoit message + user_id + role → envoie à l'orchestrateur LangGraph
 # GET  /chat/stream    → SSE endpoint → streame la réponse token par token vers le frontend React
 
-
 # app/api/chat.py
-from typing import Optional
-from fastapi import APIRouter, Depends
+from typing import Optional, List
+import json
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -18,15 +18,24 @@ from app.database.models.chat import Conversation, Message
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
+
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[int] = None
+
+
+class ReActStep(BaseModel):
+    status: str  # done | loading
+    text: str
+
 
 class ChatResponse(BaseModel):
     response: str
     intent: str
     target_agent: str
     conversation_id: int
+    steps: List[ReActStep] = []
+
 
 @router.post("/", response_model=ChatResponse)
 async def chat(
@@ -60,8 +69,10 @@ async def chat(
     # ── 2. thread_id = conversation.id ────────────────────
     thread_id = str(conversation.id)
 
-    # ── 3. Appelle LangGraph avec checkpointer async ──────
-    graph = await get_graph()
+    # ── 3. Appelle LangGraph ──────────────────────────────
+    graph = get_graph()
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Graph not initialized")
 
     initial_state = {
         "messages":       [HumanMessage(content=request.message)],
@@ -77,7 +88,23 @@ async def chat(
     config = {"configurable": {"thread_id": thread_id}}
     result = await graph.ainvoke(initial_state, config)
 
-    # ── 4. Sauvegarde dans tes tables ─────────────────────
+    # ── 4. Parse la réponse — Agent RH retourne JSON ──────
+    raw_response = result["final_response"]
+    react_steps = []
+
+    try:
+        # Agent RH (ReAct) retourne un JSON avec response + react_steps
+        parsed = json.loads(raw_response)
+        final_text = parsed.get("response", raw_response)
+        react_steps = [
+            ReActStep(status="done", text=step)
+            for step in parsed.get("react_steps", [])
+        ]
+    except (json.JSONDecodeError, TypeError):
+        # Autres agents retournent du texte simple
+        final_text = raw_response
+
+    # ── 5. Sauvegarde dans tes tables ─────────────────────
     db.add(Message(
         conversation_id=conversation.id,
         role="user",
@@ -86,7 +113,7 @@ async def chat(
     db.add(Message(
         conversation_id=conversation.id,
         role="assistant",
-        content=result["final_response"],
+        content=final_text,
         intent=result["intent"],
         target_agent=result["target_agent"],
     ))
@@ -94,10 +121,11 @@ async def chat(
     await db.commit()
 
     return ChatResponse(
-        response=result["final_response"],
+        response=final_text,
         intent=result["intent"],
         target_agent=result["target_agent"],
         conversation_id=conversation.id,
+        steps=react_steps,
     )
 
 
@@ -141,4 +169,3 @@ async def get_messages(
         }
         for m in messages
     ]
-    

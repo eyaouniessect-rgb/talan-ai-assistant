@@ -29,6 +29,7 @@ Analyse le message utilisateur et retourne UNIQUEMENT un JSON valide.
 
 Intentions possibles :
 - create_leave        → agent: rh
+- check_leave_balance     → agent: rh
 - get_my_leaves       → agent: rh
 - get_team_availability → agent: rh
 - get_team_stack      → agent: rh

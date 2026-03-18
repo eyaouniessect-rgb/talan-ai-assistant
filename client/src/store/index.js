@@ -163,17 +163,18 @@ loadMessages: async (conversationId) => {
     }))
 
     try {
-      const data = await sendMessageApi(text, currentActiveId)
+        const data = await sendMessageApi(text, currentActiveId)
 
-      const assistantMsg = {
-        role: 'assistant',
-        content: data.response,
-        time: new Date().toLocaleTimeString('fr', { hour: '2-digit', minute: '2-digit' }),
-        steps: [
-          { status: 'done', text: `Intention : ${data.intent}` },
-          { status: 'done', text: `Agent : ${data.target_agent}` },
-        ]
-      }
+const assistantMsg = {
+  role: 'assistant',
+  content: data.response,
+  time: new Date().toLocaleTimeString('fr', { hour: '2-digit', minute: '2-digit' }),
+  steps: [
+    { status: 'done', text: `Intention : ${data.intent}` },
+    { status: 'done', text: `Agent : ${data.target_agent}` },
+    ...(data.steps || [])
+  ]
+}
 
       set(s => ({
         conversations: s.conversations.map(c =>

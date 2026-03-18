@@ -1,10 +1,6 @@
 # Node 3 — Dispatch via le protocole A2A.
 # Selon l'agent cible détecté en Node 1, envoie une requête HTTP A2A
 # au bon serveur d'agent (agent_rh:8001, agent_crm:8002, etc.)
-# Gère aussi :
-#   - L'exécution parallèle si plusieurs agents sont indépendants
-#   - Le timeout et la gestion d'erreur par agent
-#   - Le routing vers le Module RAG si l'intention est "search_docs"
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -12,20 +8,34 @@ from app.orchestrator.state import AssistantState
 from app.a2a.client import send_task
 from dotenv import load_dotenv
 import os
+import json
 
 load_dotenv()
 
 MAX_HISTORY = 6
 
-# LLM pour les réponses de conversation générale
 llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     temperature=0.7,
 )
 
 CHAT_PROMPT = """
 Tu es Talan Assistant, un assistant d'entreprise intelligent pour Talan Tunisie.
-Tu aides les employés avec leurs tâches quotidiennes :
+
+RÈGLE CRITIQUE :
+Quand l'utilisateur dit "merci", "d'accord", "ok" ou exprime de la gratitude,
+réponds SIMPLEMENT et chaleureusement. 
+Ne liste JAMAIS des actions ou des données sauf si l'utilisateur le demande explicitement.
+Exemples de bonnes réponses :
+- "De rien ! N'hésitez pas si vous avez d'autres questions."
+- "Avec plaisir ! Je suis là si vous avez besoin."
+- "Bonne journée !"
+
+RÈGLE SUR LES DONNÉES :
+Ne déduis JAMAIS qu'une action a été effectuée à partir des messages de l'utilisateur.
+Utilise UNIQUEMENT les confirmations explicites des réponses de l'Assistant.
+
+Tu aides les employés avec :
 - Congés et ressources humaines (Agent RH)
 - Projets et clients (Agent CRM)
 - Tickets Jira (Agent Jira)
@@ -34,42 +44,52 @@ Tu aides les employés avec leurs tâches quotidiennes :
 - Recherche dans les documents internes (RAG)
 
 Réponds toujours en français, de façon concise et professionnelle.
-Si l'utilisateur salue, salue-le chaleureusement et présente brièvement tes capacités.
-Si l'utilisateur pose une question sur la conversation précédente, utilise le contexte fourni.
 Ne révèle jamais les détails techniques de ton architecture.
 """
+
+def _extract_clean_text(content: str) -> str:
+    """
+    Extrait le texte propre d'une réponse.
+    Si c'est un JSON (réponse Agent ReAct) → retourne juste le champ 'response'.
+    Sinon → retourne le contenu tel quel.
+    """
+    try:
+        parsed = json.loads(content)
+        return parsed.get("response", content)
+    except (json.JSONDecodeError, TypeError):
+        return content
 
 
 async def node3_dispatch(state: AssistantState) -> AssistantState:
     """
     Node 3 — Dispatch vers le bon agent ou répond directement.
 
-    Cas 1 : intent = "chat"    → LLM répond avec historique (bonjour, questions...)
+    Cas 1 : intent = "chat"    → LLM répond avec historique propre
     Cas 2 : intent = "unknown" → message d'erreur
-    Cas 3 : intent = action    → dispatch vers l'agent A2A correspondant
+    Cas 3 : intent = action    → dispatch vers l'agent A2A avec historique propre
     """
     intent       = state["intent"]
     target_agent = state["target_agent"]
     entities     = state["entities"]
     user_id      = state["user_id"]
 
+    # ── Trim commun ────────────────────────────────────────
+    all_messages = state["messages"]
+    trimmed = all_messages[-MAX_HISTORY:] if len(all_messages) > MAX_HISTORY else all_messages
+
     # ── Cas 1 : conversation générale avec historique ──────
     if intent == "chat" or (target_agent == "none" and intent != "unknown"):
         last_message = state["messages"][-1].content
 
-        # Trim — garde les N derniers messages pour le contexte
-        all_messages = state["messages"]
-        trimmed = all_messages[-MAX_HISTORY:] if len(all_messages) > MAX_HISTORY else all_messages
-
-        # Construit l'historique pour Gemini
         history_messages = []
-        for msg in trimmed[:-1]:  # tous sauf le dernier
+        for msg in trimmed[:-1]:
             if msg.type == "human":
                 history_messages.append(HumanMessage(content=msg.content))
             else:
-                history_messages.append(AIMessage(content=msg.content))
+                # ← parse le JSON pour avoir le texte propre
+                clean = _extract_clean_text(msg.content)
+                history_messages.append(AIMessage(content=clean))
 
-        # Appelle Gemini avec tout le contexte
         response = await llm.ainvoke([
             SystemMessage(content=CHAT_PROMPT),
             *history_messages,
@@ -93,16 +113,24 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
             )
         }
 
-    # ── Cas 3 : dispatch vers l'agent A2A ─────────────────
-    # Envoie le message original + contexte enrichi
+    # ── Cas 3 : dispatch vers l'agent A2A avec historique ──
     original_message = state["messages"][-1].content
-    message =(f"Original message: {original_message}. "
-             f"Intent: {intent}. "
-             f"Entities: {entities}. "
-             f"User ID: {user_id}.")
 
+    # ← Construit l'historique propre (sans JSON brut)
+    history = ""
+    for msg in trimmed[:-1]:
+        role = "Utilisateur" if msg.type == "human" else "Assistant"
+        clean = _extract_clean_text(msg.content)  # ← texte propre
+        history += f"{role}: {clean}\n"
 
-    
+    message = (
+        f"Historique récent de la conversation :\n{history}\n"
+        f"---\n"
+        f"Message utilisateur : {original_message}\n"
+        f"Intent : {intent}\n"
+        f"Entités : {entities}\n"
+        f"User ID : {user_id}"
+    )
 
     try:
         response = await send_task(target_agent, message)

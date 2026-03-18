@@ -40,17 +40,15 @@ class Employee(Base):
     __tablename__ = "employees"
     __table_args__ = {"schema": "hris"}
 
-    id = Column(Integer, primary_key=True)
-
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    team_id = Column(Integer, ForeignKey("hris.teams.id"), nullable=False)
-
-    skills = Column(String)
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
+    team_id    = Column(Integer, ForeignKey("hris.teams.id"), nullable=False)
+    skills     = Column(String)
+    leave_balance = Column(Integer, default=22)  # ← 26 jours/an
     created_at = Column(DateTime, server_default=func.now())
 
     user = relationship("User", back_populates="employee")
     team = relationship("Team", back_populates="employees")
-
     leaves = relationship(
         "Leave",
         back_populates="employee",
