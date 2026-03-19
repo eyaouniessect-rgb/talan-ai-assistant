@@ -106,9 +106,9 @@ useEffect(() => {
 
   const handleSend = () => {
     if (!input.trim()) return
-    console.log('=== SEND MESSAGE ===')
-    console.log('input:', input)
-    console.log('activeId before send:', activeId)
+  console.log('=== SEND MESSAGE ===')
+  console.log('activeId:', activeId)
+  console.log('conversation_id réel:', active?.id)  // ← ajoute ça
     sendMessage(input.trim())
     setInput('')
   }
