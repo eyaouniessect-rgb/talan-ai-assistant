@@ -1,6 +1,5 @@
 # Route principale du chat.
 # POST /chat           → reçoit message + user_id + role → envoie à l'orchestrateur LangGraph
-# GET  /chat/stream    → SSE endpoint → streame la réponse token par token vers le frontend React
 
 # app/api/chat.py
 from typing import Optional, List
@@ -25,7 +24,7 @@ class ChatRequest(BaseModel):
 
 
 class ReActStep(BaseModel):
-    status: str  # done | loading
+    status: str
     text: str
 
 
@@ -46,8 +45,23 @@ async def chat(
     user_id = current_user["user_id"]
     role    = current_user["role"]
 
+    # ── DEBUG ──────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"📨 NOUVELLE REQUÊTE CHAT")
+    print(f"   message          : {request.message[:50]}")
+    print(f"   conversation_id  : {request.conversation_id}")
+    print(f"   user_id          : {user_id}")
+    # ───────────────────────────────────────────────────────
+
     # ── 1. Trouve ou crée la conversation ─────────────────
-    if request.conversation_id:
+    is_real_id = (
+        request.conversation_id is not None and
+        request.conversation_id < 1_000_000_000_000
+    )
+
+    print(f"   is_real_id       : {is_real_id}")
+
+    if is_real_id:
         result = await db.execute(
             select(Conversation).where(
                 Conversation.id == request.conversation_id,
@@ -55,8 +69,10 @@ async def chat(
             )
         )
         conversation = result.scalar_one_or_none()
+        print(f"   conversation trouvée en base : {conversation is not None}")
     else:
         conversation = None
+        print(f"   → ID temporaire détecté → nouvelle conversation")
 
     if not conversation:
         conversation = Conversation(
@@ -65,9 +81,14 @@ async def chat(
         )
         db.add(conversation)
         await db.flush()
+        print(f"   → Nouvelle conversation créée : id={conversation.id}")
+    else:
+        print(f"   → Conversation existante utilisée : id={conversation.id}")
 
     # ── 2. thread_id = conversation.id ────────────────────
     thread_id = str(conversation.id)
+    print(f"   thread_id LangGraph : {thread_id}")
+    print(f"{'='*60}\n")
 
     # ── 3. Appelle LangGraph ──────────────────────────────
     graph = get_graph()
@@ -88,21 +109,25 @@ async def chat(
     config = {"configurable": {"thread_id": thread_id}}
     result = await graph.ainvoke(initial_state, config)
 
-    # ── 4. Parse la réponse — Agent RH retourne JSON ──────
+    print(f"\n✅ LangGraph terminé")
+    print(f"   intent       : {result['intent']}")
+    print(f"   target_agent : {result['target_agent']}")
+
+    # ── 4. Parse la réponse ────────────────────────────────
     raw_response = result["final_response"]
     react_steps = []
 
     try:
-        # Agent RH (ReAct) retourne un JSON avec response + react_steps
         parsed = json.loads(raw_response)
         final_text = parsed.get("response", raw_response)
         react_steps = [
             ReActStep(status="done", text=step)
             for step in parsed.get("react_steps", [])
         ]
+        print(f"   réponse parsée (JSON) ✅")
     except (json.JSONDecodeError, TypeError):
-        # Autres agents retournent du texte simple
         final_text = raw_response
+        print(f"   réponse texte simple ✅")
 
     # ── 5. Sauvegarde dans tes tables ─────────────────────
     db.add(Message(
@@ -119,6 +144,8 @@ async def chat(
     ))
 
     await db.commit()
+    print(f"   messages sauvegardés en base ✅")
+    print(f"   conversation_id retourné : {conversation.id}\n")
 
     return ChatResponse(
         response=final_text,

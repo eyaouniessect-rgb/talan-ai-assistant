@@ -7,7 +7,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.utils import new_agent_text_message
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
@@ -137,9 +137,12 @@ class RHAgentExecutor(AgentExecutor):
     """
 
     def __init__(self) -> None:
-        llm = ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        llm = ChatOllama(
+            model="qwen3:4b-instruct-2507-q4_K_M",
             temperature=0,
+            num_predict=2048,
+            repeat_penalty=1.1,
+            num_ctx=4096,
         )
         self.react_agent = create_react_agent(
             model=llm,
@@ -166,10 +169,10 @@ class RHAgentExecutor(AgentExecutor):
             })
 
             # ── Extrait les steps du cycle ReAct ──────────
-            # Utilise un index pour associer chaque observation
-            # à la bonne étape (évite d'écraser la mauvaise)
+            # Utilise tool_call_id pour associer chaque observation
+            # à la bonne étape (gère les appels parallèles correctement)
             react_steps = []
-            tool_call_index = -1
+            tool_calls_map = {}  # ← tool_call_id → index dans react_steps
 
             for msg in result["messages"]:
                 msg_type = type(msg).__name__
@@ -177,12 +180,17 @@ class RHAgentExecutor(AgentExecutor):
                     for tc in msg.tool_calls:
                         step_text = _tool_to_human_text(tc['name'], tc['args'])
                         react_steps.append(step_text)
-                        tool_call_index = len(react_steps) - 1
+                        # ← mémorise l'index pour ce tool_call_id
+                        tool_calls_map[tc['id']] = len(react_steps) - 1
+
                 elif msg_type == "ToolMessage":
                     obs = _format_observation(msg.content)
-                    if obs and tool_call_index >= 0 and tool_call_index < len(react_steps):
-                        react_steps[tool_call_index] += f"\n   → {obs}"
-                        tool_call_index += 1  # ← passe à la prochaine étape
+                    if obs:
+                        # ← utilise tool_call_id pour trouver le bon index
+                        tool_call_id = getattr(msg, 'tool_call_id', None)
+                        if tool_call_id and tool_call_id in tool_calls_map:
+                            idx = tool_calls_map[tool_call_id]
+                            react_steps[idx] += f"\n   → {obs}"
 
             # ── Log terminal ───────────────────────────────
             print(f"\n{'─'*50}")

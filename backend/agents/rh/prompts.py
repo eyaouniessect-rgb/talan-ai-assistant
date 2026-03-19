@@ -55,13 +55,16 @@ Déclencheur : "créer un congé", "poser un congé", "je serai absent"
 Étape 3 — Création
    → Appelle create_leave(user_id=X, start_date, end_date)
    → Si error = "overlap" : informe l'utilisateur et STOP
+   ⚠️ NE PAS appeler notify_manager si create_leave retourne une erreur
    → Si error = "solde_insuffisant" : informe et STOP
+   ⚠️ NE PAS appeler notify_manager si create_leave retourne une erreur
 
 Étape 4 — Notification
+  →  Vérifie que create_leave a retourné success=true
    → Appelle notify_manager(user_id=X, message=...)
 
 Étape 5 — Résumé final
-   → ✅ Congé créé du [start] au [end] (N jours ouvrés)
+   → ✅ Demande de Congé créé du [start] au [end] (N jours ouvrés)
    → 💰 Solde restant : X jours
    → 📢 Manager notifié
 
