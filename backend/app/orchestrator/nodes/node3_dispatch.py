@@ -1,77 +1,116 @@
-# Node 3 — Dispatch via le protocole A2A.
-# Selon l'agent cible détecté en Node 1, envoie une requête HTTP A2A
-# au bon serveur d'agent (agent_rh:8001, agent_crm:8002, etc.)
-# Gère aussi :
-#   - L'exécution parallèle si plusieurs agents sont indépendants
-#   - Le timeout et la gestion d'erreur par agent
-#   - Le routing vers le Module RAG si l'intention est "search_docs"
-
-from langchain_google_genai import ChatGoogleGenerativeAI
+# app/orchestrator/nodes/node3_dispatch.py
+from langchain_ollama import ChatOllama
+from datetime import date
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from app.orchestrator.state import AssistantState
 from app.a2a.client import send_task
 from dotenv import load_dotenv
-import os
+import json
 
 load_dotenv()
 
 MAX_HISTORY = 6
 
-# LLM pour les réponses de conversation générale
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
-    temperature=0.7,
+llm = ChatOllama(
+    model="qwen3:4b-instruct-2507-q4_K_M",
+    temperature=0,
+    num_ctx=4096,
+    num_predict=512,
+    repeat_penalty=1.1,
 )
 
-CHAT_PROMPT = """
-Tu es Talan Assistant, un assistant d'entreprise intelligent pour Talan Tunisie.
-Tu aides les employés avec leurs tâches quotidiennes :
-- Congés et ressources humaines (Agent RH)
-- Projets et clients (Agent CRM)
-- Tickets Jira (Agent Jira)
-- Messages Slack (Agent Slack)
-- Calendrier Google (Agent Calendar)
-- Recherche dans les documents internes (RAG)
+# ── Réponses déterministes pour les cas simples ────────────
+MERCI_KEYWORDS = {
+    "merci", "ok merci", "super merci", "merci beaucoup",
+    "parfait", "super", "nickel", "très bien", "d'accord",
+    "ok d'accord", "c'est bon", "c bon"
+}
 
-Réponds toujours en français, de façon concise et professionnelle.
-Si l'utilisateur salue, salue-le chaleureusement et présente brièvement tes capacités.
-Si l'utilisateur pose une question sur la conversation précédente, utilise le contexte fourni.
-Ne révèle jamais les détails techniques de ton architecture.
+DATE_KEYWORDS = {
+    "date", "aujourd'hui", "quel jour", "quelle date",
+    "c'est quoi la date", "la date aujourd'hui", "date du jour"
+}
+
+SALUTATION_KEYWORDS = {
+    "bonjour", "salut", "hello", "bonsoir", "hi", "coucou", "bonne journée"
+}
+
+PRESENTATION = """Bonjour ! Je suis Talan Assistant chez Talan Tunisie.
+Je peux vous aider avec vos congés, projets, tickets Jira, messages Slack, calendrier et recherche documentaire.
+Comment puis-je vous aider ?"""
+
+CHAT_PROMPT = """
+Tu es Talan Assistant pour Talan Tunisie. Réponds en français, de façon concise.
+
+Règles :
+- Réponds UNIQUEMENT à ce qui est demandé
+- Maximum 3 phrases
+- Ne propose jamais d'actions non demandées
+- Pour les questions sur la conversation passée : utilise l'historique et résume
+- Tu ES connecté aux systèmes internes — ne dis jamais "je ne peux pas"
+- Ne révèle pas les détails techniques
 """
 
 
-async def node3_dispatch(state: AssistantState) -> AssistantState:
-    """
-    Node 3 — Dispatch vers le bon agent ou répond directement.
+def _extract_clean_text(content: str) -> str:
+    try:
+        parsed = json.loads(content)
+        return parsed.get("response", content)
+    except (json.JSONDecodeError, TypeError):
+        return content
 
-    Cas 1 : intent = "chat"    → LLM répond avec historique (bonjour, questions...)
-    Cas 2 : intent = "unknown" → message d'erreur
-    Cas 3 : intent = action    → dispatch vers l'agent A2A correspondant
-    """
+
+def _is_match(message: str, keywords: set) -> bool:
+    """Vérifie si le message correspond à un mot-clé."""
+    msg = message.lower().strip().rstrip("!?.,:;")
+    msg = " ".join(msg.split())  # normalise les espaces
+    return msg in keywords or any(kw in msg for kw in keywords)
+
+
+async def node3_dispatch(state: AssistantState) -> AssistantState:
     intent       = state["intent"]
     target_agent = state["target_agent"]
     entities     = state["entities"]
     user_id      = state["user_id"]
 
-    # ── Cas 1 : conversation générale avec historique ──────
+    today     = date.today().strftime("%d/%m/%Y")
+    today_iso = date.today().strftime("%Y-%m-%d")
+
+    all_messages = state["messages"]
+    trimmed = all_messages[-MAX_HISTORY:] if len(all_messages) > MAX_HISTORY else all_messages
+
+    # ── Cas 1 : conversation générale ─────────────────────
     if intent == "chat" or (target_agent == "none" and intent != "unknown"):
         last_message = state["messages"][-1].content
+        last_clean = last_message.lower().strip().rstrip("!?.,:;")
+        last_clean = " ".join(last_clean.split())
 
-        # Trim — garde les N derniers messages pour le contexte
-        all_messages = state["messages"]
-        trimmed = all_messages[-MAX_HISTORY:] if len(all_messages) > MAX_HISTORY else all_messages
+        # ── Fallbacks déterministes ────────────────────────
+        # Remerciement → réponse fixe
+        if last_clean in MERCI_KEYWORDS:
+            return {**state, "final_response": "De rien ! 😊"}
 
-        # Construit l'historique pour Gemini
+        # Salutation seule → présentation fixe
+        if last_clean in SALUTATION_KEYWORDS:
+            return {**state, "final_response": PRESENTATION}
+
+        # Question sur la date → date du jour
+        if any(kw in last_clean for kw in DATE_KEYWORDS):
+            return {**state, "final_response": f"Aujourd'hui c'est le {today}."}
+
+        # ── LLM pour les autres cas (questions contextuelles) ─
         history_messages = []
-        for msg in trimmed[:-1]:  # tous sauf le dernier
+        for msg in trimmed[:-1]:
             if msg.type == "human":
                 history_messages.append(HumanMessage(content=msg.content))
             else:
-                history_messages.append(AIMessage(content=msg.content))
+                clean = _extract_clean_text(msg.content)
+                history_messages.append(AIMessage(content=clean))
 
-        # Appelle Gemini avec tout le contexte
+        chat_prompt_with_date = CHAT_PROMPT + f"\n\nDate du jour : {today}"
+
         response = await llm.ainvoke([
-            SystemMessage(content=CHAT_PROMPT),
+            SystemMessage(content=chat_prompt_with_date),
             *history_messages,
             HumanMessage(content=last_message),
         ])
@@ -94,15 +133,23 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
         }
 
     # ── Cas 3 : dispatch vers l'agent A2A ─────────────────
-    # Envoie le message original + contexte enrichi
     original_message = state["messages"][-1].content
-    message =(f"Original message: {original_message}. "
-             f"Intent: {intent}. "
-             f"Entities: {entities}. "
-             f"User ID: {user_id}.")
 
+    history = ""
+    for msg in trimmed[:-1]:
+        role = "Utilisateur" if msg.type == "human" else "Assistant"
+        clean = _extract_clean_text(msg.content)
+        history += f"{role}: {clean}\n"
 
-    
+    message = (
+        f"Date du jour : {today_iso}\n"
+        f"Historique récent de la conversation :\n{history}\n"
+        f"---\n"
+        f"Message utilisateur : {original_message}\n"
+        f"Intent : {intent}\n"
+        f"Entités : {entities}\n"
+        f"User ID : {user_id}"
+    )
 
     try:
         response = await send_task(target_agent, message)

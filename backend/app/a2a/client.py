@@ -20,7 +20,7 @@ async def send_task(agent_name: str, user_message: str) -> str:
     """
     agent_url = get_agent_url(agent_name)
 
-    async with httpx.AsyncClient(timeout=60.0) as httpx_client:
+    async with httpx.AsyncClient(timeout=120) as httpx_client:
         # Connexion à l'agent (doc officielle : ClientFactory.connect)
         client = await ClientFactory.connect(
             agent_url,

@@ -23,6 +23,90 @@ from agents.rh.schemas import (
 
 
 async def create_leave(user_id: int, start_date: str, end_date: str) -> dict:
+    async with AsyncSessionLocal() as db:
+
+        # ── 1. Trouve l'employee ───────────────────────
+        result = await db.execute(
+            select(Employee).where(Employee.user_id == user_id)
+        )
+        employee = result.scalar_one_or_none()
+        if not employee:
+            return {"error": f"Employé introuvable pour user_id={user_id}"}
+
+        # ── 2. Parse les dates ─────────────────────────
+        start = date.fromisoformat(start_date)
+        end   = date.fromisoformat(end_date)
+
+        if end < start:
+            return {"error": "La date de fin doit être après la date de début."}
+
+        # ── 3. Calcule les jours ouvrés ────────────────
+        days = sum(
+            1 for i in range((end - start).days + 1)
+            if (start.toordinal() + i) % 7 not in (6, 0)
+        )
+
+        if days == 0:
+            return {"error": "La période ne contient aucun jour ouvré."}
+
+        # ── 4. Vérifie le solde AVANT l'overlap ────────
+        balance_check = await check_leave_balance(
+            user_id=user_id,
+            requested_days=days
+        )
+
+        if not balance_check.get("can_create", True):
+            return {
+                "error": "solde_insuffisant",
+                "message": balance_check["message"],
+                "solde_effectif": balance_check["solde_effectif"],
+                "jours_demandes": days,
+            }
+
+        # ── 5. Vérifie l'overlap ───────────────────────
+        overlap_result = await db.execute(
+            select(Leave).where(
+                and_(
+                    Leave.employee_id == employee.id,
+                    Leave.status.in_(["pending", "approved"]),
+                    Leave.start_date <= end,
+                    Leave.end_date >= start,
+                )
+            )
+        )
+        existing_leave = overlap_result.scalars().first()
+
+        if existing_leave:
+            return {
+                "error": "overlap",
+                "message": (
+                    f"Chevauchement avec un congé existant du "
+                    f"{existing_leave.start_date} au {existing_leave.end_date} "
+                    f"(statut: {existing_leave.status})."
+                ),
+            }
+
+        # ── 6. Crée le congé ───────────────────────────
+        leave = Leave(
+            employee_id=employee.id,
+            start_date=start,
+            end_date=end,
+            days_count=days,
+            status="pending",
+        )
+        db.add(leave)
+        await db.commit()
+        await db.refresh(leave)
+
+        return {
+            "success": True,
+            "leave_id": leave.id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "days_count": days,
+            "status": "pending",
+            "solde_restant": balance_check["solde_effectif"] - days,
+        }
     """
     Crée une demande de congé pour un employé.
     Vérifie :
@@ -237,3 +321,76 @@ async def get_team_stack(user_id: int) -> dict:
             "success": True,
             "team_stack": stack,
         }
+    
+
+async def check_leave_balance(user_id: int, requested_days: int = 0) -> dict:
+    """
+    Vérifie le solde de congés disponible.
+    
+    Calcul :
+    solde_effectif = leave_balance - jours_pending
+    
+    Si requested_days > 0 : vérifie si la demande est possible.
+    """
+    async with AsyncSessionLocal() as db:
+
+        # ── 1. Trouve l'employee ───────────────────────
+        result = await db.execute(
+            select(Employee).where(Employee.user_id == user_id)
+        )
+        employee = result.scalar_one_or_none()
+
+        if not employee:
+            return {"error": "Employé introuvable"}
+
+        # ── 2. Calcule les jours déjà en pending ───────
+        result = await db.execute(
+            select(Leave).where(
+                and_(
+                    Leave.employee_id == employee.id,
+                    Leave.status == "pending",
+                )
+            )
+        )
+        pending_leaves = result.scalars().all()
+
+        jours_pending = sum(l.days_count or 0 for l in pending_leaves)
+
+        # ── 3. Solde effectif ──────────────────────────
+        solde_total    = employee.leave_balance or 26
+        solde_effectif = solde_total - jours_pending
+
+        response = {
+            "success": True,
+            "solde_total": solde_total,
+            "jours_pending": jours_pending,
+            "solde_effectif": solde_effectif,
+            "pending_details": [
+                {
+                    "id": l.id,
+                    "start_date": str(l.start_date),
+                    "end_date": str(l.end_date),
+                    "days_count": l.days_count,
+                }
+                for l in pending_leaves
+            ]
+        }
+
+        # ── 4. Vérifie si la demande est possible ──────
+        if requested_days > 0:
+            if requested_days > solde_effectif:
+                response["can_create"] = False
+                response["message"] = (
+                    f"Solde insuffisant. Vous avez {solde_effectif} jours disponibles "
+                    f"({solde_total} jours - {jours_pending} jours en attente). "
+                    f"Votre demande de {requested_days} jours dépasse ce solde."
+                )
+            else:
+                response["can_create"] = True
+                response["message"] = (
+                    f"Solde suffisant. Vous avez {solde_effectif} jours disponibles. "
+                    f"Après cette demande il vous restera "
+                    f"{solde_effectif - requested_days} jours."
+                )
+
+        return response    

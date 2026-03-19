@@ -2,12 +2,14 @@
 import api from './index'
 
 export const sendMessageApi = async (message, conversationId = null) => {
+  // Si l'ID est un timestamp (> 1 trillion) c'est temporaire → envoie null
+  const realId = conversationId && conversationId < 1_000_000_000_000
+    ? conversationId
+    : null
+
   const response = await api.post('/chat/', {
-    message: message,
-    // envoie null si c'est un timestamp local (pas encore en base)
-    conversation_id: typeof conversationId === 'number' && conversationId < 1000000000000
-      ? conversationId
-      : null,
+    message,
+    conversation_id: realId,
   })
   return response.data
 }

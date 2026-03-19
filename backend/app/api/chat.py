@@ -1,11 +1,8 @@
-# Route principale du chat.
-# POST /chat           → reçoit message + user_id + role → envoie à l'orchestrateur LangGraph
-# GET  /chat/stream    → SSE endpoint → streame la réponse token par token vers le frontend React
-
-
 # app/api/chat.py
-from typing import Optional
-from fastapi import APIRouter, Depends
+from typing import Optional, List
+import json
+import logging
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -17,16 +14,26 @@ from app.database.connection import get_db
 from app.database.models.chat import Conversation, Message
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+logger = logging.getLogger(__name__)
+
 
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[int] = None
+
+
+class ReActStep(BaseModel):
+    status: str
+    text: str
+
 
 class ChatResponse(BaseModel):
     response: str
     intent: str
     target_agent: str
     conversation_id: int
+    steps: List[ReActStep] = []
+
 
 @router.post("/", response_model=ChatResponse)
 async def chat(
@@ -37,8 +44,15 @@ async def chat(
     user_id = current_user["user_id"]
     role    = current_user["role"]
 
+    logger.info(f"Nouvelle requête - user_id={user_id} conv_id={request.conversation_id} msg={request.message[:50]}")
+
     # ── 1. Trouve ou crée la conversation ─────────────────
-    if request.conversation_id:
+    is_real_id = (
+        request.conversation_id is not None and
+        request.conversation_id < 1_000_000_000_000
+    )
+
+    if is_real_id:
         result = await db.execute(
             select(Conversation).where(
                 Conversation.id == request.conversation_id,
@@ -46,8 +60,10 @@ async def chat(
             )
         )
         conversation = result.scalar_one_or_none()
+        logger.info(f"Conversation trouvée en base : {conversation is not None}")
     else:
         conversation = None
+        logger.info("ID temporaire détecté → nouvelle conversation")
 
     if not conversation:
         conversation = Conversation(
@@ -56,12 +72,17 @@ async def chat(
         )
         db.add(conversation)
         await db.flush()
+        logger.info(f"Nouvelle conversation créée : id={conversation.id}")
+    else:
+        logger.info(f"Conversation existante utilisée : id={conversation.id}")
 
     # ── 2. thread_id = conversation.id ────────────────────
     thread_id = str(conversation.id)
 
-    # ── 3. Appelle LangGraph avec checkpointer async ──────
-    graph = await get_graph()
+    # ── 3. Appelle LangGraph ──────────────────────────────
+    graph = get_graph()
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Graph not initialized")
 
     initial_state = {
         "messages":       [HumanMessage(content=request.message)],
@@ -77,7 +98,25 @@ async def chat(
     config = {"configurable": {"thread_id": thread_id}}
     result = await graph.ainvoke(initial_state, config)
 
-    # ── 4. Sauvegarde dans tes tables ─────────────────────
+    logger.info(f"LangGraph terminé - intent={result['intent']} agent={result['target_agent']}")
+
+    # ── 4. Parse la réponse ────────────────────────────────
+    raw_response = result["final_response"]
+    react_steps = []
+
+    try:
+        parsed = json.loads(raw_response)
+        final_text = parsed.get("response", raw_response)
+        react_steps = [
+            ReActStep(status="done", text=step)
+            for step in parsed.get("react_steps", [])
+        ]
+        logger.info("Réponse parsée (JSON) ✅")
+    except (json.JSONDecodeError, TypeError):
+        final_text = raw_response
+        logger.info("Réponse texte simple ✅")
+
+    # ── 5. Sauvegarde dans les tables ─────────────────────
     db.add(Message(
         conversation_id=conversation.id,
         role="user",
@@ -86,18 +125,20 @@ async def chat(
     db.add(Message(
         conversation_id=conversation.id,
         role="assistant",
-        content=result["final_response"],
+        content=final_text,
         intent=result["intent"],
         target_agent=result["target_agent"],
     ))
 
     await db.commit()
+    logger.info(f"Messages sauvegardés - conversation_id={conversation.id}")
 
     return ChatResponse(
-        response=result["final_response"],
+        response=final_text,
         intent=result["intent"],
         target_agent=result["target_agent"],
         conversation_id=conversation.id,
+        steps=react_steps,
     )
 
 
@@ -124,6 +165,16 @@ async def get_messages(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # ✅ FIX sécurité : vérifie que la conversation appartient bien à l'user
+    conv_result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == current_user["user_id"]
+        )
+    )
+    if not conv_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Conversation non trouvée")
+
     result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation_id)
@@ -141,4 +192,3 @@ async def get_messages(
         }
         for m in messages
     ]
-    

@@ -7,138 +7,225 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.utils import new_agent_text_message
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
+from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
-
+from langgraph.prebuilt import create_react_agent
+# Après — import depuis prompts.py
+from agents.rh.prompts import RH_REACT_PROMPT
 from agents.rh import tools as rh_tools
 
 load_dotenv()
 
 
+# ══════════════════════════════════════════════════════
+# OUTILS LANGCHAIN — utilisés par le ReAct agent
+# ══════════════════════════════════════════════════════
+
+@tool
+async def create_leave(user_id: int, start_date: str, end_date: str) -> str:
+    """
+    Crée une demande de congé pour un employé.
+    Vérifie automatiquement les chevauchements.
+    Paramètres: user_id (int), start_date (YYYY-MM-DD), end_date (YYYY-MM-DD)
+    """
+    result = await rh_tools.create_leave(
+        user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def get_my_leaves(user_id: int, status_filter: str = None) -> str:
+    """
+    Retourne les congés d'un employé.
+    status_filter optionnel: 'pending' | 'approved' | 'rejected' | None (tous)
+    """
+    result = await rh_tools.get_my_leaves(
+        user_id=user_id,
+        status_filter=status_filter,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def get_team_availability(user_id: int) -> str:
+    """
+    Retourne la disponibilité de l'équipe de l'employé.
+    """
+    result = await rh_tools.get_team_availability(user_id=user_id)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def get_team_stack(user_id: int) -> str:
+    """
+    Retourne les compétences techniques de l'équipe.
+    """
+    result = await rh_tools.get_team_stack(user_id=user_id)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str) -> str:
+    """
+    Vérifie les conflits dans Google Calendar pour la période donnée.
+    Appelle l'Agent Calendar via A2A.
+    """
+    # ── MOCK — Agent Calendar pas encore implémenté ────
+    return json.dumps({
+        "success": True,
+        "conflicts": [],
+        "message": f"Aucun conflit détecté du {start_date} au {end_date}."
+    })
+
+
+@tool
+async def notify_manager(user_id: int, message: str) -> str:
+    """
+    Notifie le manager de l'employé via Slack.
+    Appelle l'Agent Slack via A2A.
+    """
+    # ── MOCK — Agent Slack pas encore implémenté ───────
+    return json.dumps({
+        "success": True,
+        "message": f"✅ [MOCK] Notification envoyée au manager : {message}"
+    })
+
+
+
+@tool
+async def check_leave_balance(user_id: int, requested_days: int = 0) -> str:
+    """
+    Vérifie le solde de congés disponible d'un employé.
+    requested_days: nombre de jours demandés (0 = juste consulter le solde)
+    Retourne: solde_total, jours_pending, solde_effectif, can_create
+    """
+    result = await rh_tools.check_leave_balance(
+        user_id=user_id,
+        requested_days=requested_days
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+# ══════════════════════════════════════════════════════
+# REACT AGENT RH
+# ══════════════════════════════════════════════════════
+
+
+
+
+TOOLS = [
+    check_leave_balance,
+    create_leave,
+    get_my_leaves,
+    get_team_availability,
+    get_team_stack,
+    check_calendar_conflicts,
+    notify_manager,
+]
+
+# ══════════════════════════════════════════════════════
+# A2A EXECUTOR — garde la structure A2A officielle
+# ══════════════════════════════════════════════════════
 class RHAgentExecutor(AgentExecutor):
     """
-    Pont entre le protocole A2A et la logique métier RH.
-    Conforme à la doc officielle A2A (comme PolicyAgentExecutor).
+    Pont entre le protocole A2A et le ReAct agent RH.
+    - Structure A2A : conforme à la doc officielle
+    - Logique interne : ReAct agent LangGraph
     """
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        llm = ChatOllama(
+            model="qwen3:4b-instruct-2507-q4_K_M",
             temperature=0,
+            num_predict=2048,
+            repeat_penalty=1.1,
+            num_ctx=4096,
         )
-
-    async def _handle_intent(self, user_input: str, context_data: dict) -> str:
-        """
-        Analyse le message avec Gemini pour détecter l'intent
-        puis appelle le bon tool directement.
-        """
-        # ── 1. Détection d'intent ──────────────────────────
-        detection_prompt = f"""
-Analyse ce message et retourne UNIQUEMENT un JSON valide, sans markdown.
-Message : "{user_input}"
-
-Intents possibles :
-- create_leave          : créer un congé
-- get_my_leaves         : consulter ses congés (tous ou filtrés par statut)
-- get_team_availability : disponibilité équipe
-- get_team_stack        : compétences équipe
-
-Format :
-{{
-  "intent": "nom_intent",
-  "entities": {{}}
-}}
-
-Exemples d'entités :
-- create_leave  : {{"start_date": "2025-03-15", "end_date": "2025-03-21"}}
-- get_my_leaves : {{"status_filter": "pending"}}   ← congés en attente
-- get_my_leaves : {{"status_filter": "approved"}}  ← congés approuvés
-- get_my_leaves : {{}}                              ← tous les congés
-"""
-        response = await self.llm.ainvoke([
-            HumanMessage(content=detection_prompt)
-        ])
-
-        # ── 2. Parse JSON ──────────────────────────────────
-        try:
-            content = response.content.strip()
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            parsed   = json.loads(content.strip())
-            intent   = parsed.get("intent", "unknown")
-            entities = parsed.get("entities", {})
-        except Exception:
-            intent   = "unknown"
-            entities = {}
-
-        user_id = context_data.get("user_id", 1)
-
-        # ── 3. Appelle le bon tool ─────────────────────────
-        if intent == "create_leave":
-            start = entities.get("start_date")
-            end   = entities.get("end_date")
-            if not start or not end:
-                return "Pour créer un congé, j'ai besoin des dates de début et de fin. Pouvez-vous me les préciser ? (format : YYYY-MM-DD)"
-            result = await rh_tools.create_leave(
-                user_id=user_id,
-                start_date=start,
-                end_date=end,
-            )
-
-        elif intent == "get_my_leaves":
-            status_filter = entities.get("status_filter", None)
-            result = await rh_tools.get_my_leaves(
-                user_id=user_id,
-                status_filter=status_filter
-            )
-
-        elif intent == "get_team_availability":
-            result = await rh_tools.get_team_availability(user_id=user_id)
-
-        elif intent == "get_team_stack":
-            result = await rh_tools.get_team_stack(user_id=user_id)
-
-        else:
-            return "Je n'ai pas compris votre demande RH. Pouvez-vous reformuler ?"
-
-        # ── 4. Formule une réponse naturelle ──────────────
-        format_prompt = f"""
-Tu es RHAgent, assistant RH de Talan Tunisie.
-L'utilisateur a demandé : "{user_input}"
-
-Voici les données exactes récupérées depuis la base de données :
-{json.dumps(result, ensure_ascii=False, indent=2)}
-
-RÈGLES STRICTES :
-- Réponds DIRECTEMENT à la question posée
-- Ne te présente PAS et ne liste PAS tes capacités
-- Utilise UNIQUEMENT les données ci-dessus
-- Si la liste est vide, dis-le clairement
-- Affiche les données sous forme de liste claire et lisible
-- Réponds toujours en français
-"""
-        final = await self.llm.ainvoke([
-            HumanMessage(content=format_prompt)
-        ])
-        return final.content
+        self.react_agent = create_react_agent(
+            model=llm,
+            tools=TOOLS,
+            prompt=RH_REACT_PROMPT,
+        )
 
     async def execute(
         self,
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
+        # 1. Récupère le message A2A (doc officielle)
         user_input = context.get_user_input()
-        try:
-            result = await self._handle_intent(
-                user_input=user_input,
-                context_data={"user_id": 1},
-            )
-        except Exception as e:
-            result = f"Erreur lors du traitement : {str(e)}"
 
-        message = new_agent_text_message(result)
+        print(f"\n{'='*50}")
+        print(f"🤖 RHAgent ReAct — Message reçu : {user_input}")
+        print(f"{'='*50}")
+
+        # 2. Exécute le cycle ReAct
+        try:
+            result = await self.react_agent.ainvoke({
+                "messages": [HumanMessage(content=user_input)]
+            })
+
+            # ── Extrait les steps du cycle ReAct ──────────
+            # Utilise tool_call_id pour associer chaque observation
+            # à la bonne étape (gère les appels parallèles correctement)
+            react_steps = []
+            tool_calls_map = {}  # ← tool_call_id → index dans react_steps
+
+            for msg in result["messages"]:
+                msg_type = type(msg).__name__
+                if msg_type == "AIMessage" and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        step_text = _tool_to_human_text(tc['name'], tc['args'])
+                        react_steps.append(step_text)
+                        # ← mémorise l'index pour ce tool_call_id
+                        tool_calls_map[tc['id']] = len(react_steps) - 1
+
+                elif msg_type == "ToolMessage":
+                    obs = _format_observation(msg.content)
+                    if obs:
+                        # ← utilise tool_call_id pour trouver le bon index
+                        tool_call_id = getattr(msg, 'tool_call_id', None)
+                        if tool_call_id and tool_call_id in tool_calls_map:
+                            idx = tool_calls_map[tool_call_id]
+                            react_steps[idx] += f"\n   → {obs}"
+
+            # ── Log terminal ───────────────────────────────
+            print(f"\n{'─'*50}")
+            print("🧠 CYCLE ReAct :")
+            for msg in result["messages"]:
+                msg_type = type(msg).__name__
+                if msg_type == "HumanMessage":
+                    print(f"  👤 Human  : {msg.content[:100]}")
+                elif msg_type == "AIMessage":
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            print(f"  🔧 Act    : {tc['name']}({tc['args']})")
+                    else:
+                        print(f"  🤖 Answer : {msg.content[:200]}")
+                elif msg_type == "ToolMessage":
+                    print(f"  👁️  Observe: {msg.content[:100]}")
+            print(f"{'─'*50}\n")
+
+            final_response = result["messages"][-1].content
+
+            # ── Encode réponse + steps en JSON ────────────
+            response_with_steps = json.dumps({
+                "response": final_response,
+                "react_steps": react_steps,
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"❌ Erreur ReAct : {str(e)}")
+            response_with_steps = json.dumps({
+                "response": f"Erreur lors du traitement : {str(e)}",
+                "react_steps": [],
+            }, ensure_ascii=False)
+
+        # 3. Retourne la réponse A2A (doc officielle)
+        message = new_agent_text_message(response_with_steps)
         await event_queue.enqueue_event(message)
 
     async def cancel(
@@ -147,3 +234,58 @@ RÈGLES STRICTES :
         event_queue: EventQueue,
     ) -> None:
         pass
+
+
+# ══════════════════════════════════════════════════════
+# FONCTIONS UTILITAIRES
+# ══════════════════════════════════════════════════════
+
+def _tool_to_human_text(tool_name: str, args: dict) -> str:
+    mapping = {
+        "check_leave_balance": "💰 Vérification du solde de congés...",
+        "check_calendar_conflicts": (
+            f"🔍 Vérification du calendrier du {args.get('start_date')} "
+            f"au {args.get('end_date')}..."
+        ),
+        "create_leave": (
+            f"📝 Création du congé du {args.get('start_date')} "
+            f"au {args.get('end_date')}..."
+        ),
+        "notify_manager": "📢 Notification du manager...",
+        "get_my_leaves": (
+            f"📋 Récupération des congés"
+            f"{' en attente' if args.get('status_filter') == 'pending' else ''}..."
+        ),
+        "get_team_availability": "👥 Vérification de la disponibilité de l'équipe...",
+        "get_team_stack": "💼 Récupération des compétences de l'équipe...",
+    }
+    return mapping.get(tool_name, f"⚙️ {tool_name}...")
+
+
+def _format_observation(content: str) -> str:
+    try:
+        data = json.loads(content)
+        if data.get("success"):
+            if "solde_effectif" in data:
+                solde = data['solde_effectif']
+                total = data['solde_total']
+                pending = data['jours_pending']
+                can = data.get('can_create')
+                base = f"Solde effectif : {solde} jours ({total} total - {pending} en attente)"
+                if can is True:
+                    return f"{base} ✅"
+                elif can is False:
+                    return f"{base} ❌ Solde insuffisant"
+                return f"{base} ✅"
+            if "conflicts" in data:
+                conflicts = data.get("conflicts", [])
+                return "Aucun conflit trouvé ✅" if not conflicts else f"{len(conflicts)} conflit(s) ⚠️"
+            if "leave_id" in data:
+                return f"Congé créé (ID: {data['leave_id']}) ✅"
+            if "message" in data:
+                return f"{data['message']} ✅"
+        elif "error" in data:
+            return f"❌ {data['error']}"
+    except Exception:
+        pass
+    return ""

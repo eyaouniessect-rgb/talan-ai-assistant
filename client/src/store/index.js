@@ -64,12 +64,11 @@ export const useChatStore = create((set, get) => ({
         date: new Date(c.created_at).toLocaleDateString('fr'),
         agents: [],
         messageCount: 0,
-        messages: [],        // ← vide au départ
-        loaded: false,       // ← messages pas encore chargés
+        messages: [],
+        loaded: false,
       }))
       set({ conversations })
 
-      // Active la première conversation si elle existe
       if (conversations.length > 0) {
         set({ activeId: conversations[0].id })
         await get().loadMessages(conversations[0].id)
@@ -80,38 +79,36 @@ export const useChatStore = create((set, get) => ({
   },
 
   // ── Charge les messages d'une conversation ─────────────
-loadMessages: async (conversationId) => {
-  try {
-    const data = await getMessagesApi(conversationId)
-    const messages = data.map(m => ({
-      role: m.role,
-      content: m.content,
-      time: new Date(m.timestamp).toLocaleTimeString('fr', {
-        hour: '2-digit', minute: '2-digit'
-      }),
-      // ← reconstruit les steps depuis intent + target_agent
-      steps: m.role === 'assistant' && m.intent ? [
-        { status: 'done', text: `Intention : ${m.intent}` },
-        { status: 'done', text: `Agent : ${m.target_agent}` },
-      ] : [],
-    }))
-    set(s => ({
-      conversations: s.conversations.map(c =>
-        c.id === conversationId
-          ? { ...c, messages, messageCount: messages.length, loaded: true }
-          : c
-      )
-    }))
-  } catch (error) {
-    console.error('Erreur chargement messages:', error)
-  }
-},
+  loadMessages: async (conversationId) => {
+    try {
+      const data = await getMessagesApi(conversationId)
+      const messages = data.map(m => ({
+        role: m.role,
+        content: m.content,
+        time: new Date(m.timestamp).toLocaleTimeString('fr', {
+          hour: '2-digit', minute: '2-digit'
+        }),
+        steps: m.role === 'assistant' && m.intent ? [
+          { status: 'done', text: `Intention : ${m.intent}` },
+          { status: 'done', text: `Agent : ${m.target_agent}` },
+        ] : [],
+      }))
+      set(s => ({
+        conversations: s.conversations.map(c =>
+          c.id === conversationId
+            ? { ...c, messages, messageCount: messages.length, loaded: true }
+            : c
+        )
+      }))
+    } catch (error) {
+      console.error('Erreur chargement messages:', error)
+    }
+  },
 
   // ── Change de conversation active ─────────────────────
   setActive: async (id) => {
     set({ activeId: id })
     const conv = get().conversations.find(c => c.id === id)
-    // Charge les messages si pas encore chargés
     if (conv && !conv.loaded) {
       await get().loadMessages(id)
     }
@@ -120,12 +117,15 @@ loadMessages: async (conversationId) => {
   // ── Nouvelle conversation ──────────────────────────────
   newConversation: () => {
     const { conversations } = get()
-    const hasEmpty = conversations.some(c => c.messages.length === 0)
-    if (hasEmpty) {
-      const empty = conversations.find(c => c.messages.length === 0)
-      set({ activeId: empty.id })
+
+    // ✅ FIX 1 : loaded:true obligatoire pour qu'une conv soit considérée "vide"
+    // Une conv avec loaded:false a messages:[] mais n'est pas vide, elle est juste pas encore chargée
+    const emptyConv = conversations.find(c => c.loaded && c.messages.length === 0)
+    if (emptyConv) {
+      set({ activeId: emptyConv.id })
       return
     }
+
     const id = Date.now()
     set(s => ({
       conversations: [{
@@ -143,6 +143,8 @@ loadMessages: async (conversationId) => {
 
   // ── Envoie un message ──────────────────────────────────
   sendMessage: async (text) => {
+    // ✅ FIX 2 : currentActiveId capturé ici, avant tout appel async
+    // il ne changera pas même si l'utilisateur clique ailleurs pendant l'attente
     const currentActiveId = get().activeId
 
     const userMsg = {
@@ -172,11 +174,14 @@ loadMessages: async (conversationId) => {
         steps: [
           { status: 'done', text: `Intention : ${data.intent}` },
           { status: 'done', text: `Agent : ${data.target_agent}` },
+          ...(data.steps || [])
         ]
       }
 
       set(s => ({
         conversations: s.conversations.map(c =>
+          // ✅ on cible currentActiveId (timestamp local ou vrai id)
+          // puis on remplace l'id local par le vrai id retourné par le backend
           c.id === currentActiveId ? {
             ...c,
             messages: [...c.messages, assistantMsg],
