@@ -1,18 +1,24 @@
 # app/orchestrator/nodes/node1_intent.py
-from langchain_ollama import ChatOllama
+# ═══════════════════════════════════════════════════════════
+# MIGRATION : ChatOllama (qwen3:4b local) → Groq GPT-OSS 20B
+# Modèle léger pour la classification d'intention (économise les tokens)
+# ═══════════════════════════════════════════════════════════
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.orchestrator.state import AssistantState
 from dotenv import load_dotenv
 import json
+import os
 
 load_dotenv()
 
-llm = ChatOllama(
-    model="qwen3:4b-instruct-2507-q4_K_M",
+# ── Groq GPT-OSS 20B via compatibilité OpenAI ─────────────
+llm = ChatOpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.getenv("GROQ_API_KEY"),
+    model="openai/gpt-oss-20b",
     temperature=0,
-    num_ctx=4096,
-    num_predict=512,
-    repeat_penalty=1.1,
+    max_tokens=512,
 )
 
 MAX_HISTORY_MESSAGES = 6
@@ -94,39 +100,93 @@ N'extrais des dates QUE si explicitement mentionnées.
 """
 
 
+def _extract_clean_text(content: str) -> str:
+    """
+    Nettoie le content des AIMessage.
+    Si c'est du JSON (réponse agent RH), extrait le champ "response".
+    Sinon retourne le texte tel quel.
+    """
+    try:
+        parsed = json.loads(content)
+        return parsed.get("response", content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+
+
 async def node1_detect_intent(state: AssistantState) -> AssistantState:
 
     all_messages = state["messages"]
     trimmed = all_messages[-MAX_HISTORY_MESSAGES:] if len(all_messages) > MAX_HISTORY_MESSAGES else all_messages
     last_message = trimmed[-1].content
 
-    history = ""
-    for msg in trimmed[:-1]:
-        role = "Utilisateur" if msg.type == "human" else "Assistant"
-        history += f"{role}: {msg.content}\n"
+    # ── Debug : messages bruts dans le state ───────────────
+    print(f"\n{'='*60}")
+    print(f"🔍 NODE 1 — INTENT DETECTION")
+    print(f"{'='*60}")
+    print(f"📨 Dernier message : {last_message}")
+    print(f"📚 Messages dans le state : {len(all_messages)} total → {len(trimmed)} après trim")
 
+    # ── Construit l'historique NETTOYÉ ─────────────────────
+    history = ""
+    for i, msg in enumerate(trimmed[:-1]):
+        role = "Utilisateur" if msg.type == "human" else "Assistant"
+        # ✅ FIX : nettoie les AIMessage (JSON → texte propre)
+        if msg.type == "human":
+            clean_content = msg.content
+        else:
+            clean_content = _extract_clean_text(msg.content)
+        history += f"{role}: {clean_content}\n"
+
+        # ── Debug : chaque message de l'historique ─────────
+        is_cleaned = (clean_content != msg.content)
+        tag = " 🧹 (nettoyé)" if is_cleaned else ""
+        print(f"  [{i}] {role}{tag}: {clean_content[:120]}")
+
+    print(f"{'─'*60}")
+
+    # ── Construit le prompt final ──────────────────────────
     user_content = ""
     if history:
         user_content += f"Contexte récent :\n{history}\n\n"
     user_content += f"Dernier message : {last_message}"
+
+    # ── Debug : ce que le LLM reçoit ──────────────────────
+    print(f"📤 Prompt envoyé au LLM :")
+    print(f"{user_content}")
+    print(f"{'─'*60}")
 
     response = await llm.ainvoke([
         SystemMessage(content=INTENT_PROMPT),
         HumanMessage(content=user_content),
     ])
 
+    # ── Debug : réponse brute du LLM ──────────────────────
+    print(f"📥 Réponse brute LLM : {response.content[:200]}")
+
     try:
         content = response.content.strip()
+        # GPT-OSS peut retourner du markdown — on nettoie
         if "```" in content:
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
+        # GPT-OSS peut aussi inclure du texte avant/après le JSON
+        # On cherche le premier { et le dernier }
+        start_idx = content.find("{")
+        end_idx = content.rfind("}") + 1
+        if start_idx != -1 and end_idx > start_idx:
+            content = content[start_idx:end_idx]
         result = json.loads(content.strip())
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Parsing JSON échoué ({e}) → fallback chat")
         result = {"intent": "chat", "target_agent": "none", "entities": {}}
 
     if result.get("intent") == "unknown":
         result = {"intent": "chat", "target_agent": "none", "entities": {}}
+
+    # ── Debug : résultat final ─────────────────────────────
+    print(f"✅ Résultat : intent={result.get('intent')} | agent={result.get('target_agent')} | entities={result.get('entities')}")
+    print(f"{'='*60}\n")
 
     return {
         **state,

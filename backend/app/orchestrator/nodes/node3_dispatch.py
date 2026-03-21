@@ -1,22 +1,29 @@
 # app/orchestrator/nodes/node3_dispatch.py
-from langchain_ollama import ChatOllama
+# ═══════════════════════════════════════════════════════════
+#  → Groq GPT-OSS 20B
+# Modèle léger pour le chat conversationnel
+# (le raisonnement complexe est dans les agents A2A)
+# ═══════════════════════════════════════════════════════════
+from langchain_openai import ChatOpenAI
 from datetime import date
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from app.orchestrator.state import AssistantState
 from app.a2a.client import send_task
 from dotenv import load_dotenv
 import json
+import os
 
 load_dotenv()
 
 MAX_HISTORY = 6
 
-llm = ChatOllama(
-    model="qwen3:4b-instruct-2507-q4_K_M",
+# ── Groq GPT-OSS 20B via compatibilité OpenAI ─────────────
+llm = ChatOpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.getenv("GROQ_API_KEY"),
+    model="openai/gpt-oss-20b",
     temperature=0,
-    num_ctx=4096,
-    num_predict=512,
-    repeat_penalty=1.1,
+    max_tokens=512,
 )
 
 # ── Réponses déterministes pour les cas simples ────────────
@@ -79,6 +86,13 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
     all_messages = state["messages"]
     trimmed = all_messages[-MAX_HISTORY:] if len(all_messages) > MAX_HISTORY else all_messages
 
+    # ── Debug ──────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"📡 NODE 3 — DISPATCH")
+    print(f"{'='*60}")
+    print(f"🎯 Intent: {intent} | Agent: {target_agent} | Entities: {entities}")
+    print(f"📚 Messages: {len(all_messages)} total → {len(trimmed)} après trim")
+
     # ── Cas 1 : conversation générale ─────────────────────
     if intent == "chat" or (target_agent == "none" and intent != "unknown"):
         last_message = state["messages"][-1].content
@@ -86,26 +100,37 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
         last_clean = " ".join(last_clean.split())
 
         # ── Fallbacks déterministes ────────────────────────
-        # Remerciement → réponse fixe
         if last_clean in MERCI_KEYWORDS:
+            print(f"💬 Fallback déterministe : MERCI → réponse fixe")
+            print(f"{'='*60}\n")
             return {**state, "final_response": "De rien ! 😊"}
 
-        # Salutation seule → présentation fixe
         if last_clean in SALUTATION_KEYWORDS:
+            print(f"💬 Fallback déterministe : SALUTATION → présentation")
+            print(f"{'='*60}\n")
             return {**state, "final_response": PRESENTATION}
 
-        # Question sur la date → date du jour
         if any(kw in last_clean for kw in DATE_KEYWORDS):
+            print(f"💬 Fallback déterministe : DATE → {today}")
+            print(f"{'='*60}\n")
             return {**state, "final_response": f"Aujourd'hui c'est le {today}."}
 
         # ── LLM pour les autres cas (questions contextuelles) ─
+        print(f"💬 Chat LLM — construction de l'historique :")
         history_messages = []
-        for msg in trimmed[:-1]:
+        for i, msg in enumerate(trimmed[:-1]):
             if msg.type == "human":
                 history_messages.append(HumanMessage(content=msg.content))
+                print(f"  [{i}] 👤 Human: {msg.content[:120]}")
             else:
                 clean = _extract_clean_text(msg.content)
                 history_messages.append(AIMessage(content=clean))
+                is_cleaned = (clean != msg.content)
+                tag = " 🧹 (nettoyé)" if is_cleaned else ""
+                print(f"  [{i}] 🤖 Assistant{tag}: {clean[:120]}")
+
+        print(f"  [→] 👤 Human (dernier): {last_message[:120]}")
+        print(f"{'─'*60}")
 
         chat_prompt_with_date = CHAT_PROMPT + f"\n\nDate du jour : {today}"
 
@@ -114,10 +139,15 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
             *history_messages,
             HumanMessage(content=last_message),
         ])
+
+        print(f"📥 Réponse LLM : {response.content[:200]}")
+        print(f"{'='*60}\n")
         return {**state, "final_response": response.content}
 
     # ── Cas 2 : intent inconnu ────────────────────────────
     if intent == "unknown":
+        print(f"❓ Intent inconnu → message d'aide")
+        print(f"{'='*60}\n")
         return {
             **state,
             "final_response": (
@@ -135,11 +165,18 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
     # ── Cas 3 : dispatch vers l'agent A2A ─────────────────
     original_message = state["messages"][-1].content
 
+    print(f"🚀 Dispatch A2A → agent '{target_agent}'")
+    print(f"📝 Message original : {original_message[:120]}")
+
     history = ""
-    for msg in trimmed[:-1]:
+    for i, msg in enumerate(trimmed[:-1]):
         role = "Utilisateur" if msg.type == "human" else "Assistant"
         clean = _extract_clean_text(msg.content)
         history += f"{role}: {clean}\n"
+
+        is_cleaned = (clean != msg.content)
+        tag = " 🧹 (nettoyé)" if is_cleaned else ""
+        print(f"  [{i}] {role}{tag}: {clean[:120]}")
 
     message = (
         f"Date du jour : {today_iso}\n"
@@ -151,12 +188,20 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
         f"User ID : {user_id}"
     )
 
+    print(f"{'─'*60}")
+    print(f"📤 Message complet envoyé à l'agent :")
+    print(f"{message[:500]}")
+    print(f"{'─'*60}")
+
     try:
         response = await send_task(target_agent, message)
+        print(f"📥 Réponse agent '{target_agent}' : {str(response)[:200]}")
     except Exception as e:
+        print(f"❌ Erreur agent '{target_agent}' : {str(e)}")
         response = (
             f"L'agent {target_agent} est temporairement indisponible. "
             f"Erreur : {str(e)}"
         )
 
+    print(f"{'='*60}\n")
     return {**state, "final_response": response}

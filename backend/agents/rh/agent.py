@@ -1,4 +1,8 @@
 # agents/rh/agent.py
+# ═══════════════════════════════════════════════════════════
+# MIGRATION : ChatOllama (qwen3:4b local) → Groq GPT-OSS 120B
+# Modèle puissant pour le ReAct agent (raisonnement + tool calling)
+# ═══════════════════════════════════════════════════════════
 from dotenv import load_dotenv
 import os
 import json
@@ -7,11 +11,10 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.utils import new_agent_text_message
 
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
-# Après — import depuis prompts.py
 from agents.rh.prompts import RH_REACT_PROMPT
 from agents.rh import tools as rh_tools
 
@@ -74,7 +77,6 @@ async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str)
     Vérifie les conflits dans Google Calendar pour la période donnée.
     Appelle l'Agent Calendar via A2A.
     """
-    # ── MOCK — Agent Calendar pas encore implémenté ────
     return json.dumps({
         "success": True,
         "conflicts": [],
@@ -88,12 +90,10 @@ async def notify_manager(user_id: int, message: str) -> str:
     Notifie le manager de l'employé via Slack.
     Appelle l'Agent Slack via A2A.
     """
-    # ── MOCK — Agent Slack pas encore implémenté ───────
     return json.dumps({
         "success": True,
         "message": f"✅ [MOCK] Notification envoyée au manager : {message}"
     })
-
 
 
 @tool
@@ -109,12 +109,10 @@ async def check_leave_balance(user_id: int, requested_days: int = 0) -> str:
     )
     return json.dumps(result, ensure_ascii=False)
 
+
 # ══════════════════════════════════════════════════════
 # REACT AGENT RH
 # ══════════════════════════════════════════════════════
-
-
-
 
 TOOLS = [
     check_leave_balance,
@@ -126,6 +124,7 @@ TOOLS = [
     notify_manager,
 ]
 
+
 # ══════════════════════════════════════════════════════
 # A2A EXECUTOR — garde la structure A2A officielle
 # ══════════════════════════════════════════════════════
@@ -134,15 +133,17 @@ class RHAgentExecutor(AgentExecutor):
     Pont entre le protocole A2A et le ReAct agent RH.
     - Structure A2A : conforme à la doc officielle
     - Logique interne : ReAct agent LangGraph
+    - LLM : Groq GPT-OSS 120B (raisonnement complexe + tool calling)
     """
 
     def __init__(self) -> None:
-        llm = ChatOllama(
-            model="qwen3:4b-instruct-2507-q4_K_M",
+        # ── Groq GPT-OSS 120B — modèle puissant pour ReAct ──
+        llm = ChatOpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=os.getenv("GROQ_API_KEY"),
+            model="openai/gpt-oss-120b",
             temperature=0,
-            num_predict=2048,
-            repeat_penalty=1.1,
-            num_ctx=4096,
+            max_tokens=2048,
         )
         self.react_agent = create_react_agent(
             model=llm,
@@ -155,24 +156,20 @@ class RHAgentExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
-        # 1. Récupère le message A2A (doc officielle)
         user_input = context.get_user_input()
 
         print(f"\n{'='*50}")
-        print(f"🤖 RHAgent ReAct — Message reçu : {user_input}")
+        print(f"🤖 RHAgent ReAct (Groq 120B) — Message reçu : {user_input}")
         print(f"{'='*50}")
 
-        # 2. Exécute le cycle ReAct
         try:
             result = await self.react_agent.ainvoke({
                 "messages": [HumanMessage(content=user_input)]
             })
 
             # ── Extrait les steps du cycle ReAct ──────────
-            # Utilise tool_call_id pour associer chaque observation
-            # à la bonne étape (gère les appels parallèles correctement)
             react_steps = []
-            tool_calls_map = {}  # ← tool_call_id → index dans react_steps
+            tool_calls_map = {}
 
             for msg in result["messages"]:
                 msg_type = type(msg).__name__
@@ -180,13 +177,11 @@ class RHAgentExecutor(AgentExecutor):
                     for tc in msg.tool_calls:
                         step_text = _tool_to_human_text(tc['name'], tc['args'])
                         react_steps.append(step_text)
-                        # ← mémorise l'index pour ce tool_call_id
                         tool_calls_map[tc['id']] = len(react_steps) - 1
 
                 elif msg_type == "ToolMessage":
                     obs = _format_observation(msg.content)
                     if obs:
-                        # ← utilise tool_call_id pour trouver le bon index
                         tool_call_id = getattr(msg, 'tool_call_id', None)
                         if tool_call_id and tool_call_id in tool_calls_map:
                             idx = tool_calls_map[tool_call_id]
@@ -211,7 +206,6 @@ class RHAgentExecutor(AgentExecutor):
 
             final_response = result["messages"][-1].content
 
-            # ── Encode réponse + steps en JSON ────────────
             response_with_steps = json.dumps({
                 "response": final_response,
                 "react_steps": react_steps,
@@ -224,7 +218,6 @@ class RHAgentExecutor(AgentExecutor):
                 "react_steps": [],
             }, ensure_ascii=False)
 
-        # 3. Retourne la réponse A2A (doc officielle)
         message = new_agent_text_message(response_with_steps)
         await event_queue.enqueue_event(message)
 
