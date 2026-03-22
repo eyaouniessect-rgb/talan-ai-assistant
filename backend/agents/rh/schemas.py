@@ -1,6 +1,11 @@
-# Schémas Pydantic pour les entrées/sorties de l'Agent RH :
-# CreateLeaveRequest, LeaveResponse, TeamAvailabilityResponse
 # agents/rh/schemas.py
+# ═══════════════════════════════════════════════════════════
+# AgentCard A2A + Modèles Pydantic
+# ═══════════════════════════════════════════════════════════
+# IMPORTANT : les skill IDs doivent correspondre EXACTEMENT
+# aux valeurs dans app/a2a/discovery.py → INTENT_TO_SKILL
+# C'est le lien entre le dynamic discovery et les agents.
+
 import os
 from a2a.types import AgentCard, AgentSkill, AgentCapabilities
 from pydantic import BaseModel
@@ -12,7 +17,7 @@ from datetime import date
 # ══════════════════════════════════════════════════
 
 skill_create_leave = AgentSkill(
-    id="create_leave",
+    id="create_leave",           # ← doit matcher INTENT_TO_SKILL
     name="Créer un congé",
     description="Crée une demande de congé pour un employé.",
     tags=["rh", "congé"],
@@ -22,19 +27,30 @@ skill_create_leave = AgentSkill(
     ],
 )
 
+skill_check_leave_balance = AgentSkill(
+    id="check_leave_balance",    # ← doit matcher INTENT_TO_SKILL
+    name="Vérifier le solde de congés",
+    description="Vérifie le solde de congés disponible d'un employé.",
+    tags=["rh", "congé", "solde"],
+    examples=[
+        "Combien de jours de congé il me reste ?",
+        "Mon solde de congés",
+    ],
+)
+
 skill_get_my_leaves = AgentSkill(
-    id="get_my_leaves",
+    id="get_my_leaves",          # ← doit matcher INTENT_TO_SKILL
     name="Consulter mes congés",
     description="Retourne la liste des congés d'un employé.",
     tags=["rh", "congé"],
     examples=[
-        "Combien de jours de congé il me reste ?",
         "Montre-moi mes congés",
+        "Mes congés en attente",
     ],
 )
 
 skill_get_team_availability = AgentSkill(
-    id="get_team_availability",
+    id="get_team_availability",  # ← doit matcher INTENT_TO_SKILL
     name="Disponibilité de l'équipe",
     description="Retourne la disponibilité des membres d'une équipe.",
     tags=["rh", "équipe", "disponibilité"],
@@ -45,7 +61,7 @@ skill_get_team_availability = AgentSkill(
 )
 
 skill_get_team_stack = AgentSkill(
-    id="get_team_stack",
+    id="get_team_stack",         # ← doit matcher INTENT_TO_SKILL
     name="Compétences de l'équipe",
     description="Retourne les compétences techniques des membres de l'équipe.",
     tags=["rh", "compétences"],
@@ -66,6 +82,7 @@ def build_agent_card(host: str, port: int) -> AgentCard:
         capabilities=AgentCapabilities(streaming=False),
         skills=[
             skill_create_leave,
+            skill_check_leave_balance,      # ← AJOUTÉ
             skill_get_my_leaves,
             skill_get_team_availability,
             skill_get_team_stack,
@@ -87,7 +104,7 @@ class LeaveResponse(BaseModel):
     start_date: date
     end_date: date
     days_count: int
-    status: str           # pending | approved | rejected
+    status: str
 
 class TeamMemberAvailability(BaseModel):
     employee_name: str
@@ -98,4 +115,4 @@ class TeamAvailabilityResponse(BaseModel):
     members: list[TeamMemberAvailability]
 
 class TeamStackResponse(BaseModel):
-    members: list[dict]   # [{"name": "Eya", "skills": "Python, React"}]
+    members: list[dict]

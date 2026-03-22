@@ -1,14 +1,15 @@
 # app/orchestrator/nodes/node3_dispatch.py
 # ═══════════════════════════════════════════════════════════
-#  → Groq GPT-OSS 20B
-# Modèle léger pour le chat conversationnel
-# (le raisonnement complexe est dans les agents A2A)
+# DYNAMIC DISCOVERY : Node 3 ne dépend plus de target_agent
+# Il découvre dynamiquement l'agent capable de traiter l'intent
+# via les AgentCards exposées par chaque agent A2A.
 # ═══════════════════════════════════════════════════════════
 from langchain_openai import ChatOpenAI
 from datetime import date
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from app.orchestrator.state import AssistantState
-from app.a2a.client import send_task
+from app.a2a.client import send_task_to_url
+from app.a2a.discovery import discovery
 from dotenv import load_dotenv
 import json
 import os
@@ -68,15 +69,14 @@ def _extract_clean_text(content: str) -> str:
 
 
 def _is_match(message: str, keywords: set) -> bool:
-    """Vérifie si le message correspond à un mot-clé."""
     msg = message.lower().strip().rstrip("!?.,:;")
-    msg = " ".join(msg.split())  # normalise les espaces
+    msg = " ".join(msg.split())
     return msg in keywords or any(kw in msg for kw in keywords)
 
 
 async def node3_dispatch(state: AssistantState) -> AssistantState:
     intent       = state["intent"]
-    target_agent = state["target_agent"]
+    target_agent = state["target_agent"]  # ← encore utilisé comme hint, mais plus comme source de vérité
     entities     = state["entities"]
     user_id      = state["user_id"]
 
@@ -88,9 +88,9 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
 
     # ── Debug ──────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"📡 NODE 3 — DISPATCH")
+    print(f"📡 NODE 3 — DISPATCH (Dynamic Discovery)")
     print(f"{'='*60}")
-    print(f"🎯 Intent: {intent} | Agent: {target_agent} | Entities: {entities}")
+    print(f"🎯 Intent: {intent} | Hint agent: {target_agent} | Entities: {entities}")
     print(f"📚 Messages: {len(all_messages)} total → {len(trimmed)} après trim")
 
     # ── Cas 1 : conversation générale ─────────────────────
@@ -115,7 +115,7 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
             print(f"{'='*60}\n")
             return {**state, "final_response": f"Aujourd'hui c'est le {today}."}
 
-        # ── LLM pour les autres cas (questions contextuelles) ─
+        # ── LLM pour les autres cas ────────────────────────
         print(f"💬 Chat LLM — construction de l'historique :")
         history_messages = []
         for i, msg in enumerate(trimmed[:-1]):
@@ -162,10 +162,53 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
             )
         }
 
-    # ── Cas 3 : dispatch vers l'agent A2A ─────────────────
-    original_message = state["messages"][-1].content
+    # ══════════════════════════════════════════════════════
+    # Cas 3 : DYNAMIC DISCOVERY → dispatch vers agent A2A
+    # ══════════════════════════════════════════════════════
+    print(f"🔍 Dynamic Discovery — recherche d'un agent pour intent '{intent}'...")
 
-    print(f"🚀 Dispatch A2A → agent '{target_agent}'")
+    # ── 1. Découvre l'agent via ses skills ─────────────────
+    discovered_agent = await discovery.find_agent_for_intent(intent)
+
+    if discovered_agent:
+        agent_url = discovered_agent.url
+        agent_name = discovered_agent.name
+        print(f"✅ Agent découvert : '{agent_name}' à {agent_url}")
+        print(f"   Skills : {discovered_agent.skills}")
+        # Met à jour target_agent dans le state avec l'agent découvert
+        target_agent = agent_name
+    else:
+        # ── Fallback : utilise le target_agent de Node 1 comme hint ──
+        print(f"⚠️ Aucun agent découvert pour '{intent}'")
+        if target_agent and target_agent != "none":
+            print(f"🔄 Fallback → utilise hint de Node 1 : '{target_agent}'")
+            from app.a2a.registry import get_agent_url
+            try:
+                agent_url = get_agent_url(target_agent)
+                agent_name = target_agent
+            except ValueError:
+                print(f"❌ Agent '{target_agent}' introuvable même dans le registry")
+                print(f"{'='*60}\n")
+                return {
+                    **state,
+                    "final_response": (
+                        f"Aucun agent disponible pour traiter votre demande ({intent}). "
+                        f"Veuillez réessayer plus tard."
+                    )
+                }
+        else:
+            print(f"❌ Pas de hint, pas d'agent → erreur")
+            print(f"{'='*60}\n")
+            return {
+                **state,
+                "final_response": (
+                    f"Aucun agent disponible pour traiter votre demande ({intent}). "
+                    f"Veuillez réessayer plus tard."
+                )
+            }
+
+    # ── 2. Construit le message enrichi ────────────────────
+    original_message = state["messages"][-1].content
     print(f"📝 Message original : {original_message[:120]}")
 
     history = ""
@@ -189,19 +232,19 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
     )
 
     print(f"{'─'*60}")
-    print(f"📤 Message complet envoyé à l'agent :")
-    print(f"{message[:500]}")
+    print(f"📤 Envoi à l'agent '{agent_name}' ({agent_url})")
     print(f"{'─'*60}")
 
+    # ── 3. Appelle l'agent via A2A ─────────────────────────
     try:
-        response = await send_task(target_agent, message)
-        print(f"📥 Réponse agent '{target_agent}' : {str(response)[:200]}")
+        response = await send_task_to_url(agent_url, message)
+        print(f"📥 Réponse agent '{agent_name}' : {str(response)[:200]}")
     except Exception as e:
-        print(f"❌ Erreur agent '{target_agent}' : {str(e)}")
+        print(f"❌ Erreur agent '{agent_name}' : {str(e)}")
         response = (
-            f"L'agent {target_agent} est temporairement indisponible. "
+            f"L'agent {agent_name} est temporairement indisponible. "
             f"Erreur : {str(e)}"
         )
 
     print(f"{'='*60}\n")
-    return {**state, "final_response": response}
+    return {**state, "target_agent": target_agent, "final_response": response}
