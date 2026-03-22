@@ -193,7 +193,7 @@ class RHAgentExecutor(AgentExecutor):
             for msg in result["messages"]:
                 msg_type = type(msg).__name__
                 if msg_type == "HumanMessage":
-                    print(f"  👤 Human  : {msg.content[:100]}")
+                    print(f"  👤 Human  : {msg.content[:500]}")
                 elif msg_type == "AIMessage":
                     if msg.tool_calls:
                         for tc in msg.tool_calls:
