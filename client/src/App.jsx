@@ -1,10 +1,14 @@
+// src/App.jsx
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from './store'
 import Login from './pages/Login'
 import Layout from './components/layout/Layout'
 import Dashboard from './pages/Dashboard'
 import Chat from './pages/Chat'
-import { Historique, Notifications, NouveauProjet, Settings } from './pages/OtherPages'
+import Historique from './pages/Historique'
+import Notifications from './pages/Notifications'
+import NouveauProjet from './pages/NouveauProjet'
+import Settings from './pages/Settings'
 
 function ProtectedRoute({ children }) {
   const user = useAuthStore(s => s.user)
@@ -17,16 +21,16 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={user ? <Navigate to="/dashboard"/> : <Login/>}/>
-        <Route path="/" element={<ProtectedRoute><Layout/></ProtectedRoute>}>
-          <Route path="dashboard" element={<Dashboard/>}/>
-          <Route path="chat" element={<Chat/>}/>
-          <Route path="historique" element={<Historique/>}/>
-          <Route path="notifications" element={<Notifications/>}/>
-          <Route path="nouveau-projet" element={<NouveauProjet/>}/>
-          <Route path="settings" element={<Settings/>}/>
+        <Route path="/" element={user ? <Navigate to="/dashboard" /> : <Login />} />
+        <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+          <Route path="dashboard" element={<Dashboard />} />
+          <Route path="chat" element={<Chat />} />
+          <Route path="historique" element={<Historique />} />
+          <Route path="notifications" element={<Notifications />} />
+          <Route path="nouveau-projet" element={<NouveauProjet />} />
+          <Route path="settings" element={<Settings />} />
         </Route>
-        <Route path="*" element={<Navigate to="/" replace/>}/>
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
   )
