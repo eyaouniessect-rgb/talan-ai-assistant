@@ -14,12 +14,17 @@ export const sendMessageApi = async (message, conversationId = null) => {
   return response.data
 }
 
+
+
 export const getConversationsApi = async () => {
   const response = await api.get('/chat/conversations')
   return response.data
 }
 
+
+
 export const getMessagesApi = async (conversationId) => {
   const response = await api.get(`/chat/conversations/${conversationId}/messages`)
   return response.data
 }
+

@@ -43,6 +43,7 @@ export const useChatStore = create((set, get) => ({
       // Active la première conversation et charge ses messages
       if (conversations.length > 0) {
         set({ activeId: conversations[0].id })
+        console.log("active id",conversations[0].id)
         await get().loadMessages(conversations[0].id)
       }
     } catch (error) {
@@ -81,6 +82,9 @@ export const useChatStore = create((set, get) => ({
     }
   },
 
+
+
+
   // ── Change de conversation active ─────────────────────
   setActive: async (id) => {
     set({ activeId: id })
@@ -89,6 +93,9 @@ export const useChatStore = create((set, get) => ({
       await get().loadMessages(id)
     }
   },
+
+
+
 
   // ── Nouvelle conversation ──────────────────────────────
   newConversation: () => {
@@ -119,6 +126,8 @@ export const useChatStore = create((set, get) => ({
     }))
   },
 
+
+  
   // ── Envoie un message ──────────────────────────────────
   sendMessage: async (text) => {
     const currentActiveId = get().activeId
