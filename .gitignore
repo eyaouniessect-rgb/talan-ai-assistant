@@ -1,0 +1,24 @@
+# MCP servers (repos git externes, pas à pusher)
+mcp_servers/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.next/
+
+# Env
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db

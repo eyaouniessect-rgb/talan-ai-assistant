@@ -24,10 +24,11 @@ A2A_SECRET = os.getenv("A2A_SECRET_TOKEN", "")
 # ── URLs des agents potentiels ─────────────────────────────
 AGENT_ENDPOINTS = {
     "rh":       os.getenv("AGENT_RH_URL",       "http://localhost:8001"),
-    "crm":      os.getenv("AGENT_CRM_URL",      "http://localhost:8002"),
-    "jira":     os.getenv("AGENT_JIRA_URL",      "http://localhost:8003"),
-    "slack":    os.getenv("AGENT_SLACK_URL",      "http://localhost:8004"),
-    "calendar": os.getenv("AGENT_CALENDAR_URL",  "http://localhost:8005"),
+     "calendar": os.getenv("AGENT_CALENDAR_URL",  "http://localhost:8002"),
+    "crm":      os.getenv("AGENT_CRM_URL",      "http://localhost:8003"),
+    "jira":     os.getenv("AGENT_JIRA_URL",      "http://localhost:8004"),
+    "slack":    os.getenv("AGENT_SLACK_URL",      "http://localhost:8005"),
+   
 }
 
 # ── Mapping intent → skill ID ─────────────────────────────

@@ -1,6 +1,7 @@
 # app/api/chat.py
 from typing import Optional, List
 import json
+import re
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -15,6 +16,63 @@ from app.database.models.chat import Conversation, Message
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 logger = logging.getLogger(__name__)
+
+
+def _normalize(text: str) -> str:
+    """Normalise les caractères Unicode exotiques produits par le LLM."""
+    return (
+        text.lower()
+        .replace("\u2011", "-")   # non-breaking hyphen → -
+        .replace("\u2010", "-")   # hyphen → -
+        .replace("\u2013", "-")   # en-dash → -
+        .replace("\u2014", "-")   # em-dash → -
+        .replace("\u202f", " ")   # narrow no-break space → space
+        .replace("\u00a0", " ")   # no-break space → space
+        .replace("\u00ab", '"')   # «
+        .replace("\u00bb", '"')   # »
+    )
+
+
+def _detect_ui_hint(text: str) -> "dict | None":
+    """Détecte le composant UI interactif à afficher selon le texte de la réponse."""
+    t = _normalize(text)
+
+    # ── 1. Choix en ligne / présentiel ───────────────────
+    if ("en ligne" in t or "presentiel" in t or "distanciel" in t) and "?" in t:
+        return {
+            "type": "choice",
+            "options": [
+                {"label": "En ligne (Google Meet)", "value": "oui, en ligne avec Google Meet", "icon": "video"},
+                {"label": "Présentiel", "value": "non, en présentiel", "icon": "building"},
+            ],
+        }
+
+    # ── 2. Boutons Oui / Non ─────────────────────────────
+    is_oui_non = (
+        "souhaitez-vous" in t or
+        "voulez-vous" in t or
+        "confirmez-vous" in t or
+        bool(re.search(r"oui\s*/\s*non", t)) or
+        bool(re.search(r"r.pondez.*oui", t)) or
+        ("oui" in t and "non" in t and "?" in t)
+    )
+    is_time_or_detail = bool(re.search(r"quelle heure|quel titre|quel jour", t))
+    if is_oui_non and not is_time_or_detail:
+        return {"type": "confirm", "options": ["Oui", "Non"]}
+
+    # ── 3. Date + heure début/fin (événements calendar) ──
+    if re.search(r"quelle heure|a quelle heure|heure.*(debut|fin)|debut et fin|date.{0,15}(horaire|heure)|horaire.{0,15}souhait|nouvelle date.{0,15}heur|preciser.{0,20}(date|heure|horaire)", t):
+        return {"type": "event_datetime"}
+
+    # ── 4. Plage de dates (congés, disponibilités) ───────
+    if re.search(r"dates de (d.but|fin)|p.riode souhait.e|date de debut.*date de fin", t):
+        return {"type": "date_range"}
+
+    # ── 5. Date simple ───────────────────────────────────
+    if re.search(r"quelle date|a quelle date|precisez la date|choisissez une date|quel jour|nouvelle date", t):
+        return {"type": "date_picker"}
+
+    return None
 
 
 class ChatRequest(BaseModel):
@@ -33,6 +91,7 @@ class ChatResponse(BaseModel):
     target_agent: str
     conversation_id: int
     steps: List[ReActStep] = []
+    ui_hint: Optional[dict] = None
 
 
 @router.post("/", response_model=ChatResponse)
@@ -111,10 +170,17 @@ async def chat(
             ReActStep(status="done", text=step)
             for step in parsed.get("react_steps", [])
         ]
+        ui_hint = parsed.get("ui_hint")
         logger.info("Réponse parsée (JSON) ✅")
     except (json.JSONDecodeError, TypeError):
         final_text = raw_response
+        ui_hint = None
         logger.info("Réponse texte simple ✅")
+
+    # ── Fallback : détecte ui_hint si l'agent n'en a pas fourni ──
+    if ui_hint is None:
+        ui_hint = _detect_ui_hint(final_text)
+    logger.info(f"🎨 UI hint final : {ui_hint} | texte[:100] : {final_text[:100]}")
 
     # ── 5. Sauvegarde dans les tables ─────────────────────
     db.add(Message(
@@ -139,6 +205,7 @@ async def chat(
         target_agent=result["target_agent"],
         conversation_id=conversation.id,
         steps=react_steps,
+        ui_hint=ui_hint,
     )
 
 
