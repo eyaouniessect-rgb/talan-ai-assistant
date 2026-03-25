@@ -158,6 +158,7 @@ export const useChatStore = create((set, get) => ({
         content: data.response,
         time: now(),
         steps: buildSteps(data),
+        ui_hint: data.ui_hint || null,
       }
 
       set(s => ({

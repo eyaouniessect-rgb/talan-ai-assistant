@@ -1,22 +1,21 @@
 # agents/rh/agent.py
 # ═══════════════════════════════════════════════════════════
-# MIGRATION : ChatOllama (qwen3:4b local) → Groq GPT-OSS 120B
-# Modèle puissant pour le ReAct agent (raisonnement + tool calling)
+# Agent RH — ReAct (GPT-OSS 120B) avec failover clés Groq
 # ═══════════════════════════════════════════════════════════
 from dotenv import load_dotenv
-import os
 import json
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.utils import new_agent_text_message
 
-from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
+
 from agents.rh.prompts import RH_REACT_PROMPT
 from agents.rh import tools as rh_tools
+from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error
 
 load_dotenv()
 
@@ -75,7 +74,6 @@ async def get_team_stack(user_id: int) -> str:
 async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str) -> str:
     """
     Vérifie les conflits dans Google Calendar pour la période donnée.
-    Appelle l'Agent Calendar via A2A.
     """
     return json.dumps({
         "success": True,
@@ -88,7 +86,6 @@ async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str)
 async def notify_manager(user_id: int, message: str) -> str:
     """
     Notifie le manager de l'employé via Slack.
-    Appelle l'Agent Slack via A2A.
     """
     return json.dumps({
         "success": True,
@@ -111,7 +108,7 @@ async def check_leave_balance(user_id: int, requested_days: int = 0) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# REACT AGENT RH
+# LISTE DES OUTILS
 # ══════════════════════════════════════════════════════
 
 TOOLS = [
@@ -126,21 +123,22 @@ TOOLS = [
 
 
 # ══════════════════════════════════════════════════════
-# A2A EXECUTOR — garde la structure A2A officielle
+# A2A EXECUTOR avec failover
 # ══════════════════════════════════════════════════════
+
 class RHAgentExecutor(AgentExecutor):
     """
     Pont entre le protocole A2A et le ReAct agent RH.
-    - Structure A2A : conforme à la doc officielle
-    - Logique interne : ReAct agent LangGraph
-    - LLM : Groq GPT-OSS 120B (raisonnement complexe + tool calling)
+    Failover : si la clé Groq tombe, reconstruit le ReAct agent
+    avec la clé suivante et retente.
     """
 
     def __init__(self) -> None:
-        # ── Groq GPT-OSS 120B — modèle puissant pour ReAct ──
-        llm = ChatOpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("GROQ_API_KEY"),
+        self._build_react_agent()
+
+    def _build_react_agent(self) -> None:
+        """Construit le ReAct agent avec la clé Groq active."""
+        llm = build_llm(
             model="openai/gpt-oss-120b",
             temperature=0,
             max_tokens=2048,
@@ -162,61 +160,83 @@ class RHAgentExecutor(AgentExecutor):
         print(f"🤖 RHAgent ReAct (Groq 120B) — Message reçu : {user_input}")
         print(f"{'='*50}")
 
-        try:
-            result = await self.react_agent.ainvoke({
-                "messages": [HumanMessage(content=user_input)]
-            })
+        # ── Tentative avec failover ────────────────────────
+        max_retries = 3
+        result = None
+        for attempt in range(max_retries):
+            try:
+                result = await self.react_agent.ainvoke({
+                    "messages": [HumanMessage(content=user_input)]
+                })
+                break
 
-            # ── Extrait les steps du cycle ReAct ──────────
-            react_steps = []
-            tool_calls_map = {}
+            except Exception as e:
+                if _is_fallback_error(e) and rotate_llm_key():
+                    print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
+                    self._build_react_agent()
+                    continue
+                else:
+                    print(f"❌ Erreur ReAct : {str(e)}")
+                    response_with_steps = json.dumps({
+                        "response": f"Erreur lors du traitement : {str(e)}",
+                        "react_steps": [],
+                    }, ensure_ascii=False)
+                    message = new_agent_text_message(response_with_steps)
+                    await event_queue.enqueue_event(message)
+                    return
 
-            for msg in result["messages"]:
-                msg_type = type(msg).__name__
-                if msg_type == "AIMessage" and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        step_text = _tool_to_human_text(tc['name'], tc['args'])
-                        react_steps.append(step_text)
-                        tool_calls_map[tc['id']] = len(react_steps) - 1
-
-                elif msg_type == "ToolMessage":
-                    obs = _format_observation(msg.content)
-                    if obs:
-                        tool_call_id = getattr(msg, 'tool_call_id', None)
-                        if tool_call_id and tool_call_id in tool_calls_map:
-                            idx = tool_calls_map[tool_call_id]
-                            react_steps[idx] += f"\n   → {obs}"
-
-            # ── Log terminal ───────────────────────────────
-            print(f"\n{'─'*50}")
-            print("🧠 CYCLE ReAct :")
-            for msg in result["messages"]:
-                msg_type = type(msg).__name__
-                if msg_type == "HumanMessage":
-                    print(f"  👤 Human  : {msg.content[:500]}")
-                elif msg_type == "AIMessage":
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            print(f"  🔧 Act    : {tc['name']}({tc['args']})")
-                    else:
-                        print(f"  🤖 Answer : {msg.content[:200]}")
-                elif msg_type == "ToolMessage":
-                    print(f"  👁️  Observe: {msg.content[:100]}")
-            print(f"{'─'*50}\n")
-
-            final_response = result["messages"][-1].content
-
+        if result is None:
             response_with_steps = json.dumps({
-                "response": final_response,
-                "react_steps": react_steps,
-            }, ensure_ascii=False)
-
-        except Exception as e:
-            print(f"❌ Erreur ReAct : {str(e)}")
-            response_with_steps = json.dumps({
-                "response": f"Erreur lors du traitement : {str(e)}",
+                "response": "Toutes les clés API sont temporairement indisponibles. Veuillez réessayer.",
                 "react_steps": [],
             }, ensure_ascii=False)
+            message = new_agent_text_message(response_with_steps)
+            await event_queue.enqueue_event(message)
+            return
+
+        # ── Extrait les steps du cycle ReAct ──────────────
+        react_steps = []
+        tool_calls_map = {}
+
+        for msg in result["messages"]:
+            msg_type = type(msg).__name__
+            if msg_type == "AIMessage" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    step_text = _tool_to_human_text(tc['name'], tc['args'])
+                    react_steps.append(step_text)
+                    tool_calls_map[tc['id']] = len(react_steps) - 1
+
+            elif msg_type == "ToolMessage":
+                obs = _format_observation(msg.content)
+                if obs:
+                    tool_call_id = getattr(msg, 'tool_call_id', None)
+                    if tool_call_id and tool_call_id in tool_calls_map:
+                        idx = tool_calls_map[tool_call_id]
+                        react_steps[idx] += f"\n   → {obs}"
+
+        # ── Log terminal ──────────────────────────────────
+        print(f"\n{'─'*50}")
+        print("🧠 CYCLE ReAct :")
+        for msg in result["messages"]:
+            msg_type = type(msg).__name__
+            if msg_type == "HumanMessage":
+                print(f"  👤 Human  : {msg.content[:500]}")
+            elif msg_type == "AIMessage":
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        print(f"  🔧 Act    : {tc['name']}({tc['args']})")
+                else:
+                    print(f"  🤖 Answer : {msg.content[:200]}")
+            elif msg_type == "ToolMessage":
+                print(f"  👁️  Observe: {msg.content[:100]}")
+        print(f"{'─'*50}\n")
+
+        final_response = result["messages"][-1].content
+
+        response_with_steps = json.dumps({
+            "response": final_response,
+            "react_steps": react_steps,
+        }, ensure_ascii=False)
 
         message = new_agent_text_message(response_with_steps)
         await event_queue.enqueue_event(message)

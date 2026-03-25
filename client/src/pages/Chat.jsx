@@ -10,6 +10,11 @@ import {
   Zap,
   CheckCircle,
   Loader,
+  Video,
+  Building2,
+  Calendar,
+  Clock,
+  MapPin,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import clsx from "clsx";
@@ -77,7 +82,190 @@ function ThinkingCard({ steps }) {
   );
 }
 
-function Message({ msg }) {
+const CHOICE_ICONS = { video: Video, building: Building2, map: MapPin };
+
+function InteractiveHint({ hint, onSend }) {
+  const [date, setDate] = useState("");
+  const [dateEnd, setDateEnd] = useState("");
+  const [timeStart, setTimeStart] = useState("");
+  const [timeEnd, setTimeEnd] = useState("");
+  const [sent, setSent] = useState(false);
+
+  if (!hint || sent) return null;
+
+  const send = (text) => {
+    setSent(true);
+    onSend(text);
+  };
+
+  /* ── Boutons Oui / Non ─────────────────────────────── */
+  if (hint.type === "confirm") {
+    return (
+      <div className="flex gap-2 mt-3 fade-in-up">
+        {hint.options.map((opt) => (
+          <button
+            key={opt}
+            onClick={() => send(opt)}
+            className={clsx(
+              "px-5 py-2.5 rounded-xl text-sm font-semibold border-2 transition-all active:scale-95 shadow-sm",
+              opt === "Oui"
+                ? "border-green-400 text-green-700 hover:bg-green-50 hover:shadow-green-100"
+                : "border-red-300 text-red-600 hover:bg-red-50 hover:shadow-red-100",
+            )}
+          >
+            {opt}
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  /* ── Choix multiples (en ligne / présentiel, etc.) ── */
+  if (hint.type === "choice") {
+    return (
+      <div className="flex flex-wrap gap-2 mt-3 fade-in-up">
+        {hint.options.map((opt) => {
+          const Icon = CHOICE_ICONS[opt.icon] || Zap;
+          return (
+            <button
+              key={opt.value}
+              onClick={() => send(opt.value)}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold border-2 border-slate-200 text-slate-700 hover:border-cyan hover:text-cyan hover:bg-cyan/5 transition-all active:scale-95 shadow-sm"
+            >
+              <Icon size={16} />
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  /* ── Date + heure début/fin (événements) ────────────── */
+  if (hint.type === "event_datetime") {
+    const canConfirm = date && timeStart && timeEnd;
+    return (
+      <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 fade-in-up">
+        <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          <Calendar size={14} className="text-cyan" />
+          Choisir date et horaires
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400">Date</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 flex items-center gap-1">
+              <Clock size={11} /> Début
+            </label>
+            <input
+              type="time"
+              value={timeStart}
+              onChange={(e) => setTimeStart(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+          <span className="text-slate-300 mt-5">→</span>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 flex items-center gap-1">
+              <Clock size={11} /> Fin
+            </label>
+            <input
+              type="time"
+              value={timeEnd}
+              onChange={(e) => setTimeEnd(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+        </div>
+        {canConfirm && (
+          <button
+            onClick={() => send(`le ${date} de ${timeStart} à ${timeEnd}`)}
+            className="bg-cyan text-white px-5 py-2 rounded-xl text-sm font-medium hover:bg-cyan/90 active:scale-95 transition-all shadow-sm"
+          >
+            Confirmer
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  /* ── Date simple ────────────────────────────────────── */
+  if (hint.type === "date_picker") {
+    return (
+      <div className="flex items-center gap-2 mt-3 fade-in-up">
+        <div className="flex items-center gap-2 p-2 bg-slate-50 border border-slate-200 rounded-xl">
+          <Calendar size={14} className="text-cyan" />
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            className="border-none bg-transparent text-sm outline-none"
+          />
+        </div>
+        {date && (
+          <button
+            onClick={() => send(date)}
+            className="bg-cyan text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-cyan/90 active:scale-95 transition-all shadow-sm"
+          >
+            Confirmer
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  /* ── Plage de dates (congés) ────────────────────────── */
+  if (hint.type === "date_range") {
+    return (
+      <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 fade-in-up">
+        <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          <Calendar size={14} className="text-cyan" />
+          Choisir la période
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400">Date début</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+          <span className="text-slate-300 mt-5">→</span>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400">Date fin</label>
+            <input
+              type="date"
+              value={dateEnd}
+              onChange={(e) => setDateEnd(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+        </div>
+        {date && dateEnd && (
+          <button
+            onClick={() => send(`du ${date} au ${dateEnd}`)}
+            className="bg-cyan text-white px-5 py-2 rounded-xl text-sm font-medium hover:bg-cyan/90 active:scale-95 transition-all shadow-sm"
+          >
+            Confirmer
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function Message({ msg, isLast, onSend }) {
   const isUser = msg.role === "user";
   return (
     <div
@@ -106,6 +294,9 @@ function Message({ msg }) {
             </div>
           )}
         </div>
+        {!isUser && isLast && msg.ui_hint && (
+          <InteractiveHint hint={msg.ui_hint} onSend={onSend} />
+        )}
         <span className="text-xs text-slate-400 mt-1 px-1">{msg.time}</span>
       </div>
     </div>
@@ -178,7 +369,7 @@ export default function Chat() {
   return (
     <div className="flex h-full">
       {/* Liste des conversations */}
-      <div className="w-72 border-r border-slate-100 bg-white flex flex-col shrink-0 hidden md:flex">
+      <div className="w-72 border-r border-slate-100 bg-white flex-col shrink-0 hidden md:flex">
         <div className="p-4 border-b border-slate-100">
           <button
             onClick={newConversation}
@@ -256,7 +447,12 @@ export default function Chat() {
           )}
 
           {active?.messages?.map((msg, i) => (
-            <Message key={i} msg={msg} />
+            <Message
+              key={i}
+              msg={msg}
+              isLast={i === active.messages.length - 1 && !isTyping}
+              onSend={sendMessage}
+            />
           ))}
 
           {isTyping && <TypingIndicator />}

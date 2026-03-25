@@ -22,6 +22,10 @@ PERMISSIONS = [
     {"role": "consultant", "action": "update_ticket",         "allowed": True},
     {"role": "consultant", "action": "get_calendar",          "allowed": True},
     {"role": "consultant", "action": "create_event",          "allowed": True},
+    {"role": "consultant", "action": "update_event",          "allowed": True},
+    {"role": "consultant", "action": "delete_event",          "allowed": True},
+    {"role": "consultant", "action": "check_availability",    "allowed": True},
+    {"role": "consultant", "action": "search_events",         "allowed": True},
     {"role": "consultant", "action": "send_message",          "allowed": True},
     {"role": "consultant", "action": "search_docs",           "allowed": True},
 
@@ -37,6 +41,10 @@ PERMISSIONS = [
     {"role": "pm", "action": "update_ticket",         "allowed": True},
     {"role": "pm", "action": "get_calendar",          "allowed": True},
     {"role": "pm", "action": "create_event",          "allowed": True},
+    {"role": "pm", "action": "update_event",          "allowed": True},
+    {"role": "pm", "action": "delete_event",          "allowed": True},
+    {"role": "pm", "action": "check_availability",    "allowed": True},
+    {"role": "pm", "action": "search_events",         "allowed": True},
     {"role": "pm", "action": "send_message",          "allowed": True},
     {"role": "pm", "action": "search_docs",           "allowed": True},
 ]
@@ -47,7 +55,7 @@ async def seed():
             db.add(Permission(**p))
         await db.commit()
         print(f"✅ {len(PERMISSIONS)} permissions créées !")
-        print("   consultant → 11 actions autorisées")
-        print("   pm         → 13 actions autorisées")
+        print("   consultant → 15 actions autorisées")
+        print("   pm         → 17 actions autorisées")
 
 asyncio.run(seed())

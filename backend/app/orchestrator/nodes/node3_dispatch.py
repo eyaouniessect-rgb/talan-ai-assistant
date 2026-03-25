@@ -4,28 +4,19 @@
 # Il découvre dynamiquement l'agent capable de traiter l'intent
 # via les AgentCards exposées par chaque agent A2A.
 # ═══════════════════════════════════════════════════════════
-from langchain_openai import ChatOpenAI
 from datetime import date
+import locale
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from app.orchestrator.state import AssistantState
+from app.core.groq_client import invoke_with_fallback
 from app.a2a.client import send_task_to_url
 from app.a2a.discovery import discovery
 from dotenv import load_dotenv
 import json
-import os
 
 load_dotenv()
 
-MAX_HISTORY = 6
-
-# ── Groq GPT-OSS 20B via compatibilité OpenAI ─────────────
-llm = ChatOpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROQ_API_KEY"),
-    model="openai/gpt-oss-20b",
-    temperature=0,
-    max_tokens=512,
-)
+MAX_HISTORY = 10
 
 # ── Réponses déterministes pour les cas simples ────────────
 MERCI_KEYWORDS = {
@@ -80,8 +71,11 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
     entities     = state["entities"]
     user_id      = state["user_id"]
 
-    today     = date.today().strftime("%d/%m/%Y")
-    today_iso = date.today().strftime("%Y-%m-%d")
+    _today = date.today()
+    _JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+    today_day = _JOURS[_today.weekday()]
+    today     = _today.strftime("%d/%m/%Y")
+    today_iso = f"{_today.strftime('%Y-%m-%d')} ({today_day})"
 
     all_messages = state["messages"]
     trimmed = all_messages[-MAX_HISTORY:] if len(all_messages) > MAX_HISTORY else all_messages
@@ -134,15 +128,20 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
 
         chat_prompt_with_date = CHAT_PROMPT + f"\n\nDate du jour : {today}"
 
-        response = await llm.ainvoke([
-            SystemMessage(content=chat_prompt_with_date),
-            *history_messages,
-            HumanMessage(content=last_message),
-        ])
+        response_content = await invoke_with_fallback(
+            model="openai/gpt-oss-20b",
+            messages=[
+                SystemMessage(content=chat_prompt_with_date),
+                *history_messages,
+                HumanMessage(content=last_message),
+            ],
+            temperature=0,
+            max_tokens=512,
+        )
 
-        print(f"📥 Réponse LLM : {response.content[:200]}")
+        print(f"📥 Réponse LLM : {response_content[:200]}")
         print(f"{'='*60}\n")
-        return {**state, "final_response": response.content}
+        return {**state, "final_response": response_content}
 
     # ── Cas 2 : intent inconnu ────────────────────────────
     if intent == "unknown":

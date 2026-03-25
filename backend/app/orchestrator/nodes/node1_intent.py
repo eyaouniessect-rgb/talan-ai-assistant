@@ -1,61 +1,30 @@
 # app/orchestrator/nodes/node1_intent.py
 # ═══════════════════════════════════════════════════════════
-# MIGRATION : ChatOllama (qwen3:4b local) → Groq GPT-OSS 20B
-# Modèle léger pour la classification d'intention (économise les tokens)
+# Modèle : GPT-OSS 120B — classification d'intention + entités
+# Date du jour injectée dynamiquement (avec jour de la semaine)
 # ═══════════════════════════════════════════════════════════
-from langchain_openai import ChatOpenAI
+from datetime import date
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.orchestrator.state import AssistantState
+from app.core.groq_client import invoke_with_fallback
 from dotenv import load_dotenv
 import json
-import os
 
 load_dotenv()
 
-# ── Groq GPT-OSS 20B via compatibilité OpenAI ─────────────
-llm = ChatOpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROQ_API_KEY"),
-    model="openai/gpt-oss-20b",
-    temperature=0,
-    max_tokens=512,
-)
-
-MAX_HISTORY_MESSAGES = 6
+MAX_HISTORY_MESSAGES = 10
 
 INTENT_PROMPT = """
 Tu es un analyseur d'intention pour un assistant d'entreprise.
-Analyse le message utilisateur et retourne UNIQUEMENT un JSON valide, sans markdown.
+Retourne UNIQUEMENT un JSON valide, sans markdown.
 
 ═══════════════════════════════════════════
-RÈGLE N°1 — PRIORITÉ À L'ACTION
+RÈGLE PRINCIPALE — L'ACTION PRIME TOUJOURS
 ═══════════════════════════════════════════
-Si le message contient UNE action métier, utilise l'intention de l'action.
+Si le message contient un verbe d'action métier → utilise cet intent.
+Peu importe le contexte. Peu importe les accents ou fautes de frappe.
 
-✅ "bonjour, je veux créer un congé"       → create_leave
-✅ "salut, montre-moi mes projets"         → get_my_projects
-✅ "bonjour c possible de créer un congé"  → create_leave
-❌ "bonjour" seul                          → chat
-❌ "c'est quoi la date ?"                  → chat (PAS get_calendar !)
-❌ "quelle est la date aujourd'hui ?"      → chat (PAS get_calendar !)
-
-get_calendar = UNIQUEMENT pour "montre-moi mon calendrier",
-               "mes événements", "mes réunions"
-
-═══════════════════════════════════════════
-RÈGLE N°2 — MESSAGES CONVERSATIONNELS
-═══════════════════════════════════════════
-intent: chat si le message ne contient AUCUNE action :
-- Salutations          : "bonjour", "salut", "hello"
-- Remerciements        : "merci", "ok merci", "super", "parfait"
-- Confirmations        : "ok", "d'accord"
-- Politesse            : "au revoir", "bonne journée"
-- Questions sur la date: "c'est quoi la date", "quel jour sommes-nous"
-- Questions contextuelles : "qu'est-ce qu'on a fait", "rappelle-moi"
-
-═══════════════════════════════════════════
-INTENTIONS DISPONIBLES
-═══════════════════════════════════════════
+INTENTIONS DISPONIBLES :
 - chat                  → agent: none
 - create_leave          → agent: rh
 - check_leave_balance   → agent: rh
@@ -71,7 +40,75 @@ INTENTIONS DISPONIBLES
 - send_message          → agent: slack
 - get_calendar          → agent: calendar
 - create_event          → agent: calendar
+- update_event          → agent: calendar
+- delete_event          → agent: calendar
+- search_events         → agent: calendar
+- check_availability    → agent: calendar
 - search_docs           → agent: rag
+
+Règle chat : UNIQUEMENT pour salutations seules, politesses finales, remerciements.
+❌ "oui/non/ok/bien sûr" seuls → PAS chat (voir RÈGLE CONTEXTE)
+
+═══════════════════════════════════════════
+RÈGLE CONTEXTE — si le message N'a PAS d'action propre
+═══════════════════════════════════════════
+Si le message est ambigu (pas de verbe d'action clair) ET que l'assistant
+vient de poser une question → c'est une réponse à cette question.
+→ utilise l'intent de l'action en cours dans l'historique.
+
+Détection "réponse à une question" :
+  - Messages courts sans verbe d'action : "oui", "non", "14h", "bien sûr", "avec Meet",
+    "déjeuner d'équipe", "lundi prochain", un email, un prénom, etc.
+  → intent = même intent que l'action en cours
+
+Détection "nouvelle action indépendante" :
+  - Le message contient un verbe d'action (même sans accent, même avec fautes)
+    ex: "creer", "planifie", "supprime", "modifie", "cree", "ajoute", "organise"
+  → intent = nouvelle action, IGNORE le contexte
+
+═══════════════════════════════════════════
+CORRESPONDANCES CALENDAR
+═══════════════════════════════════════════
+create_event  = verbe créer/planifier/ajouter/organiser + événement quelconque
+                (réunion, meeting, déjeuner, appel, standup, call, etc.)
+update_event  = verbe modifier/changer/décaler/mettre à jour + événement existant
+delete_event  = verbe supprimer/annuler/retirer + événement existant
+get_calendar  = "montre", "affiche", "liste" + événements/réunions/agenda
+check_availability = "disponible", "libre", "quelque chose de prévu", "conflits"
+search_events = "cherche", "trouve" + événement
+
+═══════════════════════════════════════════
+EXEMPLES — L'ACTION PRIME
+═══════════════════════════════════════════
+
+Historique : Assistant: "Souhaitez-vous un Google Meet ?"
+Message : "creer un reunion ce vendredi"
+→ NOUVELLE ACTION (verbe "creer") → create_event  ← PAS chat
+
+Historique : Assistant: "À quelle heure ?"
+Message : "14h"
+→ PAS de verbe d'action → CONTEXTE → create_event (hérite de l'historique)
+
+Historique : Assistant: "Souhaitez-vous un Google Meet ?"
+Message : "oui"
+→ PAS de verbe d'action → CONTEXTE → create_event
+
+Historique : Assistant: "Souhaitez-vous un Google Meet ?"
+Message : "bien sûr"
+→ PAS de verbe d'action → CONTEXTE → create_event
+
+Historique : Assistant: "Quel est le titre exact ?"
+Message : "déjeuner d'équipe"
+→ PAS de verbe d'action → CONTEXTE → delete_event (hérite de l'historique)
+
+Historique : Assistant: "Souhaitez-vous un Google Meet ?"
+Message : "crée-moi un congé semaine prochaine"
+→ NOUVELLE ACTION (verbe "crée") → create_leave  ← ignore le contexte calendar
+
+Correction post-création :
+Historique : Assistant: "Réunion créée ✅ ... sans lien Google Meet."
+Message : "non la réunion est en ligne"
+→ correction d'une action récente → update_event
 
 ═══════════════════════════════════════════
 FORMAT OBLIGATOIRE
@@ -79,24 +116,15 @@ FORMAT OBLIGATOIRE
 JSON pur, sans markdown :
 {"intent": "nom_intention", "target_agent": "nom_agent", "entities": {}}
 
-Exemples :
-- create_leave        : {"start_date": "2026-04-01", "end_date": "2026-04-05"}
-- check_leave_balance : {"requested_days": 5}
-- create_ticket       : {"title": "Bug login", "priority": "High"}
+Entités optionnelles :
+- create_leave   : {"start_date": "2026-04-01", "end_date": "2026-04-05"}
+- create_event   : {"title": "Réunion", "start_date": "2026-03-27", "start_time": "14:00", "end_time": "15:00"}
+- get_calendar   : {"start_date": "2026-03-27", "end_date": "2026-03-28"}
+- update_event   : {"event_id": "abc123", "title": "Nouveau titre"}
+- delete_event   : {"event_id": "abc123"}
+- search_events  : {"query": "réunion projet"}
 
-═══════════════════════════════════════════
-RÈGLES COMPLÉMENTAIRES
-═══════════════════════════════════════════
-- Contexte ("du 15 au 21", "oui confirme") → utilise l'historique
-- unknown = SEULEMENT si totalement incompréhensible
-- En cas de doute → préfère TOUJOURS chat
-
-═══════════════════════════════════════════
-RÈGLE ENTITÉS — DATES
-═══════════════════════════════════════════
 N'extrais des dates QUE si explicitement mentionnées.
-✅ "congé du 20 au 25 avril" → {"start_date": "2026-04-20", "end_date": "2026-04-25"}
-❌ "je veux créer un congé"  → {"entities": {}}
 """
 
 
@@ -111,6 +139,7 @@ def _extract_clean_text(content: str) -> str:
         return parsed.get("response", content)
     except (json.JSONDecodeError, TypeError):
         return content
+
 
 
 async def node1_detect_intent(state: AssistantState) -> AssistantState:
@@ -155,16 +184,26 @@ async def node1_detect_intent(state: AssistantState) -> AssistantState:
     print(f"{user_content}")
     print(f"{'─'*60}")
 
-    response = await llm.ainvoke([
-        SystemMessage(content=INTENT_PROMPT),
+    _today = date.today()
+    _JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+    today_str = f"{_today.strftime('%Y-%m-%d')} ({_JOURS[_today.weekday()]})"
+    intent_prompt_with_date = INTENT_PROMPT + f"\n\nDate du jour : {today_str}"
+
+    response_content = await invoke_with_fallback(
+        model="openai/gpt-oss-120b",
+        messages=[
+        SystemMessage(content=intent_prompt_with_date),
         HumanMessage(content=user_content),
-    ])
+        ],
+        temperature=0,
+        max_tokens=512,
+    )
 
     # ── Debug : réponse brute du LLM ──────────────────────
-    print(f"📥 Réponse brute LLM : {response.content[:200]}")
+    print(f"📥 Réponse brute LLM : {response_content[:200]}")
 
     try:
-        content = response.content.strip()
+        content = response_content.strip()
         # GPT-OSS peut retourner du markdown — on nettoie
         if "```" in content:
             content = content.split("```")[1]
