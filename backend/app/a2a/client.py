@@ -28,7 +28,7 @@ async def send_task_to_url(agent_url: str, user_message: str) -> str:
     if A2A_SECRET:
         headers["Authorization"] = f"Bearer {A2A_SECRET}"
 
-    async with httpx.AsyncClient(timeout=120, headers=headers) as httpx_client:
+    async with httpx.AsyncClient(timeout=300, headers=headers) as httpx_client:
         client = await ClientFactory.connect(
             agent_url,
             client_config=ClientConfig(httpx_client=httpx_client),

@@ -52,9 +52,33 @@ FALLBACK_ERRORS = (
     "529",
 )
 
+# Erreurs de dépassement de quota/tokens (rotation de clé inutile — même limite)
+QUOTA_ERRORS = (
+    "request too large",
+    "tokens per minute",
+    "413",
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+FRIENDLY_QUOTA_MSG = (
+    "⚠️ Le service IA est temporairement indisponible : limite de tokens atteinte.\n"
+    "Cela se produit lorsque la conversation est très longue ou que le quota minute est épuisé.\n"
+    "**Que faire ?**\n"
+    "- Patientez quelques secondes et réessayez\n"
+    "- Ou démarrez une nouvelle conversation (bouton ✚ en haut à gauche)"
+)
+
+
 def _is_fallback_error(error: Exception) -> bool:
     error_str = str(error).lower()
     return any(code in error_str for code in FALLBACK_ERRORS)
+
+
+def _is_quota_error(error: Exception) -> bool:
+    """Retourne True si l'erreur est un dépassement de quota/tokens (rotation inutile)."""
+    error_str = str(error).lower()
+    return any(code in error_str for code in QUOTA_ERRORS)
 
 
 # ══════════════════════════════════════════════════════
@@ -91,7 +115,11 @@ async def invoke_with_fallback(
 
         except Exception as e:
             last_error = e
-            if _is_fallback_error(e):
+            if _is_quota_error(e):
+                # Quota tokens/minute dépassé → inutile de tourner, on sort immédiatement
+                logger.warning(f"Groq : quota tokens dépassé (clé #{i+1}) : {str(e)[:120]}")
+                raise RuntimeError(FRIENDLY_QUOTA_MSG) from e
+            elif _is_fallback_error(e):
                 logger.warning(f"Groq : clé #{i+1} échouée ({type(e).__name__}: {str(e)[:80]}) → essai suivant")
                 continue
             else:
@@ -99,6 +127,8 @@ async def invoke_with_fallback(
                 raise
 
     logger.error(f"Groq : toutes les clés ont échoué. Dernière erreur : {last_error}")
+    if last_error and _is_quota_error(last_error):
+        raise RuntimeError(FRIENDLY_QUOTA_MSG) from last_error
     raise RuntimeError(f"Toutes les clés Groq sont épuisées. Dernière erreur : {last_error}")
 
 

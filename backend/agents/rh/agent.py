@@ -4,6 +4,7 @@
 # ═══════════════════════════════════════════════════════════
 from dotenv import load_dotenv
 import json
+from datetime import date
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -15,78 +16,181 @@ from langgraph.prebuilt import create_react_agent
 
 from agents.rh.prompts import RH_REACT_PROMPT
 from agents.rh import tools as rh_tools
-from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error
+from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_quota_error, FRIENDLY_QUOTA_MSG
+from app.core.rbac import check_tool_permission, tool_permission_denied_message
 
 load_dotenv()
 
 
+# ── Rôle utilisateur courant (injecté par execute()) ─────
+_current_role = "consultant"
+
+
+async def _log_leave_action(
+    user_id: int,
+    action: str,
+    description: str,
+    leave_id: "int | None" = None,
+) -> None:
+    """Persiste une entrée dans hris.leave_logs via employee_id."""
+    try:
+        from sqlalchemy import select
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.hris import Employee, LeaveLog
+
+        async with AsyncSessionLocal() as session:
+            row = await session.execute(
+                select(Employee.id).where(Employee.user_id == user_id)
+            )
+            employee_id = row.scalar_one_or_none()
+            if not employee_id:
+                return
+
+            log = LeaveLog(
+                employee_id = employee_id,
+                leave_id    = leave_id,
+                action      = action,
+                description = description,
+            )
+            session.add(log)
+            await session.commit()
+        print(f"  📋 Log congé : [{action}] (employee_id={employee_id})")
+    except Exception as e:
+        print(f"  ⚠️ Impossible de logger l'action congé : {e}")
+
+
+def _extract_role_from_message(text: str) -> str:
+    """Extrait le rôle du message enrichi envoyé par node3."""
+    for line in text.split("\n"):
+        if line.strip().lower().startswith("role utilisateur"):
+            role = line.split(":")[-1].strip().lower()
+            if role in ("consultant", "pm"):
+                return role
+    return "consultant"
+
+
+async def _check_rbac(tool_name: str) -> str | None:
+    """Vérifie RBAC. Retourne None si OK, sinon le message d'erreur."""
+    if await check_tool_permission(_current_role, tool_name):
+        return None
+    msg = tool_permission_denied_message(tool_name)
+    print(f"  🔒 RBAC refusé : {_current_role} → {tool_name}")
+    return json.dumps({"error": msg, "rbac_denied": True}, ensure_ascii=False)
+
+
 # ══════════════════════════════════════════════════════
-# OUTILS LANGCHAIN — utilisés par le ReAct agent
+# OUTILS LANGCHAIN (avec RBAC)
 # ══════════════════════════════════════════════════════
 
 @tool
 async def create_leave(user_id: int, start_date: str, end_date: str) -> str:
-    """
-    Crée une demande de congé pour un employé.
-    Vérifie automatiquement les chevauchements.
-    Paramètres: user_id (int), start_date (YYYY-MM-DD), end_date (YYYY-MM-DD)
-    """
-    result = await rh_tools.create_leave(
-        user_id=user_id,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    """Crée une demande de congé. Vérifie automatiquement les chevauchements."""
+    denied = await _check_rbac("create_leave")
+    if denied: return denied
+    result = await rh_tools.create_leave(user_id=user_id, start_date=start_date, end_date=end_date)
+
+    if result.get("success"):
+        leave_id = result.get("leave_id")
+        days     = result.get("days_count", "?")
+        await _log_leave_action(
+            user_id     = user_id,
+            action      = "requested",
+            description = f"Vous avez demandé un congé du {start_date} au {end_date} ({days} jour(s))",
+            leave_id    = leave_id,
+        )
+
     return json.dumps(result, ensure_ascii=False)
 
 
 @tool
 async def get_my_leaves(user_id: int, status_filter: str = None) -> str:
-    """
-    Retourne les congés d'un employé.
-    status_filter optionnel: 'pending' | 'approved' | 'rejected' | None (tous)
-    """
-    result = await rh_tools.get_my_leaves(
-        user_id=user_id,
-        status_filter=status_filter,
-    )
+    """Retourne les congés d'un employé."""
+    denied = await _check_rbac("get_my_leaves")
+    if denied: return denied
+    result = await rh_tools.get_my_leaves(user_id=user_id, status_filter=status_filter)
     return json.dumps(result, ensure_ascii=False)
 
 
 @tool
 async def get_team_availability(user_id: int) -> str:
-    """
-    Retourne la disponibilité de l'équipe de l'employé.
-    """
+    """Retourne la disponibilité de l'équipe."""
+    denied = await _check_rbac("get_team_availability")
+    if denied: return denied
     result = await rh_tools.get_team_availability(user_id=user_id)
     return json.dumps(result, ensure_ascii=False)
 
 
 @tool
 async def get_team_stack(user_id: int) -> str:
-    """
-    Retourne les compétences techniques de l'équipe.
-    """
+    """Retourne les compétences techniques de l'équipe."""
+    denied = await _check_rbac("get_team_stack")
+    if denied: return denied
     result = await rh_tools.get_team_stack(user_id=user_id)
     return json.dumps(result, ensure_ascii=False)
 
 
 @tool
 async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str) -> str:
+    """Vérifie les conflits réels dans Google Calendar pour la période de congé donnée."""
+    denied = await _check_rbac("check_calendar_conflicts")
+    if denied: return denied
+    try:
+        from agents.calendar.tools import check_calendar_conflicts as cal_check
+        result = await cal_check(start_date, end_date)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Calendar MCP indisponible : {e}")
+        return json.dumps({
+            "success": True,
+            "conflicts": [],
+            "message": "Impossible de vérifier le calendrier (service indisponible).",
+            "mcp_error": True,
+        }, ensure_ascii=False)
+
+
+@tool
+async def reschedule_meeting(
+    event_id: str,
+    event_title: str,
+    current_start: str,
+    current_end: str,
+    new_date: str,
+) -> str:
     """
-    Vérifie les conflits dans Google Calendar pour la période donnée.
+    Replanifie une réunion via l'agent Calendar (A2A).
+    Passe l'event_id directement pour éviter toute recherche par titre.
+
+    event_id      : ID Google Calendar de l'événement (champ 'id' des conflicts).
+    event_title   : titre de la réunion (pour le message de confirmation).
+    current_start : début ISO actuel (ex: '2026-03-26T09:00:00+01:00').
+    current_end   : fin ISO actuelle  (ex: '2026-03-26T10:00:00+01:00').
+    new_date      : nouvelle date YYYY-MM-DD.
     """
-    return json.dumps({
-        "success": True,
-        "conflicts": [],
-        "message": f"Aucun conflit détecté du {start_date} au {end_date}."
-    })
+    denied = await _check_rbac("reschedule_meeting")
+    if denied: return denied
+    from app.a2a.client import send_task
+    today = date.today().strftime("%Y-%m-%d")
+    # Reconstruit les heures de début/fin sur la nouvelle date
+    new_start = new_date + current_start[10:]
+    new_end   = new_date + current_end[10:]
+    message = (
+        f"Date du jour : {today}\n"
+        f"Déplace l'événement avec l'event_id '{event_id}' (titre : '{event_title}') "
+        f"au {new_date}, nouvelle heure de début : {new_start}, nouvelle heure de fin : {new_end}. "
+        f"Utilise directement update_meeting avec cet event_id sans faire de recherche."
+    )
+    try:
+        response = await send_task("calendar", message)
+        return json.dumps({"success": True, "response": response}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"Impossible de replanifier '{event_title}' : {str(e)}"}, ensure_ascii=False)
 
 
 @tool
 async def notify_manager(user_id: int, message: str) -> str:
-    """
-    Notifie le manager de l'employé via Slack.
-    """
+    """Notifie le manager de l'employé via Slack."""
+    denied = await _check_rbac("notify_manager")
+    if denied: return denied
     return json.dumps({
         "success": True,
         "message": f"✅ [MOCK] Notification envoyée au manager : {message}"
@@ -95,15 +199,10 @@ async def notify_manager(user_id: int, message: str) -> str:
 
 @tool
 async def check_leave_balance(user_id: int, requested_days: int = 0) -> str:
-    """
-    Vérifie le solde de congés disponible d'un employé.
-    requested_days: nombre de jours demandés (0 = juste consulter le solde)
-    Retourne: solde_total, jours_pending, solde_effectif, can_create
-    """
-    result = await rh_tools.check_leave_balance(
-        user_id=user_id,
-        requested_days=requested_days
-    )
+    """Vérifie le solde de congés disponible d'un employé."""
+    denied = await _check_rbac("check_leave_balance")
+    if denied: return denied
+    result = await rh_tools.check_leave_balance(user_id=user_id, requested_days=requested_days)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -118,6 +217,7 @@ TOOLS = [
     get_team_availability,
     get_team_stack,
     check_calendar_conflicts,
+    reschedule_meeting,
     notify_manager,
 ]
 
@@ -154,10 +254,13 @@ class RHAgentExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
+        global _current_role
         user_input = context.get_user_input()
+        _current_role = _extract_role_from_message(user_input)
 
         print(f"\n{'='*50}")
-        print(f"🤖 RHAgent ReAct (Groq 120B) — Message reçu : {user_input}")
+        print(f"🤖 RHAgent ReAct (Groq 120B) — Message reçu : {user_input[:200]}")
+        print(f"🔐 Rôle utilisateur : {_current_role}")
         print(f"{'='*50}")
 
         # ── Tentative avec failover ────────────────────────
@@ -171,7 +274,16 @@ class RHAgentExecutor(AgentExecutor):
                 break
 
             except Exception as e:
-                if _is_fallback_error(e) and rotate_llm_key():
+                if _is_quota_error(e):
+                    print(f"⚠️ Quota tokens dépassé (RH) : {str(e)[:120]}")
+                    response_with_steps = json.dumps({
+                        "response": FRIENDLY_QUOTA_MSG,
+                        "react_steps": [],
+                    }, ensure_ascii=False)
+                    message = new_agent_text_message(response_with_steps)
+                    await event_queue.enqueue_event(message)
+                    return
+                elif _is_fallback_error(e) and rotate_llm_key():
                     print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
                     self._build_react_agent()
                     continue

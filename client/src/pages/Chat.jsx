@@ -10,11 +10,10 @@ import {
   Zap,
   CheckCircle,
   Loader,
-  Video,
-  Building2,
   Calendar,
   Clock,
-  MapPin,
+  Mail,
+  X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import clsx from "clsx";
@@ -82,13 +81,12 @@ function ThinkingCard({ steps }) {
   );
 }
 
-const CHOICE_ICONS = { video: Video, building: Building2, map: MapPin };
-
 function InteractiveHint({ hint, onSend }) {
   const [date, setDate] = useState("");
   const [dateEnd, setDateEnd] = useState("");
   const [timeStart, setTimeStart] = useState("");
   const [timeEnd, setTimeEnd] = useState("");
+  const [emails, setEmails] = useState([""]);
   const [sent, setSent] = useState(false);
 
   if (!hint || sent) return null;
@@ -98,45 +96,105 @@ function InteractiveHint({ hint, onSend }) {
     onSend(text);
   };
 
-  /* ── Boutons Oui / Non ─────────────────────────────── */
-  if (hint.type === "confirm") {
-    return (
-      <div className="flex gap-2 mt-3 fade-in-up">
-        {hint.options.map((opt) => (
-          <button
-            key={opt}
-            onClick={() => send(opt)}
-            className={clsx(
-              "px-5 py-2.5 rounded-xl text-sm font-semibold border-2 transition-all active:scale-95 shadow-sm",
-              opt === "Oui"
-                ? "border-green-400 text-green-700 hover:bg-green-50 hover:shadow-green-100"
-                : "border-red-300 text-red-600 hover:bg-red-50 hover:shadow-red-100",
-            )}
-          >
-            {opt}
-          </button>
-        ))}
-      </div>
-    );
-  }
+  const addEmail = () => setEmails((prev) => [...prev, ""]);
+  const removeEmail = (i) => setEmails((prev) => prev.filter((_, idx) => idx !== i));
+  const updateEmail = (i, val) =>
+    setEmails((prev) => prev.map((e, idx) => (idx === i ? val : e)));
 
-  /* ── Choix multiples (en ligne / présentiel, etc.) ── */
-  if (hint.type === "choice") {
+  /* ── Date + heure + emails (réunion avec participants) ── */
+  if (hint.type === "event_datetime_with_emails") {
+    const validEmails = emails.filter((e) => e.trim());
+    const canConfirm = date && timeStart && timeEnd;
     return (
-      <div className="flex flex-wrap gap-2 mt-3 fade-in-up">
-        {hint.options.map((opt) => {
-          const Icon = CHOICE_ICONS[opt.icon] || Zap;
-          return (
-            <button
-              key={opt.value}
-              onClick={() => send(opt.value)}
-              className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold border-2 border-slate-200 text-slate-700 hover:border-cyan hover:text-cyan hover:bg-cyan/5 transition-all active:scale-95 shadow-sm"
-            >
-              <Icon size={16} />
-              {opt.label}
-            </button>
-          );
-        })}
+      <div className="mt-3 p-4 bg-gradient-to-br from-slate-50 to-cyan-50/30 border border-slate-200 rounded-2xl space-y-4 fade-in-up shadow-sm">
+        <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          <Calendar size={14} className="text-cyan" />
+          Choisir date, horaires et participants
+        </div>
+
+        {/* Date + heures */}
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400">Date</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 flex items-center gap-1">
+              <Clock size={11} /> Début
+            </label>
+            <input
+              type="time"
+              value={timeStart}
+              onChange={(e) => setTimeStart(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+          <span className="text-slate-300 mt-5">→</span>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 flex items-center gap-1">
+              <Clock size={11} /> Fin
+            </label>
+            <input
+              type="time"
+              value={timeEnd}
+              onChange={(e) => setTimeEnd(e.target.value)}
+              className="border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+            />
+          </div>
+        </div>
+
+        {/* Emails participants */}
+        <div className="space-y-2">
+          <label className="text-xs text-slate-400 flex items-center gap-1">
+            <Mail size={11} /> E-mails des participants
+          </label>
+          {emails.map((email, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => updateEmail(i, e.target.value)}
+                placeholder="prenom.nom@talan.com"
+                className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-sm focus:border-cyan focus:ring-2 focus:ring-cyan/10 outline-none transition-all bg-white"
+              />
+              {emails.length > 1 && (
+                <button
+                  onClick={() => removeEmail(i)}
+                  className="text-slate-400 hover:text-red-400 transition-colors"
+                >
+                  <X size={15} />
+                </button>
+              )}
+            </div>
+          ))}
+          <button
+            onClick={addEmail}
+            className="flex items-center gap-1 text-xs text-cyan hover:text-cyan/80 transition-colors font-medium"
+          >
+            <Plus size={13} /> Ajouter un participant
+          </button>
+        </div>
+
+        {canConfirm && (
+          <button
+            onClick={() => {
+              const datePart = `le ${date} de ${timeStart} à ${timeEnd}`;
+              const emailPart =
+                validEmails.length > 0
+                  ? `, participants: ${validEmails.join(", ")}`
+                  : "";
+              send(`${datePart}${emailPart}`);
+            }}
+            className="bg-cyan text-white px-5 py-2.5 rounded-xl text-sm font-semibold hover:bg-cyan/90 active:scale-95 transition-all shadow-md hover:shadow-cyan-200/50"
+          >
+            ✓ Confirmer
+          </button>
+        )}
       </div>
     );
   }
@@ -145,7 +203,7 @@ function InteractiveHint({ hint, onSend }) {
   if (hint.type === "event_datetime") {
     const canConfirm = date && timeStart && timeEnd;
     return (
-      <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 fade-in-up">
+      <div className="mt-3 p-4 bg-gradient-to-br from-slate-50 to-cyan-50/30 border border-slate-200 rounded-2xl space-y-3 fade-in-up shadow-sm">
         <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
           <Calendar size={14} className="text-cyan" />
           Choisir date et horaires
@@ -187,9 +245,9 @@ function InteractiveHint({ hint, onSend }) {
         {canConfirm && (
           <button
             onClick={() => send(`le ${date} de ${timeStart} à ${timeEnd}`)}
-            className="bg-cyan text-white px-5 py-2 rounded-xl text-sm font-medium hover:bg-cyan/90 active:scale-95 transition-all shadow-sm"
+            className="bg-cyan text-white px-5 py-2.5 rounded-xl text-sm font-semibold hover:bg-cyan/90 active:scale-95 transition-all shadow-md hover:shadow-cyan-200/50"
           >
-            Confirmer
+            ✓ Confirmer
           </button>
         )}
       </div>
@@ -199,8 +257,8 @@ function InteractiveHint({ hint, onSend }) {
   /* ── Date simple ────────────────────────────────────── */
   if (hint.type === "date_picker") {
     return (
-      <div className="flex items-center gap-2 mt-3 fade-in-up">
-        <div className="flex items-center gap-2 p-2 bg-slate-50 border border-slate-200 rounded-xl">
+      <div className="flex items-center gap-3 mt-3 fade-in-up">
+        <div className="flex items-center gap-2 p-2.5 bg-gradient-to-br from-slate-50 to-cyan-50/30 border border-slate-200 rounded-xl shadow-sm">
           <Calendar size={14} className="text-cyan" />
           <input
             type="date"
@@ -212,9 +270,9 @@ function InteractiveHint({ hint, onSend }) {
         {date && (
           <button
             onClick={() => send(date)}
-            className="bg-cyan text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-cyan/90 active:scale-95 transition-all shadow-sm"
+            className="bg-cyan text-white px-5 py-2.5 rounded-xl text-sm font-semibold hover:bg-cyan/90 active:scale-95 transition-all shadow-md hover:shadow-cyan-200/50"
           >
-            Confirmer
+            ✓ Confirmer
           </button>
         )}
       </div>
@@ -224,7 +282,7 @@ function InteractiveHint({ hint, onSend }) {
   /* ── Plage de dates (congés) ────────────────────────── */
   if (hint.type === "date_range") {
     return (
-      <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 fade-in-up">
+      <div className="mt-3 p-4 bg-gradient-to-br from-slate-50 to-cyan-50/30 border border-slate-200 rounded-2xl space-y-3 fade-in-up shadow-sm">
         <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
           <Calendar size={14} className="text-cyan" />
           Choisir la période
@@ -253,9 +311,9 @@ function InteractiveHint({ hint, onSend }) {
         {date && dateEnd && (
           <button
             onClick={() => send(`du ${date} au ${dateEnd}`)}
-            className="bg-cyan text-white px-5 py-2 rounded-xl text-sm font-medium hover:bg-cyan/90 active:scale-95 transition-all shadow-sm"
+            className="bg-cyan text-white px-5 py-2.5 rounded-xl text-sm font-semibold hover:bg-cyan/90 active:scale-95 transition-all shadow-md hover:shadow-cyan-200/50"
           >
-            Confirmer
+            ✓ Confirmer
           </button>
         )}
       </div>
