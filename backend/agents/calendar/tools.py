@@ -45,6 +45,7 @@ async def check_calendar_conflicts(start_date: str, end_date: str):
 
     busy = [
         {
+            "id":    e.get("id", ""),
             "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "")),
             "end":   e.get("end",   {}).get("dateTime", e.get("end",   {}).get("date", "")),
             "title": e.get("summary", "Sans titre"),
@@ -78,7 +79,7 @@ async def get_calendar_events(start_date: str, end_date: str):
 # ─────────────────────────────────────────
 # ➕ CREATE EVENT
 # ─────────────────────────────────────────
-async def create_meeting(title: str, start: str, end: str, attendees: list[str] | None = None, add_meet: bool = False):
+async def create_meeting(title: str, start: str, end: str, attendees: list[str] | None = None, add_meet: bool = False, location: str | None = None):
     payload = {
         "calendarId": "primary",
         "summary": title,
@@ -86,6 +87,8 @@ async def create_meeting(title: str, start: str, end: str, attendees: list[str] 
         "end": end,
         "sendUpdates": "all",
     }
+    if location:
+        payload["location"] = location
     if attendees:
         payload["attendees"] = [{"email": email} for email in attendees]
     if add_meet:
@@ -110,6 +113,8 @@ async def update_meeting(
     start: str | None = None,
     end: str | None = None,
     attendees: list[str] | None = None,
+    remove_meet: bool = False,
+    location: str | None = None,
 ):
     payload: dict = {
         "calendarId": "primary",
@@ -122,9 +127,14 @@ async def update_meeting(
         payload["start"] = start
     if end:
         payload["end"] = end
+    if location:
+        payload["location"] = location
     if attendees is not None:
-        # Liste complète des participants souhaités (remplace l'existante)
         payload["attendees"] = [{"email": email} for email in attendees]
+    if remove_meet:
+        # Supprime le lien Google Meet sans recréer l'événement
+        payload["conferenceData"] = None
+        payload["conferenceDataVersion"] = 1
     data = await call_mcp("update-event", payload)
     return {"success": True, "event": data}
 
@@ -149,6 +159,7 @@ async def delete_meeting(event_id: str):
 # 🔍 SEARCH EVENTS
 # ─────────────────────────────────────────
 import unicodedata
+from datetime import date, timedelta
 
 def _strip_accents(text: str) -> str:
     """Supprime les accents pour une comparaison normalisée."""
@@ -157,29 +168,58 @@ def _strip_accents(text: str) -> str:
         if unicodedata.category(c) != 'Mn'
     )
 
+def _keyword_match(event: dict, query: str) -> bool:
+    """
+    Vérifie si le mot-clé (ou un de ses tokens) est présent dans le titre ou la description.
+    Comparaison insensible à la casse et aux accents.
+    """
+    q_norm = _strip_accents(query.lower())
+    tokens = [t for t in q_norm.split() if len(t) >= 2]
+    title = _strip_accents(event.get("summary", "").lower())
+    desc  = _strip_accents(event.get("description", "").lower())
+    haystack = title + " " + desc
+    # Match si le terme complet OU au moins un token est trouvé
+    return q_norm in haystack or any(tok in haystack for tok in tokens)
+
 async def search_meetings(query: str):
     """
-    Recherche avec le terme original, puis avec accents normalisés si vide.
+    Recherche en 3 tentatives :
+    1. MCP search-events (terme exact)
+    2. MCP search-events (variante accentuée/sans accent)
+    3. Fallback local : récupère tous les événements des 60 prochains jours
+       et filtre par mot-clé côté Python — garantit de trouver même les titres partiels.
     """
-    # Tentative 1 — terme exact
+    # ── Tentative 1 — terme original via MCP ─────────────
     data = await call_mcp("search-events", {"query": query})
     results = data.get("events", data.get("result", []))
 
-    # Tentative 2 — si vide et le terme n'a pas d'accents, essaie les variantes accentuées françaises
+    # ── Tentative 2 — variante accentuée/sans accent ──────
     if not results:
         query_no_accent = _strip_accents(query)
         if query_no_accent != query:
-            # La requête avait des accents mais rien trouvé → rien à faire de plus
-            pass
+            # Terme avec accents → essaie sans accent
+            data2 = await call_mcp("search-events", {"query": query_no_accent})
+            results = data2.get("events", data2.get("result", [])) or results
         else:
-            # La requête n'a PAS d'accents → essaie avec accents communs
-            ACCENT_MAP = str.maketrans({
-                'e': 'é', 'a': 'à', 'u': 'û', 'i': 'î', 'o': 'ô',
-            })
+            # Terme sans accents → essaie variante accentuée
+            ACCENT_MAP = str.maketrans({'e': 'é', 'a': 'à', 'u': 'ù', 'i': 'î', 'o': 'ô'})
             accented = query.translate(ACCENT_MAP)
             if accented != query:
                 data2 = await call_mcp("search-events", {"query": accented})
                 results = data2.get("events", data2.get("result", [])) or results
+
+    # ── Tentative 3 — fallback local sur les 60 prochains jours ──
+    if not results:
+        today     = date.today()
+        time_min  = _to_rfc3339(today.isoformat())
+        time_max  = _to_rfc3339_end((today + timedelta(days=60)).isoformat())
+        all_data  = await call_mcp(
+            "list-events",
+            {"calendarId": "primary", "timeMin": time_min, "timeMax": time_max},
+        )
+        all_events = all_data.get("events", all_data.get("result", []))
+        results = [e for e in all_events if _keyword_match(e, query)]
+        print(f"[search_meetings] fallback local : {len(all_events)} évts scannés → {len(results)} match(es) pour '{query}'")
 
     return {"success": True, "results": results}
 

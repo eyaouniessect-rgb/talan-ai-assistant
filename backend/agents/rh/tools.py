@@ -262,9 +262,11 @@ async def get_team_availability(user_id: int) -> dict:
 
         today = date.today()
 
-        # Vérifie si chaque membre a un congé en cours
+        # Vérifie si chaque membre a un congé en cours (exclut l'utilisateur demandeur)
         availability = []
         for emp, user in members:
+            if emp.user_id == user_id:
+                continue  # Ne pas inclure soi-même dans la liste d'équipe
             result = await db.execute(
                 select(Leave).where(
                     and_(
@@ -316,6 +318,7 @@ async def get_team_stack(user_id: int) -> dict:
                 "skills": emp.skills or "Non renseigné",
             }
             for emp, user in members
+            if emp.user_id != user_id  # Exclut l'utilisateur demandeur
         ]
 
         return {

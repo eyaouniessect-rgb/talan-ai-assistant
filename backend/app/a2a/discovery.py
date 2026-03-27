@@ -1,6 +1,8 @@
 # app/a2a/discovery.py
 # ═══════════════════════════════════════════════════════════
-# DYNAMIC DISCOVERY — avec authentification A2A
+# DYNAMIC DISCOVERY — simplifié
+# Plus de mapping intent→skill. Node 1 fournit directement le
+# target_agent, et discovery trouve l'agent par son nom.
 # ═══════════════════════════════════════════════════════════
 
 import httpx
@@ -14,45 +16,20 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ── Configuration ──────────────────────────────────────────
 CACHE_TTL_SECONDS = int(os.getenv("DISCOVERY_CACHE_TTL", "300"))
 DISCOVERY_TIMEOUT = int(os.getenv("DISCOVERY_TIMEOUT", "5"))
-
-# ── Token secret pour l'authentification inter-agents ──────
 A2A_SECRET = os.getenv("A2A_SECRET_TOKEN", "")
 
-# ── URLs des agents potentiels ─────────────────────────────
 AGENT_ENDPOINTS = {
     "rh":       os.getenv("AGENT_RH_URL",       "http://localhost:8001"),
-     "calendar": os.getenv("AGENT_CALENDAR_URL",  "http://localhost:8002"),
+    "calendar": os.getenv("AGENT_CALENDAR_URL",  "http://localhost:8002"),
     "crm":      os.getenv("AGENT_CRM_URL",      "http://localhost:8003"),
     "jira":     os.getenv("AGENT_JIRA_URL",      "http://localhost:8004"),
     "slack":    os.getenv("AGENT_SLACK_URL",      "http://localhost:8005"),
-   
-}
-
-# ── Mapping intent → skill ID ─────────────────────────────
-INTENT_TO_SKILL = {
-    "create_leave":          "create_leave",
-    "check_leave_balance":   "check_leave_balance",
-    "get_my_leaves":         "get_my_leaves",
-    "get_team_availability": "get_team_availability",
-    "get_team_stack":        "get_team_stack",
-    "get_my_projects":       "get_my_projects",
-    "get_all_projects":      "get_all_projects",
-    "generate_report":       "generate_report",
-    "get_tickets":           "get_tickets",
-    "create_ticket":         "create_ticket",
-    "update_ticket":         "update_ticket",
-    "send_message":          "send_message",
-    "get_calendar":          "get_calendar",
-    "create_event":          "create_event",
-    "search_docs":           "search_docs",
 }
 
 
 def _build_auth_headers() -> dict:
-    """Construit les headers d'authentification pour les requêtes A2A."""
     if A2A_SECRET:
         return {"Authorization": f"Bearer {A2A_SECRET}"}
     return {}
@@ -76,10 +53,6 @@ class DiscoveredAgent:
 
 
 class AgentDiscovery:
-    """
-    Service de découverte dynamique des agents A2A.
-    Authentifié via Bearer token partagé.
-    """
 
     def __init__(self):
         self._cache: dict[str, DiscoveredAgent] = {}
@@ -87,16 +60,14 @@ class AgentDiscovery:
         self._lock = asyncio.Lock()
 
     async def scan_agents(self, force: bool = False) -> dict[str, DiscoveredAgent]:
-        """Scanne tous les agents configurés avec authentification."""
+        """Scanne tous les agents configurés."""
         async with self._lock:
             now = time.time()
 
             if not force and self._cache and (now - self._last_scan) < CACHE_TTL_SECONDS:
-                logger.debug(f"🔄 Discovery cache hit ({len(self._cache)} agents)")
                 return self._cache
 
-            # ── Log sécurité ───────────────────────────────
-            auth_status = "🔒 avec token" if A2A_SECRET else "⚠️ sans token (mode ouvert)"
+            auth_status = "🔒 avec token" if A2A_SECRET else "⚠️ sans token"
             logger.info(f"🔍 Scanning des agents A2A ({auth_status})...")
 
             tasks = {
@@ -109,12 +80,10 @@ class AgentDiscovery:
             new_cache = {}
             for name, result in zip(tasks.keys(), results):
                 if isinstance(result, Exception):
-                    error_type = type(result).__name__
-                    # ── Distingue les erreurs d'auth des erreurs réseau ──
                     if "401" in str(result) or "403" in str(result):
-                        logger.warning(f"   🔐 {name} — AUTH FAILED ({error_type})")
+                        logger.warning(f"   🔐 {name} — AUTH FAILED")
                     else:
-                        logger.warning(f"   ❌ {name} — DOWN ({error_type})")
+                        logger.warning(f"   ❌ {name} — DOWN ({type(result).__name__})")
                 elif result is not None:
                     new_cache[name] = result
                     logger.info(f"   ✅ {name} — UP (skills: {result.skills})")
@@ -122,46 +91,35 @@ class AgentDiscovery:
             self._cache = new_cache
             self._last_scan = now
 
-            logger.info(f"📊 Discovery terminé : {len(new_cache)}/{len(AGENT_ENDPOINTS)} agents actifs")
+            logger.info(f"📊 Discovery : {len(new_cache)}/{len(AGENT_ENDPOINTS)} agents actifs")
             return self._cache
 
     async def _fetch_agent_card(self, name: str, base_url: str) -> Optional[DiscoveredAgent]:
-        """Récupère l'AgentCard avec authentification Bearer."""
         url = f"{base_url}/.well-known/agent.json"
         headers = _build_auth_headers()
 
         try:
             async with httpx.AsyncClient(timeout=DISCOVERY_TIMEOUT) as client:
                 response = await client.get(url, headers=headers)
-
-                # ── Gère les erreurs d'auth explicitement ──────
                 if response.status_code == 401:
-                    raise Exception(f"401 Unauthorized — token manquant ou invalide")
+                    raise Exception("401 Unauthorized")
                 if response.status_code == 403:
-                    raise Exception(f"403 Forbidden — token rejeté par l'agent")
-
+                    raise Exception("403 Forbidden")
                 response.raise_for_status()
                 card = response.json()
                 return DiscoveredAgent(name=name, url=base_url, card=card)
         except Exception as e:
             raise e
 
-    async def find_agent_for_intent(self, intent: str) -> Optional[DiscoveredAgent]:
-        """Trouve l'agent capable de traiter un intent donné."""
-        skill_id = INTENT_TO_SKILL.get(intent)
-        if not skill_id:
-            logger.warning(f"⚠️ Pas de mapping skill pour intent '{intent}'")
-            return None
-
+    async def find_agent_by_name(self, agent_name: str) -> Optional[DiscoveredAgent]:
+        """Trouve un agent par son nom (rh, calendar, etc.)."""
         agents = await self.scan_agents()
-
-        for agent in agents.values():
-            if agent.has_skill(skill_id):
-                logger.info(f"🎯 Intent '{intent}' → Agent '{agent.name}' (skill: {skill_id})")
-                return agent
-
-        logger.warning(f"⚠️ Aucun agent actif avec le skill '{skill_id}' pour intent '{intent}'")
-        return None
+        agent = agents.get(agent_name)
+        if agent:
+            logger.info(f"🎯 Agent '{agent_name}' trouvé à {agent.url}")
+        else:
+            logger.warning(f"⚠️ Agent '{agent_name}' non disponible")
+        return agent
 
     async def get_all_active_agents(self) -> dict[str, DiscoveredAgent]:
         return await self.scan_agents()
@@ -173,5 +131,4 @@ class AgentDiscovery:
         return await self.scan_agents(force=True)
 
 
-# ── Instance globale ───────────────────────────────────────
 discovery = AgentDiscovery()

@@ -34,42 +34,37 @@ def _normalize(text: str) -> str:
 
 
 def _detect_ui_hint(text: str) -> "dict | None":
-    """Détecte le composant UI interactif à afficher selon le texte de la réponse."""
+    """
+    Détecte uniquement les composants de sélection de date/heure.
+    Les hints textuels (Oui/Non, choix, options numérotées) sont supprimés
+    pour éviter les faux positifs et les mauvais routages.
+    """
     t = _normalize(text)
 
-    # ── 1. Choix en ligne / présentiel ───────────────────
-    if ("en ligne" in t or "presentiel" in t or "distanciel" in t) and "?" in t:
-        return {
-            "type": "choice",
-            "options": [
-                {"label": "En ligne (Google Meet)", "value": "oui, en ligne avec Google Meet", "icon": "video"},
-                {"label": "Présentiel", "value": "non, en présentiel", "icon": "building"},
-            ],
-        }
+    # ── 0. Date + heure + emails (réunion avec participants) ──
+    _needs_datetime = bool(re.search(
+        r"quelle heure|a quelle heure|heure.*(debut|fin)|debut et fin"
+        r"|date.{0,15}(horaire|heure)|horaire.{0,15}souhait"
+        r"|nouvelle date.{0,15}heur|preciser.{0,20}(date|heure|horaire)",
+        t,
+    ))
+    _needs_emails = bool(re.search(
+        r"e-mail|email|adresse mail|adresses mail|coordonnees|pouvez.vous me communiquer",
+        t,
+    ))
+    if _needs_datetime and _needs_emails:
+        return {"type": "event_datetime_with_emails"}
 
-    # ── 2. Boutons Oui / Non ─────────────────────────────
-    is_oui_non = (
-        "souhaitez-vous" in t or
-        "voulez-vous" in t or
-        "confirmez-vous" in t or
-        bool(re.search(r"oui\s*/\s*non", t)) or
-        bool(re.search(r"r.pondez.*oui", t)) or
-        ("oui" in t and "non" in t and "?" in t)
-    )
-    is_time_or_detail = bool(re.search(r"quelle heure|quel titre|quel jour", t))
-    if is_oui_non and not is_time_or_detail:
-        return {"type": "confirm", "options": ["Oui", "Non"]}
-
-    # ── 3. Date + heure début/fin (événements calendar) ──
-    if re.search(r"quelle heure|a quelle heure|heure.*(debut|fin)|debut et fin|date.{0,15}(horaire|heure)|horaire.{0,15}souhait|nouvelle date.{0,15}heur|preciser.{0,20}(date|heure|horaire)", t):
+    # ── 1. Date + heure début/fin (événements calendar) ──
+    if _needs_datetime:
         return {"type": "event_datetime"}
 
-    # ── 4. Plage de dates (congés, disponibilités) ───────
+    # ── 2. Plage de dates (congés) ───────────────────────
     if re.search(r"dates de (d.but|fin)|p.riode souhait.e|date de debut.*date de fin", t):
         return {"type": "date_range"}
 
-    # ── 5. Date simple ───────────────────────────────────
-    if re.search(r"quelle date|a quelle date|precisez la date|choisissez une date|quel jour|nouvelle date", t):
+    # ── 3. Date simple ───────────────────────────────────
+    if re.search(r"quelle date|a quelle date|precisez la date|choisissez une date|nouvelle date", t):
         return {"type": "date_picker"}
 
     return None
@@ -147,17 +142,14 @@ async def chat(
         "messages":       [HumanMessage(content=request.message)],
         "user_id":        user_id,
         "role":           role,
-        "intent":         None,
         "target_agent":   None,
-        "entities":       {},
-        "is_authorized":  None,
         "final_response": None,
     }
 
     config = {"configurable": {"thread_id": thread_id}}
     result = await graph.ainvoke(initial_state, config)
 
-    logger.info(f"LangGraph terminé - intent={result['intent']} agent={result['target_agent']}")
+    logger.info(f"LangGraph terminé - agent={result['target_agent']}")
 
     # ── 4. Parse la réponse ────────────────────────────────
     raw_response = result["final_response"]
@@ -188,12 +180,14 @@ async def chat(
         role="user",
         content=request.message,
     ))
+    target_agent = result.get("target_agent", "chat")
+
     db.add(Message(
         conversation_id=conversation.id,
         role="assistant",
         content=final_text,
-        intent=result["intent"],
-        target_agent=result["target_agent"],
+        intent=target_agent,
+        target_agent=target_agent,
     ))
 
     await db.commit()
@@ -201,8 +195,8 @@ async def chat(
 
     return ChatResponse(
         response=final_text,
-        intent=result["intent"],
-        target_agent=result["target_agent"],
+        intent=target_agent,
+        target_agent=target_agent,
         conversation_id=conversation.id,
         steps=react_steps,
         ui_hint=ui_hint,
