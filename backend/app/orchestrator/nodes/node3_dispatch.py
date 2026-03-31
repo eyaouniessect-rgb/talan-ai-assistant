@@ -5,16 +5,19 @@
 # Plus de mapping intent→skill. L'agent décide lui-même quel tool appeler.
 # ═══════════════════════════════════════════════════════════
 from datetime import date
+import asyncio
 from langchain_core.messages import HumanMessage, AIMessage
 from app.orchestrator.state import AssistantState
 from app.a2a.client import send_task_to_url
 from app.a2a.discovery import discovery
 from dotenv import load_dotenv
+from langsmith import traceable
 import json
 
 load_dotenv()
 
-MAX_HISTORY = 10
+MAX_HISTORY = 6          # réduit : chaque réponse calendar peut être longue
+MAX_AI_RESPONSE_CHARS = 600  # tronque les réponses AI dans l'historique
 
 # ── Réponses déterministes pour les cas simples ────────────
 MERCI_KEYWORDS = {
@@ -59,6 +62,94 @@ def _is_match(message: str, keywords: set) -> bool:
     return msg in keywords or any(kw in msg for kw in keywords)
 
 
+
+async def _dispatch_multi_agent(
+    targets: list[dict],
+    user_id: int,
+    role: str,
+    today_iso: str,
+    trimmed_messages: list,
+) -> str:
+    """Dispatch vers plusieurs agents en parallèle et fusionne les réponses."""
+    # Construit l'historique à partir des messages trimmés
+    history = ""
+    for msg in trimmed_messages[:-1]:
+        r = "Utilisateur" if msg.type == "human" else "Assistant"
+        clean = _extract_clean_text(msg.content)
+        if msg.type != "human" and len(clean) > MAX_AI_RESPONSE_CHARS:
+            clean = clean[:MAX_AI_RESPONSE_CHARS] + "... [tronqué]"
+        history += f"{r}: {clean}\n"
+
+    # Pré-résoudre toutes les URLs en parallèle pour éviter la latence de discovery séquentielle
+    agent_names = [t["agent"] for t in targets]
+    discovered_list = await asyncio.gather(
+        *[discovery.find_agent_by_name(name) for name in agent_names],
+        return_exceptions=True,
+    )
+    # Injecter l'URL directement dans _dispatch_single_agent via un wrapper
+    async def _dispatch_with_discovered(t: dict, disc) -> str:
+        agent_name = t["agent"]
+        sub_task = t["sub_task"]
+        if isinstance(disc, Exception) or disc is None:
+            return f"⚠️ Agent '{agent_name}' indisponible."
+        message = f"Date du jour : {today_iso}\n"
+        if history.strip():
+            message += (
+                f"Historique récent (LECTURE SEULE — ne PAS ré-exécuter ces actions, "
+                f"c'est uniquement du contexte pour comprendre la conversation) :\n{history}\n"
+            )
+        message += (
+            f"---\n"
+            f"INSTRUCTION À EXÉCUTER MAINTENANT (la SEULE action à faire) :\n"
+            f"{sub_task}\n"
+            f"---\n"
+            f"Role utilisateur : {role}\n"
+            f"User ID : {user_id}"
+        )
+        try:
+            return await send_task_to_url(disc.url, message)
+        except Exception as e:
+            return f"⚠️ Erreur agent '{agent_name}' : {str(e)}"
+
+    tasks = []
+    for t, disc in zip(targets, discovered_list):
+        print(f"  📤 → {t['agent']} : {t['sub_task'][:80]}")
+        tasks.append(_dispatch_with_discovered(t, disc))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Fusionne les réponses
+    parts = []
+    for t, result in zip(targets, results):
+        agent_name = t["agent"]
+        if isinstance(result, Exception):
+            parts.append(f"**{agent_name.upper()}** : ⚠️ Erreur — {str(result)}")
+        else:
+            # Parse la réponse si c'est du JSON avec "response"
+            text = result
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict) and "response" in parsed:
+                    text = parsed["response"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            parts.append(f"**{agent_name.upper()}** :\n{text}")
+
+    combined = json.dumps({
+        "response": "\n\n---\n\n".join(parts),
+        "react_steps": [f"📤 Dispatch parallèle → {t['agent']}" for t in targets],
+    }, ensure_ascii=False)
+
+    print(f"  ✅ Multi-agent terminé : {len(parts)} réponses fusionnées")
+    return combined
+
+
+@traceable(
+    name="node3_dispatch",
+    run_type="chain",
+    tags=["orchestrator", "dispatch"],
+    metadata={"node": "node3"},
+)
 async def node3_dispatch(state: AssistantState) -> AssistantState:
     target_agent = state["target_agent"]
     user_id      = state["user_id"]
@@ -115,7 +206,7 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
         print(f"{'='*60}\n")
         fallback = (
             "Je n'ai pas compris votre demande. Voici ce que je peux faire :\n\n"
-            "- **Congés** : créer, consulter, vérifier le solde\n"
+            "- **Congés** : créer, supprimer, consulter, vérifier le solde\n"
             "- **Calendrier** : créer, modifier, supprimer des réunions\n"
             "- **Jira** : consulter vos tickets\n"
             "- **Slack** : envoyer un message\n\n"
@@ -124,7 +215,19 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
         return {**state, "final_response": fallback}
 
     # ══════════════════════════════════════════════════════
-    # Cas 2 : dispatch vers un agent A2A
+    # Cas 2 : dispatch MULTI-AGENT (parallèle)
+    # ══════════════════════════════════════════════════════
+    target_agents = state.get("target_agents")
+    if target_agents and len(target_agents) >= 2:
+        print(f"🔀 MULTI-AGENT DISPATCH : {[t['agent'] for t in target_agents]}")
+        multi_response = await _dispatch_multi_agent(
+            target_agents, user_id, role, today_iso, trimmed
+        )
+        print(f"{'='*60}\n")
+        return {**state, "final_response": multi_response}
+
+    # ══════════════════════════════════════════════════════
+    # Cas 3 : dispatch vers un agent A2A (mono-agent)
     # ══════════════════════════════════════════════════════
     print(f"🔍 Discovery — recherche agent '{target_agent}'...")
 
@@ -160,14 +263,25 @@ async def node3_dispatch(state: AssistantState) -> AssistantState:
     for i, msg in enumerate(trimmed[:-1]):
         r = "Utilisateur" if msg.type == "human" else "Assistant"
         clean = _extract_clean_text(msg.content)
+        # Tronquer les longues réponses AI (tableaux d'événements, etc.)
+        if msg.type != "human" and len(clean) > MAX_AI_RESPONSE_CHARS:
+            clean = clean[:MAX_AI_RESPONSE_CHARS] + "... [tronqué]"
         history += f"{r}: {clean}\n"
         print(f"  [{i}] {r}: {clean[:120]}")
 
     message = (
         f"Date du jour : {today_iso}\n"
-        f"Historique récent de la conversation :\n{history}\n"
+    )
+    if history.strip():
+        message += (
+            f"Historique récent (LECTURE SEULE — ne PAS ré-exécuter ces actions, "
+            f"c'est uniquement du contexte pour comprendre la conversation) :\n{history}\n"
+        )
+    message += (
         f"---\n"
-        f"Message utilisateur : {original_message}\n"
+        f"INSTRUCTION À EXÉCUTER MAINTENANT (la SEULE action à faire) :\n"
+        f"{original_message}\n"
+        f"---\n"
         f"Role utilisateur : {role}\n"
         f"User ID : {user_id}"
     )

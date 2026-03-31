@@ -1,111 +1,148 @@
 # app/orchestrator/nodes/node1_intent.py
 # ═══════════════════════════════════════════════════════════
-# Node 1 — Routeur : classifie le message vers le bon AGENT
+# Node 1 — Routeur LLM-first (refactorisé)
+#
+# Architecture :
+#   FAST PATH 1 → chat-only (salutations, remerciements) — sans LLM
+#   FAST PATH 2 → gibberish — sans LLM
+#   FAST PATH 3 → context continuation stricte — sans LLM
+#                 (réponse courte à une question, state["target_agent"] comme référence)
+#   PRIMARY     → LLM router avec Agent Cards compactes + few-shots
+#   FALLBACK    → keyword match d'urgence si LLM indisponible
+#
+# Principe fondamental : le DOMAINE décide, pas le verbe d'action.
+# target_agents est TOUJOURS réinitialisé à None sauf dispatch multi-agent explicite.
 # ═══════════════════════════════════════════════════════════
+
 from datetime import date
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.orchestrator.state import AssistantState
 from app.core.groq_client import invoke_with_fallback
+from app.a2a.discovery import routing_manifest
 from dotenv import load_dotenv
+from langsmith import traceable
 import json
 import re as _re
+import unicodedata as _unicodedata
 
 load_dotenv()
 
-MAX_HISTORY_MESSAGES = 10
+# Historique : 6 messages suffisent pour le contexte, évite le context overflow
+MAX_HISTORY_MESSAGES = 6
+# Longueur max d'un message AI dans l'historique envoyé au routeur
+MAX_AI_CHARS_IN_HISTORY = 300
 
 # ══════════════════════════════════════════════════════════
-# PROMPT — Classification par AGENT
+# FAST PATH — Tokens chat-only (sans LLM)
 # ══════════════════════════════════════════════════════════
-ROUTER_PROMPT = """
-Tu es un routeur pour un assistant d'entreprise.
-Analyse le message et retourne UNIQUEMENT un JSON valide.
+_CHAT_ONLY_TOKENS = {
+    "bonjour", "salut", "hello", "bonsoir", "hi", "coucou",
+    "merci", "ok merci", "super merci", "merci beaucoup",
+    "au revoir", "bonne journée", "bonne journee", "à bientôt", "a bientot",
+    "bonne soirée", "bonne soiree",
+}
 
-═══════════════════════════════════════════
-AGENTS DISPONIBLES
-═══════════════════════════════════════════
-- rh        → congés, solde de congé, disponibilité équipe, compétences équipe, absence
-- calendar  → réunions, meetings, agenda, créer/modifier/supprimer événement
-- crm       → projets, clients, rapports
-- jira      → tickets, bugs, tâches Jira
-- slack     → envoyer messages Slack
-- rag       → recherche documentaire
-- chat      → salutations, politesses, remerciements UNIQUEMENT
+# ══════════════════════════════════════════════════════════
+# FAST PATH — Verbes d'action (utilisés UNIQUEMENT pour
+# la context continuation : si présent → pas une réponse)
+# ══════════════════════════════════════════════════════════
+_ACTION_VERBS = [
+    "créer", "creer", "cree", "crée",
+    "supprimer", "supprime",
+    "modifier", "modifie",
+    "déplacer", "deplacer", "décaler", "decaler",
+    "consulter", "consulte", "voir", "montre", "affiche",
+    "envoyer", "envoie", "envoi",
+    "chercher", "cherche",
+    "je veux", "je voudrais", "je souhaite",
+    "combien", "quel est", "quelle est",
+    "donne moi", "donne-moi", "donnez",
+    "poser", "pose", "planifier", "planifie",
+    "organiser", "organise", "annuler", "annule",
+    "vérifier", "verifie", "vérifie",
+    "retirer", "retire",
+    "mettre à jour", "mets à jour", "mets a jour",
+]
 
-═══════════════════════════════════════════
-RÈGLE 1 — CHANGEMENT DE SUJET EXPLICITE
-(PRIORITÉ LA PLUS HAUTE)
-═══════════════════════════════════════════
-Si le message contient une NOUVELLE ACTION EXPLICITE qui appartient
-à un domaine DIFFÉRENT du contexte actuel → TOUJOURS suivre la nouvelle action.
-Le contexte précédent ne compte plus.
+# ══════════════════════════════════════════════════════════
+# PROMPT LLM ROUTEUR — Agent Cards injectées dynamiquement
+# ══════════════════════════════════════════════════════════
+ROUTER_SYSTEM_PROMPT = """\
+Tu es le routeur d'un assistant d'entreprise multi-agents.
+Ta seule mission : analyser le message et retourner un JSON indiquant quel(s) agent(s) traite(nt) la demande.
 
-Exemples CRITIQUES :
-  Contexte calendar → "je veux créer un congé"      → rh (PAS calendar)
-  Contexte calendar → "combien de jours de congé"   → rh (PAS calendar)
-  Contexte calendar → "je serai absent lundi"        → rh (PAS calendar)
-  Contexte rh       → "crée-moi une réunion demain"  → calendar (PAS rh)
-  Contexte rh       → "montre mes tickets"           → jira (PAS rh)
-  N'importe quel contexte → "envoie un message slack" → slack
+{agents_section}
 
-⚠️ PIÈGE À ÉVITER : ne jamais rester sur l'agent précédent quand
-l'utilisateur change clairement de sujet. Le verbe d'action + le domaine
-suffisent pour rerouter.
+══════════════════════════════════════════
+RÈGLE 1 — LE DOMAINE DÉCIDE (pas le verbe)
+══════════════════════════════════════════
+Le SUJET détermine l'agent, pas le verbe. Mêmes verbes, domaines différents :
+  "supprimer un CONGÉ"       → rh       | "supprimer une RÉUNION"    → calendar
+  "créer un CONGÉ"           → rh       | "créer une RÉUNION"        → calendar
+  "annuler mon ABSENCE"      → rh       | "annuler un MEETING"       → calendar
+  "modifier mes jours de RH" → rh       | "modifier le PLANNING"     → calendar
 
-═══════════════════════════════════════════
-RÈGLE 2 — CONTINUATION DE CONTEXTE
-═══════════════════════════════════════════
-Si le message N'a PAS de verbe d'action pour un autre domaine
-ET que l'assistant vient de poser une question
-→ c'est une RÉPONSE → route vers le MÊME agent.
+══════════════════════════════════════════
+RÈGLE 2 — CONTEXTE CONVERSATIONNEL
+══════════════════════════════════════════
+L'historique récent est fourni pour contexte. Si le message actuel contient
+une action explicite dans un NOUVEAU domaine → route vers le NOUVEL agent.
+Ne pas rester sur l'agent précédent si le sujet change clairement.
 
-Messages qui sont des RÉPONSES (pas de changement de sujet) :
-  "oui", "non", "14h", "ok", "d'accord", "bien sûr"
-  un email (ex: "ahmed@talan.com")
-  une date ou heure (ex: "demain à 10h", "lundi prochain")
-  un nom de personne
-  des infos combinées (ex: "ahmed@talan.com demain a 8h vers 8:30")
-  → même agent que le contexte
+══════════════════════════════════════════
+RÈGLE 3 — MULTI-AGENT
+══════════════════════════════════════════
+Multi-agent si :
+  1. 2+ actions dans des DOMAINES DIFFÉRENTS (agents différents)
+  2. Chaque action est INDÉPENDANTE (pas une condition de l'autre)
+  3. Présence d'un connecteur ou d'une liste : "et", "aussi", "en plus", "puis", "+", virgule entre actions distinctes
 
-═══════════════════════════════════════════
-RÈGLE 3 — ACTION EXPLICITE SANS CONTEXTE
-═══════════════════════════════════════════
-Si le message contient une action claire → route vers l'agent concerné.
+Supporte 2 agents ET 3 agents ou plus.
+Format 3 agents : {{"targets": [{{"agent":"rh","sub_task":"..."}},{{"agent":"calendar","sub_task":"..."}},{{"agent":"jira","sub_task":"..."}}]}}
 
-Exemples :
-  "creer un reunion demain"       → calendar
-  "je veux créer un congé"        → rh
-  "montre mes tickets"            → jira
-  "envoie un message à Ahmed"     → slack
-  "cherche dans la doc"           → rag
+❌ PAS multi-agent si :
+  • deux actions du même domaine → un seul agent suffit
+  • une action + une condition / précision
+  • une seule action principale
 
-═══════════════════════════════════════════
-RÈGLE 4 — INTENTIONS IMPLICITES
-═══════════════════════════════════════════
-  "je suis malade demain"                  → rh
-  "je serai absent lundi"                  → rh
-  "je ne viens pas demain"                 → rh
-  "compétences de l'équipe"                → rh
-  "qui est disponible dans mon équipe"     → rh
+══════════════════════════════════════════
+RÈGLE 4 — CHAT (ultra restreint)
+══════════════════════════════════════════
+chat uniquement pour : salutations pures, politesse, remerciements.
+Si le moindre doute → NE PAS router vers chat.
 
-═══════════════════════════════════════════
-RÈGLE 5 — CHAT = CAS ULTRA RESTREINTS
-═══════════════════════════════════════════
-chat UNIQUEMENT pour :
-  1. Salutation pure : "bonjour", "salut", "hello"
-  2. Politesse pure : "au revoir", "bonne journée"
-  3. Remerciement pur : "merci", "ok merci"
+══════════════════════════════════════════
+EXEMPLES FEW-SHOT
+══════════════════════════════════════════
+"supprimer mon congé de demain"                     → {{"target_agent": "rh"}}
+"annule la réunion avec le client"                  → {{"target_agent": "calendar"}}
+"décaler la réunion de test la semaine prochaine"   → {{"target_agent": "calendar"}}
+"supprime mon absence de lundi"                     → {{"target_agent": "rh"}}
+"montre mes congés en attente"                      → {{"target_agent": "rh"}}
+"qu'est-ce que j'ai comme réunions cette semaine ?" → {{"target_agent": "calendar"}}
+"combien de jours de congé il me reste ?"           → {{"target_agent": "rh"}}
+"qui est disponible dans mon équipe lundi ?"        → {{"target_agent": "rh"}}
+"pose un congé lundi ET crée une réunion mardi"     → {{"targets": [{{"agent": "rh", "sub_task": "pose un congé lundi"}}, {{"agent": "calendar", "sub_task": "crée une réunion mardi"}}]}}
+"annule mon congé et montre mes réunions de la semaine" → {{"targets": [{{"agent": "rh", "sub_task": "annule mon congé"}}, {{"agent": "calendar", "sub_task": "montre mes réunions de la semaine"}}]}}
+"vérifie mon solde de congés puis montre moi mon agenda de la semaine prochaine" → {{"targets": [{{"agent": "rh", "sub_task": "vérifie mon solde de congés"}}, {{"agent": "calendar", "sub_task": "montre mon agenda de la semaine prochaine"}}]}}
+"pose un congé lundi, crée une réunion mardi et mets à jour mon ticket jira en cours" → {{"targets": [{{"agent": "rh", "sub_task": "pose un congé lundi"}}, {{"agent": "calendar", "sub_task": "crée une réunion mardi"}}, {{"agent": "jira", "sub_task": "mets à jour mon ticket jira en cours"}}]}}
+"supprimer mon congé et vérifier mon solde"         → {{"target_agent": "rh"}} (même domaine RH)
+"décaler la réunion de test vendredi"               → {{"target_agent": "calendar"}} (1 seule action)
+"bonjour"                                           → {{"target_agent": "chat"}}
 
-❌ "oui"/"non"/"ok" → PAS chat (voir RÈGLE 2)
-❌ Si le moindre doute → NE PAS router vers chat
+══════════════════════════════════════════
+FORMAT DE SORTIE (JSON strict, sans markdown)
+══════════════════════════════════════════
+Agent unique  : {{"target_agent": "nom_agent"}}
+Multi-agent   : {{"targets": [{{"agent": "nom1", "sub_task": "tâche1"}}, {{"agent": "nom2", "sub_task": "tâche2"}}]}}
 
-═══════════════════════════════════════════
-FORMAT OBLIGATOIRE
-═══════════════════════════════════════════
-JSON pur, sans markdown :
-{"target_agent": "nom_agent"}
+Date du jour  : {today}
 """
 
+
+# ══════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════
 
 def _extract_clean_text(content: str) -> str:
     """Nettoie le content des AIMessage (JSON → texte propre)."""
@@ -118,293 +155,296 @@ def _extract_clean_text(content: str) -> str:
         return content
 
 
-# ══════════════════════════════════════════════════════════
-# KEYWORDS par domaine
-# ══════════════════════════════════════════════════════════
-_AGENT_KEYWORDS = {
-    "rh":       ["congé", "conge", "leave", "solde", "absence", "rh", "ressources humaines",
-                 "malade", "maladie", "arrêt maladie", "arret maladie",
-                 "je reste", "rester à la maison", "rester a la maison",
-                 "je serai absent", "je suis absent", "je ne viens pas",
-                 "je ne serai pas", "absent demain", "absent lundi", "pas au bureau",
-                 "compétences", "competences", "stack", "disponibilité équipe",
-                 "disponibilite equipe", "qui est disponible", "équipe disponible",
-                 "membres de l'équipe", "membres de mon équipe",
-                 "compétences de l'équipe", "competences de l'equipe",
-                 "jours de congé", "jours de conge", "solde de congé",
-                 "combien de jours", "reste de congé"],
-    "calendar": ["réunion", "reunion", "meeting", "événement", "evenement", "agenda",
-                 "calendrier", "meet", "google meet", "visio", "stand-up",
-                 "standup", "call", "appel"],
-    "jira":     ["ticket", "jira", "bug", "tâche", "tache", "sprint", "backlog"],
-    "crm":      ["projet", "client", "rapport", "crm"],
-    "slack":    ["slack", "canal", "channel"],
-    "rag":      ["documentation", "cherche dans la doc"],
-}
-
-# Verbes qui indiquent une NOUVELLE action (pas une continuation)
-_ACTION_VERBS = [
-    "créer", "creer", "cree", "crée",
-    "supprimer", "supprime",
-    "modifier", "modifie",
-    "déplacer", "deplacer", "décaler", "decaler",
-    "consulter", "consulte", "voir", "montre", "affiche",
-    "envoyer", "envoie", "envoi",
-    "chercher", "cherche",
-    "je veux", "je voudrais", "je souhaite",
-    "combien", "quel est", "quelle est",
-    "donne moi", "donne-moi", "donnez",
-]
-
-_CHAT_ONLY_TOKENS = {
-    "bonjour", "salut", "hello", "bonsoir", "hi", "coucou",
-    "merci", "ok merci", "super merci", "merci beaucoup",
-    "au revoir", "bonne journée", "bonne journee", "à bientôt", "a bientot",
-    "bonne soirée", "bonne soiree",
-}
-
-# Keywords dans les réponses AI pour identifier l'agent actif
-_AI_CONTENT_KEYWORDS = {
-    "rh":       ["congé", "jours ouvrés", "solde de congé", "demande de congé",
-                 "jours disponibles", "manager notifié", "absence",
-                 "compétences", "en congé", "équipe", "leave_balance"],
-    "calendar": ["réunion", "événement", "google calendar", "google meet",
-                 "créneau", "quelle heure", "planifier", "e-mail",
-                 "adresse", "participants", "conflit"],
-    "jira":     ["ticket", "jira", "sprint", "bug"],
-    "crm":      ["projet", "client", "crm"],
-    "slack":    ["slack", "message envoyé"],
-}
-
-
 def _is_chat_only(text: str) -> bool:
     clean = text.lower().strip().rstrip("!?.,")
     clean = " ".join(clean.split())
     return clean in _CHAT_ONLY_TOKENS
 
 
+def _has_action_verb(text: str) -> bool:
+    t = text.lower()
+    return any(v in t for v in _ACTION_VERBS)
+
+
 def _is_gibberish(text: str) -> bool:
+    """
+    Détecte le gibberish par analyse linguistique simple.
+    Indépendant du keyword map — fonctionne pour n'importe quel nombre d'agents.
+    """
     clean = text.lower().strip()
     if not clean:
         return True
-    for keywords in _AGENT_KEYWORDS.values():
-        if any(kw in clean for kw in keywords):
-            return False
     if _is_chat_only(clean):
         return False
+    # Retire les non-lettres pour l'analyse phonétique
     alpha_only = _re.sub(r"[^a-zàâäéèêëïîôùûüÿçœæ]", "", clean)
     if len(alpha_only) < 3:
         return False
     voyelles = set("aeiouyàâäéèêëïîôùûüÿœæ")
     n_voyelles = sum(1 for c in alpha_only if c in voyelles)
     ratio = n_voyelles / len(alpha_only) if alpha_only else 0
+    # Trop peu de voyelles → probablement du gibberish
     if len(alpha_only) >= 5 and ratio < 0.15:
         return True
+    # Suite de consonnes impossibles en français
     if _re.search(r"[^aeiouyàâäéèêëïîôùûüÿœæ]{6,}", alpha_only):
         return True
     return False
 
 
-def _has_action_verb(text: str) -> bool:
-    """Détecte si le message contient un verbe d'action explicite."""
+def _is_short_reply(text: str) -> bool:
+    """True si le message est manifestement une courte réponse (date, heure, nom, oui/non...)."""
+    t = text.strip()
+    if len(t) > 80:
+        return False
+    if _has_action_verb(t.lower()):
+        return False
+    return True
+
+
+def _build_history_for_llm(trimmed_messages: list) -> str:
+    """Construit un historique compact pour le prompt du routeur (sans le dernier message)."""
+    lines = []
+    for msg in trimmed_messages[:-1]:
+        role = "Utilisateur" if msg.type == "human" else "Assistant"
+        content = msg.content if msg.type == "human" else _extract_clean_text(msg.content)
+        # Tronque les longues réponses AI
+        if msg.type != "human" and len(content) > MAX_AI_CHARS_IN_HISTORY:
+            content = content[:MAX_AI_CHARS_IN_HISTORY] + "..."
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _parse_llm_json(raw: str) -> dict | None:
+    """Extrait et parse le JSON de la réponse LLM (tolère le markdown)."""
+    content = raw.strip()
+    if "```" in content:
+        parts = content.split("```")
+        content = parts[1] if len(parts) > 1 else content
+        if content.startswith("json"):
+            content = content[4:]
+    start = content.find("{")
+    end = content.rfind("}") + 1
+    if start != -1 and end > start:
+        content = content[start:end]
+    try:
+        return json.loads(content.strip())
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════
+# FALLBACK — keyword match d'urgence (LLM indisponible)
+# ══════════════════════════════════════════════════════════
+
+def _normalize_french(text: str) -> str:
+    """Retire les accents et corrige les typos françaises courantes."""
+    _FIXES = {
+        "conje": "conge", "conjes": "conges", "conjer": "conger",
+        "réuion": "reunion", "reunoin": "reunion",
+        "absense": "absence", "absance": "absence",
+    }
+    nfkd = _unicodedata.normalize("NFD", text)
+    normalized = "".join(c for c in nfkd if _unicodedata.category(c) != "Mn")
+    for typo, fix in _FIXES.items():
+        normalized = normalized.replace(typo, fix)
+    return normalized
+
+
+def _keyword_fallback(text: str, keyword_map: dict[str, set[str]]) -> str | None:
+    """
+    Fallback keyword match pondéré.
+    UNIQUEMENT utilisé quand le LLM est indisponible.
+    """
     t = text.lower()
-    return any(v in t for v in _ACTION_VERBS)
+    t_norm = _normalize_french(t)
+    t_words = set(_re.findall(r"[a-zàâäéèêëïîôùûüÿçœæ]+", t))
+    t_norm_words = set(_re.findall(r"[a-zàâäéèêëïîôùûüÿçœæ]+", t_norm))
 
+    scores: dict[str, float] = {}
+    for agent, tags in keyword_map.items():
+        score = 0.0
+        for kw in tags:
+            kw_lower = kw.lower()
+            matched = kw_lower in t or kw_lower in t_norm
+            if not matched and " " in kw_lower:
+                kw_words = set(kw_lower.split())
+                matched = kw_words.issubset(t_words) or kw_words.issubset(t_norm_words)
+            if matched:
+                word_count = len(kw_lower.split())
+                weight = word_count * 2.0 if word_count > 1 else 1.0
+                if len(kw_lower) > 8:
+                    weight += 1.0
+                score += weight
+        if score > 0:
+            scores[agent] = score
 
-def _detect_agent_keywords(text: str) -> "str | None":
-    """Retourne le nom de l'agent si le message contient des keywords de cet agent."""
-    t = text.lower()
-    for agent, keywords in _AGENT_KEYWORDS.items():
-        if any(kw in t for kw in keywords):
-            return agent
-    return None
-
-
-def _find_last_active_agent(messages: list) -> "str | None":
-    """
-    Cherche le dernier agent actif :
-    1. Keywords dans les messages humains précédents
-    2. Fallback : keywords dans le dernier message AI
-    """
-    for msg in reversed(messages[:-1]):
-        if msg.type == "human":
-            agent = _detect_agent_keywords(msg.content)
-            if agent:
-                return agent
-
-    for msg in reversed(messages[:-1]):
-        if msg.type != "human":
-            content_lower = _extract_clean_text(msg.content).lower()
-            for agent, keywords in _AI_CONTENT_KEYWORDS.items():
-                if any(kw in content_lower for kw in keywords):
-                    print(f"  🔍 Agent détecté via réponse AI → {agent}")
-                    return agent
-            break
-
-    return None
-
-
-def _detect_context_continuation(messages: list) -> "dict | None":
-    """
-    Logique de continuation de contexte améliorée :
-    1. Si l'utilisateur change EXPLICITEMENT de sujet → return None (LLM décide)
-    2. Si c'est une réponse à une question → continue le même agent
-    """
-    if len(messages) < 2:
+    if not scores:
         return None
-
-    last_user_msg = messages[-1].content.strip()
-    last_user_lower = last_user_msg.lower().rstrip("!?.,")
-    last_ai_msg = None
-
-    for msg in reversed(messages[:-1]):
-        if msg.type != "human":
-            last_ai_msg = _extract_clean_text(msg.content)
-            break
-
-    if not last_ai_msg:
-        return None
-
-    # L'assistant doit avoir posé une question
-    if "?" not in last_ai_msg:
-        return None
-
-    # Salutation isolée → chat (ne pas forcer un agent)
-    if _is_chat_only(last_user_lower):
-        return None
-
-    last_active = _find_last_active_agent(messages)
-    if not last_active:
-        return None
-
-    # ── CHANGEMENT DE SUJET EXPLICITE ─────────────────────
-    # Si le message contient des keywords d'un AUTRE agent
-    # ET un verbe d'action → changement de sujet clair
-    detected_agent = _detect_agent_keywords(last_user_lower)
-    if detected_agent and detected_agent != last_active:
-        if _has_action_verb(last_user_lower):
-            print(f"  🔀 Changement de sujet explicite : {last_active} → {detected_agent}")
-            return {"target_agent": detected_agent}
-        # Keywords d'un autre agent mais pas de verbe d'action
-        # ex: "congé" dans un contexte calendar → laisser le LLM trancher
-        print(f"  🔀 Keywords autre agent détectés ({detected_agent}) sans verbe → LLM")
-        return None
-
-    # ── CONTINUATION ──────────────────────────────────────
-    print(f"  🎯 Context continuation → {last_active}")
-    return {"target_agent": last_active}
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    # Si ambiguïté forte → None (caller choisira le fallback ultime)
+    if len(ranked) >= 2:
+        best, second = ranked[0][1], ranked[1][1]
+        if best > 0 and (best - second) / best < 0.25:
+            return None
+    return ranked[0][0]
 
 
 # ══════════════════════════════════════════════════════════
 # NODE 1 — FONCTION PRINCIPALE
 # ══════════════════════════════════════════════════════════
+@traceable(
+    name="node1_detect_intent",
+    run_type="chain",
+    tags=["orchestrator", "routing"],
+    metadata={"node": "node1"},
+)
 async def node1_detect_intent(state: AssistantState) -> AssistantState:
+    """
+    Routeur LLM-first.
+    Retourne toujours target_agent + target_agents (None sauf multi-agent explicite).
+    """
+
+    # ── Charger le manifest ───────────────────────────────
+    manifest = await routing_manifest.build()
+    valid_agents = manifest.agent_names | {"chat", "rag"}
 
     all_messages = state["messages"]
-    trimmed = all_messages[-MAX_HISTORY_MESSAGES:] if len(all_messages) > MAX_HISTORY_MESSAGES else all_messages
+    trimmed = (
+        all_messages[-MAX_HISTORY_MESSAGES:]
+        if len(all_messages) > MAX_HISTORY_MESSAGES
+        else all_messages
+    )
     last_message = trimmed[-1].content
-
-    print(f"\n{'='*60}")
-    print(f"🔍 NODE 1 — ROUTEUR (classification par agent)")
-    print(f"{'='*60}")
-    print(f"📨 Dernier message : {last_message}")
-    print(f"📚 Messages : {len(all_messages)} total → {len(trimmed)} après trim")
-
-    # ── Pré-check gibberish ──────────────────────────────
-    if _is_gibberish(last_message):
-        print(f"🚫 Message détecté comme gibberish → chat")
-        print(f"{'='*60}\n")
-        return {**state, "target_agent": "chat"}
-
-    # ── Changement de sujet explicite (AVANT continuation) ─
-    # Si le message a un verbe d'action + keywords d'un agent → route directement
-    detected = _detect_agent_keywords(last_message.lower())
-    if detected and _has_action_verb(last_message.lower()):
-        last_active = _find_last_active_agent(trimmed)
-        if last_active and last_active != detected:
-            print(f"  🔀 Changement de sujet direct : {last_active} → {detected}")
-            print(f"{'='*60}\n")
-            return {**state, "target_agent": detected}
-
-    # ── Continuation de contexte ──────────────────────────
-    context_result = _detect_context_continuation(trimmed)
-    if context_result:
-        print(f"✅ Résultat (déterministe) : target_agent={context_result['target_agent']}")
-        print(f"{'='*60}\n")
-        return {**state, "target_agent": context_result["target_agent"]}
-
-    # ── Construit l'historique nettoyé ────────────────────
-    history = ""
-    for i, msg in enumerate(trimmed[:-1]):
-        role = "Utilisateur" if msg.type == "human" else "Assistant"
-        clean_content = msg.content if msg.type == "human" else _extract_clean_text(msg.content)
-        history += f"{role}: {clean_content}\n"
-        print(f"  [{i}] {role}: {clean_content[:300]}")
-
-    print(f"{'─'*60}")
-
-    # ── Prompt final ─────────────────────────────────────
-    user_content = ""
-    if history:
-        user_content += f"Contexte récent :\n{history}\n\n"
-    user_content += f"Dernier message : {last_message}"
 
     _today = date.today()
     _JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
     today_str = f"{_today.strftime('%Y-%m-%d')} ({_JOURS[_today.weekday()]})"
-    router_prompt_with_date = ROUTER_PROMPT + f"\n\nDate du jour : {today_str}"
+
+    print(f"\n{'='*60}")
+    print(f"🔍 NODE 1 — ROUTEUR LLM-FIRST")
+    print(f"{'='*60}")
+    print(f"📨 Message : {last_message[:120]}")
+    print(f"📚 {len(all_messages)} msgs total → {len(trimmed)} trimmed | {len(valid_agents)-2} agents actifs")
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  FAST PATH 1 — Chat-only (sans LLM)                 ║
+    # ╚══════════════════════════════════════════════════════╝
+    if _is_chat_only(last_message):
+        print(f"✅ FAST PATH: chat-only token")
+        print(f"{'='*60}\n")
+        return {**state, "target_agent": "chat", "target_agents": None}
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  FAST PATH 2 — Gibberish (sans LLM)                 ║
+    # ╚══════════════════════════════════════════════════════╝
+    if _is_gibberish(last_message):
+        print(f"🚫 FAST PATH: gibberish → chat")
+        print(f"{'='*60}\n")
+        return {**state, "target_agent": "chat", "target_agents": None}
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  FAST PATH 3 — Context continuation stricte (sans LLM) ║
+    # ║  Utilise state["target_agent"] comme référence      ║
+    # ╚══════════════════════════════════════════════════════╝
+    last_active_agent = state.get("target_agent")
+
+    if last_active_agent and last_active_agent not in ("chat", "rag"):
+        # Trouve le dernier message AI
+        last_ai_msg = None
+        for msg in reversed(trimmed[:-1]):
+            if msg.type != "human":
+                last_ai_msg = _extract_clean_text(msg.content)
+                break
+
+        # Continuation seulement si : AI a posé une question ET réponse courte sans verbe
+        if last_ai_msg and "?" in last_ai_msg and _is_short_reply(last_message):
+            print(f"✅ FAST PATH: context continuation → {last_active_agent}")
+            print(f"   (réponse courte à une question, pas de verbe d'action)")
+            print(f"{'='*60}\n")
+            return {**state, "target_agent": last_active_agent, "target_agents": None}
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  PRIMARY — LLM Router avec Agent Cards + few-shots  ║
+    # ╚══════════════════════════════════════════════════════╝
+    history = _build_history_for_llm(trimmed)
+
+    # Log de l'historique
+    for line in history.splitlines()[:6]:
+        print(f"  {line[:120]}")
+    print(f"{'─'*60}")
+
+    agents_section = manifest.routing_prompt or (
+        "AGENTS : rh (congés/RH), calendar (réunions/agenda), chat (salutations)"
+    )
+
+    system_prompt = ROUTER_SYSTEM_PROMPT.format(
+        agents_section=agents_section,
+        today=today_str,
+    )
+
+    user_content = ""
+    if history.strip():
+        user_content += f"Historique récent :\n{history}\n\n"
+    user_content += f"Message à router : {last_message}"
 
     try:
-        response_content = await invoke_with_fallback(
-            model="openai/gpt-oss-120b",
+        raw_response = await invoke_with_fallback(
+            model="openai/gpt-oss-20b",
             messages=[
-                SystemMessage(content=router_prompt_with_date),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=user_content),
             ],
             temperature=0,
-            max_tokens=128,
+            max_tokens=300,
         )
     except RuntimeError as e:
-        print(f"⚠️ Node1 LLM indisponible ({str(e)[:80]}) → fallback keyword")
-        for agent, keywords in _AGENT_KEYWORDS.items():
-            if any(kw in last_message.lower() for kw in keywords):
-                return {**state, "target_agent": agent}
-        return {**state, "target_agent": "chat"}
+        print(f"⚠️ LLM indisponible ({str(e)[:60]}) → fallback keyword")
+        fb = _keyword_fallback(last_message.lower(), manifest.keyword_map)
+        print(f"{'='*60}\n")
+        return {**state, "target_agent": fb or "chat", "target_agents": None}
 
-    print(f"📥 Réponse brute LLM : {response_content[:200]}")
+    print(f"📥 LLM brut : {raw_response[:200]}")
 
-    try:
-        content = response_content.strip()
-        if "```" in content:
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        start_idx = content.find("{")
-        end_idx = content.rfind("}") + 1
-        if start_idx != -1 and end_idx > start_idx:
-            content = content[start_idx:end_idx]
-        result = json.loads(content.strip())
-    except Exception as e:
-        print(f"⚠️ Parsing JSON échoué ({e}) → fallback keyword")
-        # Fallback keyword avant de tomber sur chat
-        for agent, keywords in _AGENT_KEYWORDS.items():
-            if any(kw in last_message.lower() for kw in keywords):
-                return {**state, "target_agent": agent}
-        result = {"target_agent": "chat"}
+    result = _parse_llm_json(raw_response)
 
+    if result is None:
+        print(f"⚠️ JSON invalide → fallback keyword")
+        fb = _keyword_fallback(last_message.lower(), manifest.keyword_map)
+        print(f"{'='*60}\n")
+        return {**state, "target_agent": fb or "chat", "target_agents": None}
+
+    # ── Cas multi-agent ──────────────────────────────────
+    if "targets" in result and isinstance(result["targets"], list):
+        targets = result["targets"]
+        valid_targets = [
+            t for t in targets
+            if isinstance(t, dict)
+            and t.get("agent") in valid_agents
+            and t.get("sub_task")
+        ]
+        if len(valid_targets) >= 2:
+            print(f"✅ MULTI-AGENT : {[t['agent'] for t in valid_targets]}")
+            print(f"{'='*60}\n")
+            return {
+                **state,
+                "target_agent": valid_targets[0]["agent"],
+                "target_agents": valid_targets,
+            }
+        # Dégradation : 1 seul target valide → mono-agent
+        if len(valid_targets) == 1:
+            print(f"✅ Résultat (multi→mono) : {valid_targets[0]['agent']}")
+            print(f"{'='*60}\n")
+            return {**state, "target_agent": valid_targets[0]["agent"], "target_agents": None}
+
+    # ── Cas mono-agent ───────────────────────────────────
     target_agent = result.get("target_agent", "chat")
 
-    valid_agents = {"rh", "calendar", "crm", "jira", "slack", "rag", "chat"}
     if target_agent not in valid_agents:
-        print(f"⚠️ Agent inconnu '{target_agent}' → fallback keyword")
-        for agent, keywords in _AGENT_KEYWORDS.items():
-            if any(kw in last_message.lower() for kw in keywords):
-                target_agent = agent
-                break
-        else:
-            target_agent = "chat"
+        print(f"⚠️ Agent '{target_agent}' inconnu → fallback keyword")
+        fb = _keyword_fallback(last_message.lower(), manifest.keyword_map)
+        target_agent = fb or "chat"
 
     print(f"✅ Résultat : target_agent={target_agent}")
     print(f"{'='*60}\n")
-
-    return {**state, "target_agent": target_agent}
+    return {**state, "target_agent": target_agent, "target_agents": None}

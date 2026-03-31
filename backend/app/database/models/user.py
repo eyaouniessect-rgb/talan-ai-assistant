@@ -19,7 +19,7 @@ class User(Base):
 
     password = Column(String, nullable=False)  # bcrypt hash
 
-    role = Column(String, nullable=False)  # consultant | pm
+    role = Column(String, nullable=False)  # consultant | pm | rh
 
     is_active = Column(Boolean, default=True)
 

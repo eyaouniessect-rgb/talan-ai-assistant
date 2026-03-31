@@ -1,7 +1,7 @@
 # scripts/seed_permissions.py
 # ═══════════════════════════════════════════════════════════
 # RBAC par TOOL — les permissions sont maintenant par nom d'outil
-# (tel que déclaré dans les agents), pas par intent.
+# Rôles : consultant | pm | rh
 # ═══════════════════════════════════════════════════════════
 import asyncio
 import sys
@@ -13,7 +13,7 @@ from app.database.models.permissions import Permission
 
 PERMISSIONS = [
     # ═══════════════════════════════════════════════════
-    # CONSULTANT
+    # CONSULTANT — actions sur son propre périmètre
     # ═══════════════════════════════════════════════════
 
     # ── Calendar Agent tools ──────────────────────────
@@ -26,14 +26,22 @@ PERMISSIONS = [
 
     # ── RH Agent tools ────────────────────────────────
     {"role": "consultant", "action": "create_leave",             "allowed": True},
+    {"role": "consultant", "action": "delete_leave",             "allowed": True},
     {"role": "consultant", "action": "get_my_leaves",            "allowed": True},
     {"role": "consultant", "action": "check_leave_balance",      "allowed": True},
     {"role": "consultant", "action": "get_team_availability",    "allowed": True},
     {"role": "consultant", "action": "get_team_stack",           "allowed": True},
     {"role": "consultant", "action": "notify_manager",           "allowed": True},
 
+    # Pas d'accès RH admin
+    {"role": "consultant", "action": "approve_leave",            "allowed": False},
+    {"role": "consultant", "action": "reject_leave",             "allowed": False},
+    {"role": "consultant", "action": "get_all_leaves",           "allowed": False},
+    {"role": "consultant", "action": "create_user_account",      "allowed": False},
+    {"role": "consultant", "action": "deactivate_user",          "allowed": False},
+
     # ═══════════════════════════════════════════════════
-    # PM — tout ce que le consultant peut + plus
+    # PM — tout consultant + vision équipe
     # ═══════════════════════════════════════════════════
 
     # ── Calendar Agent tools ──────────────────────────
@@ -46,20 +54,52 @@ PERMISSIONS = [
 
     # ── RH Agent tools ────────────────────────────────
     {"role": "pm", "action": "create_leave",             "allowed": True},
+    {"role": "pm", "action": "delete_leave",             "allowed": True},
     {"role": "pm", "action": "get_my_leaves",            "allowed": True},
     {"role": "pm", "action": "check_leave_balance",      "allowed": True},
     {"role": "pm", "action": "get_team_availability",    "allowed": True},
     {"role": "pm", "action": "get_team_stack",           "allowed": True},
     {"role": "pm", "action": "notify_manager",           "allowed": True},
+    {"role": "pm", "action": "get_all_leaves",           "allowed": True},   # voir congés équipe
 
-    # ── PM-only tools (futurs) ────────────────────────
-    # {"role": "pm", "action": "generate_report",       "allowed": True},
-    # {"role": "pm", "action": "get_all_projects",      "allowed": True},
+    # Pas de création de comptes
+    {"role": "pm", "action": "approve_leave",            "allowed": False},
+    {"role": "pm", "action": "reject_leave",             "allowed": False},
+    {"role": "pm", "action": "create_user_account",      "allowed": False},
+    {"role": "pm", "action": "deactivate_user",          "allowed": False},
+
+    # ═══════════════════════════════════════════════════
+    # RH — administration RH complète
+    # ═══════════════════════════════════════════════════
+
+    # ── Calendar Agent tools ──────────────────────────
+    {"role": "rh", "action": "check_calendar_conflicts", "allowed": True},
+    {"role": "rh", "action": "get_calendar_events",      "allowed": True},
+    {"role": "rh", "action": "create_meeting",           "allowed": True},
+    {"role": "rh", "action": "update_meeting",           "allowed": True},
+    {"role": "rh", "action": "delete_meeting",           "allowed": True},
+    {"role": "rh", "action": "search_meetings",          "allowed": True},
+
+    # ── RH Agent tools — accès complet ───────────────
+    {"role": "rh", "action": "create_leave",             "allowed": True},
+    {"role": "rh", "action": "delete_leave",             "allowed": True},
+    {"role": "rh", "action": "get_my_leaves",            "allowed": True},
+    {"role": "rh", "action": "check_leave_balance",      "allowed": True},
+    {"role": "rh", "action": "get_team_availability",    "allowed": True},
+    {"role": "rh", "action": "get_team_stack",           "allowed": True},
+    {"role": "rh", "action": "notify_manager",           "allowed": True},
+    {"role": "rh", "action": "get_all_leaves",           "allowed": True},
+
+    # ── RH Admin tools — exclusif RH ─────────────────
+    {"role": "rh", "action": "approve_leave",            "allowed": True},
+    {"role": "rh", "action": "reject_leave",             "allowed": True},
+    {"role": "rh", "action": "create_user_account",      "allowed": True},
+    {"role": "rh", "action": "deactivate_user",          "allowed": True},
 ]
+
 
 async def seed():
     async with AsyncSessionLocal() as db:
-        # Supprime les anciennes permissions
         from sqlalchemy import delete
         await db.execute(delete(Permission))
         await db.commit()
@@ -68,10 +108,12 @@ async def seed():
             db.add(Permission(**p))
         await db.commit()
 
-        consultant_count = sum(1 for p in PERMISSIONS if p["role"] == "consultant")
-        pm_count = sum(1 for p in PERMISSIONS if p["role"] == "pm")
-        print(f"✅ {len(PERMISSIONS)} permissions créées !")
-        print(f"   consultant → {consultant_count} tools autorisés")
-        print(f"   pm         → {pm_count} tools autorisés")
+        for role in ("consultant", "pm", "rh"):
+            count = sum(1 for p in PERMISSIONS if p["role"] == role)
+            allowed = sum(1 for p in PERMISSIONS if p["role"] == role and p["allowed"])
+            print(f"   {role:12} → {allowed} autorisés / {count} total")
+
+        print(f"\n✅ {len(PERMISSIONS)} permissions créées (3 rôles : consultant, pm, rh)")
+
 
 asyncio.run(seed())

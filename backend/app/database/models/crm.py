@@ -1,9 +1,10 @@
-# Modèles SQLAlchemy pour le schéma CRM (schema crm) :
-# - `clients`      : id, name, industry, contact_email
-# - `projects`     : id, name, client_id, status, progress, deadline, team_ids
-# - `reports`      : id, project_id, content, generated_at
-
 # database/models/crm.py
+# Tables :
+# - clients     : clients de Talan
+# - projects    : projets avec start_date + end_date
+# - assignments : participation d'un employé à un projet
+#                 (remplace project_members — ajoute allocation_percent, start/end date)
+
 from sqlalchemy import Column, Integer, String, Float, Date, ForeignKey, DateTime, func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
@@ -18,11 +19,7 @@ class Client(Base):
     industry      = Column(String)
     contact_email = Column(String)
 
-    projects = relationship(
-        "Project",
-        back_populates="client",
-        cascade="all, delete-orphan"
-    )
+    projects = relationship("Project", back_populates="client", cascade="all, delete-orphan")
 
 
 class Project(Base):
@@ -32,28 +29,32 @@ class Project(Base):
     id         = Column(Integer, primary_key=True)
     name       = Column(String, nullable=False)
     client_id  = Column(Integer, ForeignKey("crm.clients.id"), nullable=False)
-    status     = Column(String, default="En cours")
-    progress   = Column(Float, default=0.0)
-    deadline   = Column(Date)
+    status     = Column(String, default="En cours")   # En cours | Terminé | En attente
+    progress   = Column(Float, default=0.0)           # 0.0 → 100.0
+    start_date = Column(Date, nullable=True)
+    end_date   = Column(Date, nullable=True)          # remplace deadline
     created_at = Column(DateTime, server_default=func.now())
 
-    client  = relationship("Client", back_populates="projects")
-    members = relationship(
-        "ProjectMember",
-        back_populates="project",
-        cascade="all, delete-orphan"
-    )
+    client      = relationship("Client", back_populates="projects")
+    assignments = relationship("Assignment", back_populates="project", cascade="all, delete-orphan")
 
 
-class ProjectMember(Base):
-    __tablename__ = "project_members"
+class Assignment(Base):
+    """Participation d'un employé à un projet.
+    Règle métier : la somme des allocation_percent actifs d'un employé ≤ 100.
+    Cette contrainte est vérifiée côté application (pas en DB).
+    """
+    __tablename__ = "assignments"
     __table_args__ = {"schema": "crm"}
 
-    id              = Column(Integer, primary_key=True)
-    project_id      = Column(Integer, ForeignKey("crm.projects.id"), nullable=False)
-    employee_id     = Column(Integer, ForeignKey("hris.employees.id"), nullable=False)
-    role_in_project = Column(String)        # ex: "Lead Dev", "Designer", "DevOps"
-    joined_at       = Column(DateTime, server_default=func.now())
+    id                 = Column(Integer, primary_key=True)
+    project_id         = Column(Integer, ForeignKey("crm.projects.id"),    nullable=False)
+    employee_id        = Column(Integer, ForeignKey("hris.employees.id"),  nullable=False)
+    role_in_project    = Column(String)                # ex: "Lead Dev", "Designer", "DevOps"
+    allocation_percent = Column(Integer, default=100)  # % du temps alloué au projet
+    start_date         = Column(Date, nullable=True)
+    end_date           = Column(Date, nullable=True)   # NULL = encore affecté
+    joined_at          = Column(DateTime, server_default=func.now())
 
-    project  = relationship("Project", back_populates="members")
+    project  = relationship("Project", back_populates="assignments")
     employee = relationship("Employee")

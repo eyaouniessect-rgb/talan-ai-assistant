@@ -41,6 +41,9 @@
   .badge-pm {
     @apply bg-purple-50 text-purple-700 text-xs font-medium px-2.5 py-0.5 rounded-full;
   }
+  .badge-rh {
+    @apply bg-emerald-50 text-emerald-700 text-xs font-medium px-2.5 py-0.5 rounded-full;
+  }
   .sidebar-item {
     @apply flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium
            text-slate-600 hover:bg-slate-100 hover:text-navy
@@ -161,9 +164,15 @@
 /* Tableaux */
 .prose-chat table {
   width: 100%;
+  display: block;
+  overflow-x: auto;
   border-collapse: collapse;
   margin: 0.75rem 0;
   font-size: 0.8125rem;
+}
+.prose-chat th,
+.prose-chat td {
+  white-space: nowrap;
 }
 .prose-chat thead th {
   background: #f1f5f9;
@@ -218,6 +227,8 @@
 .prose-chat a {
   color: #0891b2;
   text-decoration: underline;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .prose-chat a:hover {
   color: #0e7490;
