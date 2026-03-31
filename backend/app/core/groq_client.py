@@ -33,7 +33,16 @@ def _load_keys() -> list[str]:
             keys.append(key)
     if not keys:
         raise ValueError("Aucune clé API Groq trouvée dans le .env")
-    logger.info(f"Groq : {len(keys)} clé(s) chargée(s)")
+
+    # Rotation basée sur le PID du processus OS.
+    # Chaque agent (port 8001, 8002…) est un processus séparé avec un PID différent.
+    # → ils démarrent naturellement sur des clés différentes sans aucune config.
+    # Ex avec 5 clés : PID % 5 → agent RH=0, agent Calendar=2, orchestrateur=1
+    if len(keys) > 1:
+        offset = os.getpid() % len(keys)
+        keys = keys[offset:] + keys[:offset]
+
+    logger.info(f"Groq : {len(keys)} clé(s) | PID={os.getpid()} offset={os.getpid() % len(keys)}")
     return keys
 
 

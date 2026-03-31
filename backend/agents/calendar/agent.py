@@ -12,6 +12,7 @@ from agents.calendar.prompts import CALENDAR_REACT_PROMPT
 from agents.calendar import tools
 from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_quota_error, FRIENDLY_QUOTA_MSG
 from app.core.rbac import check_tool_permission, tool_permission_denied_message
+from langsmith import trace
 
 
 # ── Rôle et user courants (injectés par execute()) ───────
@@ -360,84 +361,100 @@ class CalendarAgentExecutor(AgentExecutor):
         max_retries = 3
         result = None
 
-        for attempt in range(max_retries):
-            try:
-                result = await self.react_agent.ainvoke({
-                    "messages": [HumanMessage(content=user_input)]
-                })
-                break
+        with trace(
+            name="calendar_agent.execute",
+            run_type="chain",
+            inputs={"user_input": user_input[:1000], "role": _current_role, "user_id": _current_user_id},
+            tags=["agent", "calendar"],
+        ) as ls_run:
+            for attempt in range(max_retries):
+                try:
+                    result = await self.react_agent.ainvoke({
+                        "messages": [HumanMessage(content=user_input)]
+                    })
+                    break
 
-            except Exception as e:
-                if _is_quota_error(e):
-                    print(f"⚠️ Quota tokens dépassé (Calendar) : {str(e)[:120]}")
-                    response = json.dumps({
-                        "response": FRIENDLY_QUOTA_MSG,
-                        "react_steps": [],
-                    }, ensure_ascii=False)
-                    message = new_agent_text_message(response)
-                    await event_queue.enqueue_event(message)
-                    return
-                elif _is_fallback_error(e) and rotate_llm_key():
-                    print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation vers clé suivante")
-                    self._build_react_agent()
-                    continue
+                except Exception as e:
+                    if _is_quota_error(e):
+                        print(f"⚠️ Quota tokens dépassé (Calendar) : {str(e)[:120]}")
+                        ls_run.end(outputs={"response": FRIENDLY_QUOTA_MSG, "error": "quota"})
+                        response = json.dumps({
+                            "response": FRIENDLY_QUOTA_MSG,
+                            "react_steps": [],
+                        }, ensure_ascii=False)
+                        message = new_agent_text_message(response)
+                        await event_queue.enqueue_event(message)
+                        return
+                    elif _is_fallback_error(e) and rotate_llm_key():
+                        print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation vers clé suivante")
+                        self._build_react_agent()
+                        continue
 
-                print(f"❌ Erreur (tentative {attempt+1}) : {str(e)}")
-                if attempt == max_retries - 1:
-                    response = json.dumps({
-                        "response": f"Erreur : {str(e)}",
-                        "react_steps": []
-                    }, ensure_ascii=False)
-                    message = new_agent_text_message(response)
-                    await event_queue.enqueue_event(message)
-                    return
+                    print(f"❌ Erreur (tentative {attempt+1}) : {str(e)}")
+                    if attempt == max_retries - 1:
+                        ls_run.end(outputs={"response": f"Erreur : {str(e)}", "error": str(e)})
+                        response = json.dumps({
+                            "response": f"Erreur : {str(e)}",
+                            "react_steps": []
+                        }, ensure_ascii=False)
+                        message = new_agent_text_message(response)
+                        await event_queue.enqueue_event(message)
+                        return
 
-        # ── Extraction + Log Think/Act/Observe ───────────
-        react_steps = []
-        tool_calls_map = {}
+            # ── Extraction + Log Think/Act/Observe ───────────
+            react_steps = []
+            tool_calls_map = {}
 
-        print(f"\n{'─'*50}")
-        print("🧠 CYCLE ReAct — CalendarAgent :")
+            print(f"\n{'─'*50}")
+            print("🧠 CYCLE ReAct — CalendarAgent :")
 
-        for msg in result["messages"]:
-            msg_type = type(msg).__name__
+            for msg in result["messages"]:
+                msg_type = type(msg).__name__
 
-            if msg_type == "AIMessage":
-                if msg.content:
-                    print(f"  🤔 Think  : {msg.content[:300]}")
-                if msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        human_label = _tool_to_human_text(tc['name'], tc['args'])
-                        react_steps.append(human_label)
-                        tool_calls_map[tc['id']] = len(react_steps) - 1
-                        print(f"  🔧 Act    : {tc['name']}({tc['args']})")
+                if msg_type == "AIMessage":
+                    if msg.content:
+                        print(f"  🤔 Think  : {msg.content[:300]}")
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            human_label = _tool_to_human_text(tc['name'], tc['args'])
+                            react_steps.append(human_label)
+                            tool_calls_map[tc['id']] = len(react_steps) - 1
+                            print(f"  🔧 Act    : {tc['name']}({tc['args']})")
 
-            elif msg_type == "ToolMessage":
-                tool_call_id = getattr(msg, 'tool_call_id', None)
-                obs_human = _format_observation(msg.content)
-                print(f"  👁️  Observe: {msg.content[:200]}")
-                if tool_call_id and tool_call_id in tool_calls_map:
-                    idx = tool_calls_map[tool_call_id]
-                    if obs_human:
-                        react_steps[idx] += f"\n   → {obs_human}"
+                elif msg_type == "ToolMessage":
+                    tool_call_id = getattr(msg, 'tool_call_id', None)
+                    obs_human = _format_observation(msg.content)
+                    print(f"  👁️  Observe: {msg.content[:200]}")
+                    if tool_call_id and tool_call_id in tool_calls_map:
+                        idx = tool_calls_map[tool_call_id]
+                        if obs_human:
+                            react_steps[idx] += f"\n   → {obs_human}"
 
-            elif msg_type == "HumanMessage":
-                print(f"  👤 Human  : {msg.content[:200]}")
+                elif msg_type == "HumanMessage":
+                    print(f"  👤 Human  : {msg.content[:200]}")
 
-        print(f"{'─'*50}\n")
+            print(f"{'─'*50}\n")
 
-        final = result["messages"][-1].content
+            final = result["messages"][-1].content
 
-        ui_hint = _detect_ui_hint(final)
-        print(f"  🎨 UI Hint détecté : {ui_hint}")
-        response_data = {"response": final, "react_steps": react_steps}
-        if ui_hint:
-            response_data["ui_hint"] = ui_hint
+            ui_hint = _detect_ui_hint(final)
+            print(f"  🎨 UI Hint détecté : {ui_hint}")
 
-        response = json.dumps(response_data, ensure_ascii=False)
+            ls_run.end(outputs={
+                "response": final[:500],
+                "react_steps": react_steps,
+                "steps_count": len(react_steps),
+                "ui_hint": ui_hint,
+            })
 
-        message = new_agent_text_message(response)
-        await event_queue.enqueue_event(message)
+            response_data = {"response": final, "react_steps": react_steps}
+            if ui_hint:
+                response_data["ui_hint"] = ui_hint
+
+            response = json.dumps(response_data, ensure_ascii=False)
+
+            message = new_agent_text_message(response)
+            await event_queue.enqueue_event(message)
 
     async def cancel(self, context, event_queue):
         pass

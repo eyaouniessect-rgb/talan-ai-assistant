@@ -1,6 +1,6 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import { useAuthStore, useNotifStore } from '../../store'
-import { LayoutDashboard, MessageSquare, Clock, Bell, Settings, Rocket, LogOut, Zap, X } from 'lucide-react'
+import { LayoutDashboard, MessageSquare, Clock, Bell, Settings, Rocket, LogOut, Zap, X, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 
 const NAV = [
@@ -18,6 +18,7 @@ export default function Sidebar({ open, onClose }) {
   const unread = notifications.filter(n=>!n.read).length
   const nav = useNavigate()
   const isPM = user?.role === 'pm'
+  const isRH = user?.role === 'rh'
 
   const handleLogout = () => { logout(); nav('/') }
 
@@ -55,8 +56,8 @@ export default function Sidebar({ open, onClose }) {
             </div>
             <div className="min-w-0">
               <div className="text-sm font-semibold text-slate-800 truncate">{user?.name}</div>
-              <span className={isPM ? 'badge-pm' : 'badge-consultant'}>
-                {isPM ? 'Project Manager' : 'Consultant'}
+              <span className={isPM ? 'badge-pm' : isRH ? 'badge-rh' : 'badge-consultant'}>
+                {isPM ? 'Project Manager' : isRH ? 'RH' : 'Consultant'}
               </span>
             </div>
           </div>
@@ -83,6 +84,15 @@ export default function Sidebar({ open, onClose }) {
               <Rocket size={18} className="shrink-0"/>
               <span className="flex-1">Nouveau Projet</span>
               <span className="text-xs bg-cyan/10 text-cyan px-1.5 py-0.5 rounded-md font-medium">PM</span>
+            </NavLink>
+          )}
+
+          {isRH && (
+            <NavLink to="/rh" onClick={onClose}
+              className={({isActive}) => clsx('sidebar-item mt-2', isActive && 'active')}>
+              <ShieldCheck size={18} className="shrink-0"/>
+              <span className="flex-1">Espace RH</span>
+              <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-md font-medium">RH</span>
             </NavLink>
           )}
         </nav>

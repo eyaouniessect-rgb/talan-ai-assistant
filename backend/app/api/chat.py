@@ -142,11 +142,24 @@ async def chat(
         "messages":       [HumanMessage(content=request.message)],
         "user_id":        user_id,
         "role":           role,
-        "target_agent":   None,
+        # target_agent absent intentionnellement :
+        # LangGraph garde la valeur checkpointée → FAST PATH 3 peut détecter
+        # qu'on répond à une question en cours ("1", "oui", "non"...).
+        # Si nouveau sujet → LLM router réécrit target_agent normalement.
+        "target_agents":  None,   # reset : évite replay d'un vieux dispatch multi-agent
         "final_response": None,
     }
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "run_name": f"chat:user_{user_id}",
+        "metadata": {
+            "user_id": user_id,
+            "role": role,
+            "conversation_id": conversation.id,
+            "message_preview": request.message[:100],
+        },
+    }
     result = await graph.ainvoke(initial_state, config)
 
     logger.info(f"LangGraph terminé - agent={result['target_agent']}")

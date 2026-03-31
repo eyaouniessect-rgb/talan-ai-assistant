@@ -12,6 +12,7 @@ import os
 import logging
 from typing import Optional
 from dotenv import load_dotenv
+from langsmith import traceable
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class AgentDiscovery:
         self._last_scan: float = 0
         self._lock = asyncio.Lock()
 
+    @traceable(name="discovery.scan_agents", tags=["a2a", "discovery"])
     async def scan_agents(self, force: bool = False) -> dict[str, DiscoveredAgent]:
         """Scanne tous les agents configurés."""
         async with self._lock:
@@ -94,6 +96,7 @@ class AgentDiscovery:
             logger.info(f"📊 Discovery : {len(new_cache)}/{len(AGENT_ENDPOINTS)} agents actifs")
             return self._cache
 
+    @traceable(name="discovery.fetch_card", tags=["a2a", "http"])
     async def _fetch_agent_card(self, name: str, base_url: str) -> Optional[DiscoveredAgent]:
         url = f"{base_url}/.well-known/agent.json"
         headers = _build_auth_headers()
@@ -111,6 +114,7 @@ class AgentDiscovery:
         except Exception as e:
             raise e
 
+    @traceable(name="discovery.find_agent", tags=["a2a", "discovery"])
     async def find_agent_by_name(self, agent_name: str) -> Optional[DiscoveredAgent]:
         """Trouve un agent par son nom (rh, calendar, etc.)."""
         agents = await self.scan_agents()
@@ -132,3 +136,133 @@ class AgentDiscovery:
 
 
 discovery = AgentDiscovery()
+
+
+# ══════════════════════════════════════════════════════════
+# ROUTING MANIFEST — auto-généré depuis les Agent Cards
+# ══════════════════════════════════════════════════════════
+
+class RoutingManifest:
+    """
+    Construit un manifest de routage à partir des Agent Cards A2A.
+    - routing_prompt : prompt LLM auto-généré avec descriptions + skills + examples
+    - keyword_map    : {agent_name: set(tags)} extrait automatiquement des skills
+    """
+
+    def __init__(self):
+        self._prompt: str = ""
+        self._keyword_map: dict[str, set[str]] = {}
+        self._agent_names: set[str] = set()
+        self._last_build: float = 0
+
+    @property
+    def routing_prompt(self) -> str:
+        return self._prompt
+
+    @property
+    def keyword_map(self) -> dict[str, set[str]]:
+        return self._keyword_map
+
+    @property
+    def agent_names(self) -> set[str]:
+        return self._agent_names
+
+    def is_stale(self) -> bool:
+        import time
+        return (time.time() - self._last_build) > CACHE_TTL_SECONDS or not self._prompt
+
+    async def build(self, force: bool = False) -> "RoutingManifest":
+        """Reconstruit le manifest depuis les Agent Cards découvertes."""
+        import time
+
+        if not force and not self.is_stale():
+            return self
+
+        agents = await discovery.scan_agents(force=force)
+
+        if not agents:
+            logger.warning("⚠️ Aucun agent découvert — manifest vide")
+            return self
+
+        prompt_lines = []
+        keyword_map = {}
+        agent_names = set()
+
+        for name, agent in sorted(agents.items()):
+            agent_names.add(name)
+            card = agent.card
+
+            # ── En-tête agent (description complète) ────────────
+            desc = card.get("description", "Pas de description")
+            prompt_lines.append(f"\n## AGENT: {name}")
+            prompt_lines.append(f"   Description: {desc}")
+
+            skills = card.get("skills", [])
+            all_tags = set()
+
+            for skill in skills:
+                skill_id   = skill.get("id", "?")
+                skill_name = skill.get("name", skill_id)
+                skill_desc = skill.get("description", "")
+                examples   = skill.get("examples", [])
+                tags       = skill.get("tags", [])
+
+                all_tags.update(t.lower() for t in tags)
+
+                # Skill complet : id + nom + description complète
+                prompt_lines.append(f"  • {skill_id} ({skill_name})")
+                if skill_desc:
+                    prompt_lines.append(f"    → {skill_desc}")
+                # Exemples représentatifs : max 2 par skill pour rester compact
+                if examples:
+                    for ex in examples[:2]:
+                        prompt_lines.append(f"    Ex: \"{ex}\"")
+
+            # --- Enrichir les tags avec des mots extraits des examples ---
+            # On filtre les mots génériques (verbes d'action, temporels, pronoms)
+            # pour éviter que des mots comme "supprimer", "demain" créent des
+            # collisions entre agents.
+            _GENERIC_WORDS = {
+                # Pronoms / déterminants / prépositions
+                "dans", "avec", "pour", "quel", "quels", "quelle", "quelles",
+                "cette", "mon", "mes", "mes", "sont", "est-ce", "votre", "vous",
+                "moi", "nous", "leur", "leurs", "tous", "tout", "toute", "toutes",
+                # Temporels (partagés entre agents)
+                "prochaine", "prochain", "semaine", "mois", "demain", "aujourd'hui",
+                "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+                "matin", "après-midi", "soir", "jour", "jours", "heure", "heures",
+                "date", "dates",
+                # Verbes d'action génériques (partagés entre agents)
+                "créer", "creer", "supprimer", "supprime", "modifier", "modifie",
+                "annuler", "annule", "consulter", "consulte", "voir", "montre",
+                "affiche", "cherche", "chercher", "trouver", "trouve", "montrer",
+                "vérifier", "verifie", "vérifie",
+                # Mots de liaison
+                "comment", "combien", "quand", "peut", "veux", "voudrais",
+                "souhaite", "besoin", "faire", "fait",
+            }
+            for skill in skills:
+                for ex in skill.get("examples", []):
+                    words = ex.lower().split()
+                    for w in words:
+                        clean = w.strip(".,?!\"'()[]")
+                        if len(clean) > 3 and clean not in _GENERIC_WORDS:
+                            all_tags.add(clean)
+
+            keyword_map[name] = all_tags
+
+        self._prompt = (
+            f"AGENTS DISPONIBLES ({len(agents)} agents actifs):\n"
+            + "\n".join(prompt_lines)
+        )
+        self._keyword_map = keyword_map
+        self._agent_names = agent_names
+        self._last_build = time.time()
+
+        logger.info(f"📋 Routing manifest construit : {len(agents)} agents, "
+                     f"{sum(len(t) for t in keyword_map.values())} keywords total")
+
+        return self
+
+
+routing_manifest = RoutingManifest()

@@ -18,6 +18,7 @@ from agents.rh.prompts import RH_REACT_PROMPT
 from agents.rh import tools as rh_tools
 from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_quota_error, FRIENDLY_QUOTA_MSG
 from app.core.rbac import check_tool_permission, tool_permission_denied_message
+from langsmith import trace
 
 load_dotenv()
 
@@ -98,6 +99,55 @@ async def create_leave(user_id: int, start_date: str, end_date: str) -> str:
             description = f"Vous avez demandé un congé du {start_date} au {end_date} ({days} jour(s))",
             leave_id    = leave_id,
         )
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def delete_leave(
+    user_id: int,
+    leave_id: int = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> str:
+    """
+    Annule une demande de congé existante.
+    - leave_id : annule un congé précis
+    - start_date seule : annule le congé couvrant cette date
+    - start_date + end_date : annule les congés de la période
+    """
+    denied = await _check_rbac("delete_leave")
+    if denied: return denied
+    result = await rh_tools.delete_leave(
+        user_id=user_id,
+        leave_id=leave_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    if result.get("success"):
+        cancelled = result.get("cancelled_leaves") or []
+        if cancelled:
+            for item in cancelled:
+                await _log_leave_action(
+                    user_id     = user_id,
+                    action      = "cancelled",
+                    description = (
+                        f"Congé #{item.get('leave_id')} du {item.get('start_date')} "
+                        f"au {item.get('end_date')} annulé"
+                    ),
+                    leave_id    = item.get("leave_id"),
+                )
+        else:
+            await _log_leave_action(
+                user_id     = user_id,
+                action      = "cancelled",
+                description = (
+                    f"Congé #{result.get('leave_id')} du {result.get('start_date')} "
+                    f"au {result.get('end_date')} annulé"
+                ),
+                leave_id    = result.get("leave_id"),
+            )
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -213,6 +263,7 @@ async def check_leave_balance(user_id: int, requested_days: int = 0) -> str:
 TOOLS = [
     check_leave_balance,
     create_leave,
+    delete_leave,
     get_my_leaves,
     get_team_availability,
     get_team_stack,
@@ -266,92 +317,111 @@ class RHAgentExecutor(AgentExecutor):
         # ── Tentative avec failover ────────────────────────
         max_retries = 3
         result = None
-        for attempt in range(max_retries):
-            try:
-                result = await self.react_agent.ainvoke({
-                    "messages": [HumanMessage(content=user_input)]
-                })
-                break
+        final_response = None
 
-            except Exception as e:
-                if _is_quota_error(e):
-                    print(f"⚠️ Quota tokens dépassé (RH) : {str(e)[:120]}")
-                    response_with_steps = json.dumps({
-                        "response": FRIENDLY_QUOTA_MSG,
-                        "react_steps": [],
-                    }, ensure_ascii=False)
-                    message = new_agent_text_message(response_with_steps)
-                    await event_queue.enqueue_event(message)
-                    return
-                elif _is_fallback_error(e) and rotate_llm_key():
-                    print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
-                    self._build_react_agent()
-                    continue
-                else:
-                    print(f"❌ Erreur ReAct : {str(e)}")
-                    response_with_steps = json.dumps({
-                        "response": f"Erreur lors du traitement : {str(e)}",
-                        "react_steps": [],
-                    }, ensure_ascii=False)
-                    message = new_agent_text_message(response_with_steps)
-                    await event_queue.enqueue_event(message)
-                    return
+        with trace(
+            name="rh_agent.execute",
+            run_type="chain",
+            inputs={"user_input": user_input[:1000], "role": _current_role},
+            tags=["agent", "rh"],
+        ) as ls_run:
+            for attempt in range(max_retries):
+                try:
+                    result = await self.react_agent.ainvoke({
+                        "messages": [HumanMessage(content=user_input)]
+                    })
+                    break
 
-        if result is None:
+                except Exception as e:
+                    if _is_quota_error(e):
+                        print(f"⚠️ Quota tokens dépassé (RH) : {str(e)[:120]}")
+                        final_response = FRIENDLY_QUOTA_MSG
+                        ls_run.end(outputs={"response": final_response, "error": "quota"})
+                        response_with_steps = json.dumps({
+                            "response": final_response,
+                            "react_steps": [],
+                        }, ensure_ascii=False)
+                        message = new_agent_text_message(response_with_steps)
+                        await event_queue.enqueue_event(message)
+                        return
+                    elif _is_fallback_error(e) and rotate_llm_key():
+                        print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
+                        self._build_react_agent()
+                        continue
+                    else:
+                        print(f"❌ Erreur ReAct : {str(e)}")
+                        final_response = f"Erreur lors du traitement : {str(e)}"
+                        ls_run.end(outputs={"response": final_response, "error": str(e)})
+                        response_with_steps = json.dumps({
+                            "response": final_response,
+                            "react_steps": [],
+                        }, ensure_ascii=False)
+                        message = new_agent_text_message(response_with_steps)
+                        await event_queue.enqueue_event(message)
+                        return
+
+            if result is None:
+                final_response = "Toutes les clés API sont temporairement indisponibles. Veuillez réessayer."
+                ls_run.end(outputs={"response": final_response, "error": "all_keys_exhausted"})
+                response_with_steps = json.dumps({
+                    "response": final_response,
+                    "react_steps": [],
+                }, ensure_ascii=False)
+                message = new_agent_text_message(response_with_steps)
+                await event_queue.enqueue_event(message)
+                return
+
+            # ── Extrait les steps du cycle ReAct ──────────────
+            react_steps = []
+            tool_calls_map = {}
+
+            for msg in result["messages"]:
+                msg_type = type(msg).__name__
+                if msg_type == "AIMessage" and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        step_text = _tool_to_human_text(tc['name'], tc['args'])
+                        react_steps.append(step_text)
+                        tool_calls_map[tc['id']] = len(react_steps) - 1
+
+                elif msg_type == "ToolMessage":
+                    obs = _format_observation(msg.content)
+                    if obs:
+                        tool_call_id = getattr(msg, 'tool_call_id', None)
+                        if tool_call_id and tool_call_id in tool_calls_map:
+                            idx = tool_calls_map[tool_call_id]
+                            react_steps[idx] += f"\n   → {obs}"
+
+            # ── Log terminal ──────────────────────────────────
+            print(f"\n{'─'*50}")
+            print("🧠 CYCLE ReAct :")
+            for msg in result["messages"]:
+                msg_type = type(msg).__name__
+                if msg_type == "HumanMessage":
+                    print(f"  👤 Human  : {msg.content[:500]}")
+                elif msg_type == "AIMessage":
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            print(f"  🔧 Act    : {tc['name']}({tc['args']})")
+                    else:
+                        print(f"  🤖 Answer : {msg.content[:200]}")
+                elif msg_type == "ToolMessage":
+                    print(f"  👁️  Observe: {msg.content[:100]}")
+            print(f"{'─'*50}\n")
+
+            final_response = result["messages"][-1].content
+            ls_run.end(outputs={
+                "response": final_response[:500],
+                "react_steps": react_steps,
+                "steps_count": len(react_steps),
+            })
+
             response_with_steps = json.dumps({
-                "response": "Toutes les clés API sont temporairement indisponibles. Veuillez réessayer.",
-                "react_steps": [],
+                "response": final_response,
+                "react_steps": react_steps,
             }, ensure_ascii=False)
+
             message = new_agent_text_message(response_with_steps)
             await event_queue.enqueue_event(message)
-            return
-
-        # ── Extrait les steps du cycle ReAct ──────────────
-        react_steps = []
-        tool_calls_map = {}
-
-        for msg in result["messages"]:
-            msg_type = type(msg).__name__
-            if msg_type == "AIMessage" and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    step_text = _tool_to_human_text(tc['name'], tc['args'])
-                    react_steps.append(step_text)
-                    tool_calls_map[tc['id']] = len(react_steps) - 1
-
-            elif msg_type == "ToolMessage":
-                obs = _format_observation(msg.content)
-                if obs:
-                    tool_call_id = getattr(msg, 'tool_call_id', None)
-                    if tool_call_id and tool_call_id in tool_calls_map:
-                        idx = tool_calls_map[tool_call_id]
-                        react_steps[idx] += f"\n   → {obs}"
-
-        # ── Log terminal ──────────────────────────────────
-        print(f"\n{'─'*50}")
-        print("🧠 CYCLE ReAct :")
-        for msg in result["messages"]:
-            msg_type = type(msg).__name__
-            if msg_type == "HumanMessage":
-                print(f"  👤 Human  : {msg.content[:500]}")
-            elif msg_type == "AIMessage":
-                if msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        print(f"  🔧 Act    : {tc['name']}({tc['args']})")
-                else:
-                    print(f"  🤖 Answer : {msg.content[:200]}")
-            elif msg_type == "ToolMessage":
-                print(f"  👁️  Observe: {msg.content[:100]}")
-        print(f"{'─'*50}\n")
-
-        final_response = result["messages"][-1].content
-
-        response_with_steps = json.dumps({
-            "response": final_response,
-            "react_steps": react_steps,
-        }, ensure_ascii=False)
-
-        message = new_agent_text_message(response_with_steps)
-        await event_queue.enqueue_event(message)
 
     async def cancel(
         self,
@@ -375,6 +445,11 @@ def _tool_to_human_text(tool_name: str, args: dict) -> str:
         "create_leave": (
             f"📝 Création du congé du {args.get('start_date')} "
             f"au {args.get('end_date')}..."
+        ),
+        "delete_leave": (
+            f"🗑️ Annulation du congé"
+            f"{' #' + str(args.get('leave_id')) if args.get('leave_id') else ''}"
+            f"{' du ' + args.get('start_date') if args.get('start_date') else ''}..."
         ),
         "notify_manager": "📢 Notification du manager...",
         "get_my_leaves": (
@@ -405,7 +480,9 @@ def _format_observation(content: str) -> str:
             if "conflicts" in data:
                 conflicts = data.get("conflicts", [])
                 return "Aucun conflit trouvé ✅" if not conflicts else f"{len(conflicts)} conflit(s) ⚠️"
-            if "leave_id" in data:
+            if "new_status" in data and data["new_status"] == "cancelled":
+                return f"Congé #{data.get('leave_id')} annulé ✅"
+            if "leave_id" in data and "new_status" not in data:
                 return f"Congé créé (ID: {data['leave_id']}) ✅"
             if "message" in data:
                 return f"{data['message']} ✅"

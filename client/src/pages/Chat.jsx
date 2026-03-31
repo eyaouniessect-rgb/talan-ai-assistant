@@ -42,6 +42,14 @@ const QUICK_PM = [
   "Uploader un CDC",
 ];
 
+function formatAssistantContent(content = "") {
+  // Replace long raw Google Calendar URLs with short markdown links for better layout.
+  return content.replace(
+    /(https?:\/\/www\.google\.com\/calendar\/event\?eid=[^\s\]\)]+)/g,
+    "[Ouvrir l'evenement]($1)",
+  );
+}
+
 function ThinkingCard({ steps }) {
   const [open, setOpen] = useState(true);
   if (!steps || steps.length === 0) return null;
@@ -91,13 +99,23 @@ function InteractiveHint({ hint, onSend }) {
 
   if (!hint || sent) return null;
 
+  // Calendar pickers are disabled in chat to avoid misplaced UI blocks.
+  if (
+    hint.type === "date_picker" ||
+    hint.type === "event_datetime" ||
+    hint.type === "event_datetime_with_emails"
+  ) {
+    return null;
+  }
+
   const send = (text) => {
     setSent(true);
     onSend(text);
   };
 
   const addEmail = () => setEmails((prev) => [...prev, ""]);
-  const removeEmail = (i) => setEmails((prev) => prev.filter((_, idx) => idx !== i));
+  const removeEmail = (i) =>
+    setEmails((prev) => prev.filter((_, idx) => idx !== i));
   const updateEmail = (i, val) =>
     setEmails((prev) => prev.map((e, idx) => (idx === i ? val : e)));
 
@@ -325,6 +343,9 @@ function InteractiveHint({ hint, onSend }) {
 
 function Message({ msg, isLast, onSend }) {
   const isUser = msg.role === "user";
+  const assistantContent = !isUser
+    ? formatAssistantContent(msg.content)
+    : msg.content;
   return (
     <div
       className={clsx(
@@ -346,8 +367,22 @@ function Message({ msg, isLast, onSend }) {
             </p>
           ) : (
             <div className="prose-chat">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {msg.content}
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  a: ({ href, children, ...props }) => (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      {...props}
+                    >
+                      {children}
+                    </a>
+                  ),
+                }}
+              >
+                {assistantContent}
               </ReactMarkdown>
             </div>
           )}

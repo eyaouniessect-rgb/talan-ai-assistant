@@ -1,4 +1,5 @@
 # Outils Calendar : create_event, get_events.
+from datetime import date, datetime, timedelta
 from agents.calendar.mcp_client import call_mcp
 
 # ─────────────────────────────────────────
@@ -50,13 +51,31 @@ async def check_calendar_conflicts(start_date: str, end_date: str):
             "end":   e.get("end",   {}).get("dateTime", e.get("end",   {}).get("date", "")),
             "title": e.get("summary", "Sans titre"),
         }
-        for e in events
+        for e in events  # conflits : on garde le format minimal actuel (pas besoin de plus)
     ]
 
     return {
         "success": True,
         "conflicts": busy,
         "message": "Conflits détectés" if busy else "Aucun conflit"
+    }
+
+
+def _trim_event(e: dict) -> dict:
+    """
+    Réduit un objet événement Google Calendar aux seuls champs utiles pour l'agent.
+    Un événement complet peut dépasser 2000 tokens — on garde l'essentiel.
+    """
+    start = e.get("start", {})
+    end   = e.get("end", {})
+    return {
+        "id":        e.get("id", ""),
+        "summary":   e.get("summary", "Sans titre"),
+        "start":     start.get("dateTime", start.get("date", "")),
+        "end":       end.get("dateTime",   end.get("date", "")),
+        "htmlLink":  e.get("htmlLink", ""),
+        "hangoutLink": e.get("hangoutLink", ""),
+        "location":  e.get("location", ""),
     }
 
 
@@ -73,13 +92,26 @@ async def get_calendar_events(start_date: str, end_date: str):
         }
     )
     events = data.get("events", data.get("result", []))
-    return {"success": True, "events": events}
+    trimmed = [_trim_event(e) for e in events]
+    return {"success": True, "events": trimmed}
 
 
 # ─────────────────────────────────────────
 # ➕ CREATE EVENT
 # ─────────────────────────────────────────
 async def create_meeting(title: str, start: str, end: str, attendees: list[str] | None = None, add_meet: bool = False, location: str | None = None):
+    # Reject past dates
+    try:
+        start_clean = start.split("T")[0] if "T" in start else start
+        event_date = datetime.strptime(start_clean, "%Y-%m-%d").date()
+        if event_date < date.today():
+            return {
+                "success": False,
+                "error": f"Impossible de créer un événement dans le passé (date : {start_clean}). Veuillez choisir une date future."
+            }
+    except ValueError:
+        pass  # Si on ne peut pas parser la date, on laisse le MCP valider
+
     payload = {
         "calendarId": "primary",
         "summary": title,
@@ -143,23 +175,50 @@ async def update_meeting(
 # ❌ DELETE EVENT
 # ─────────────────────────────────────────
 async def delete_meeting(event_id: str):
-    data = await call_mcp(
-        "delete-event",
-        {
-            "calendarId": "primary",
-            "eventId": event_id,
-            "sendUpdates": "all",
-        }
-    )
-    print(f"[delete_meeting] MCP response: {data}")
-    return {"success": True, "message": "Event supprimé"}
+    try:
+        data = await call_mcp(
+            "delete-event",
+            {
+                "calendarId": "primary",
+                "eventId": event_id,
+                "sendUpdates": "all",
+            }
+        )
+        print(f"[delete_meeting] MCP response: {data}")
+
+        # Le MCP renvoie une erreur explicite dans le texte
+        if isinstance(data, dict):
+            text = data.get("text", "")
+            if "403" in text or "forbidden" in text.lower() or "not the organizer" in text.lower():
+                return {
+                    "success": False,
+                    "message": "Suppression impossible : vous n'êtes pas l'organisateur de cet événement. "
+                               "Vous pouvez uniquement vous retirer de la réunion.",
+                    "not_organizer": True,
+                }
+            if "404" in text or "not found" in text.lower():
+                return {"success": False, "message": "Événement introuvable (déjà supprimé ?)."}
+
+        # HTTP 204 = succès → data est {} ou None
+        return {"success": True, "message": "Event supprimé"}
+
+    except Exception as e:
+        err = str(e)
+        print(f"[delete_meeting] ERREUR: {err}")
+        if "403" in err or "forbidden" in err.lower() or "organizer" in err.lower():
+            return {
+                "success": False,
+                "message": "Suppression impossible : vous n'êtes pas l'organisateur de cet événement. "
+                           "Vous pouvez uniquement vous retirer de la réunion.",
+                "not_organizer": True,
+            }
+        return {"success": False, "message": f"Erreur lors de la suppression : {err}"}
 
 
 # ─────────────────────────────────────────
 # 🔍 SEARCH EVENTS
 # ─────────────────────────────────────────
 import unicodedata
-from datetime import date, timedelta
 
 def _strip_accents(text: str) -> str:
     """Supprime les accents pour une comparaison normalisée."""
@@ -221,7 +280,8 @@ async def search_meetings(query: str):
         results = [e for e in all_events if _keyword_match(e, query)]
         print(f"[search_meetings] fallback local : {len(all_events)} évts scannés → {len(results)} match(es) pour '{query}'")
 
-    return {"success": True, "results": results}
+    trimmed = [_trim_event(e) for e in results]
+    return {"success": True, "results": trimmed}
 
 
 # ─────────────────────────────────────────

@@ -10,6 +10,7 @@ from a2a.client import ClientFactory, ClientConfig, create_text_message_object
 from a2a.types import Message, Task, Artifact
 from a2a.utils.message import get_message_text
 from dotenv import load_dotenv
+from langsmith import traceable
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 A2A_SECRET = os.getenv("A2A_SECRET_TOKEN", "")
 
 
+@traceable(name="a2a.send_task", tags=["a2a", "dispatch"])
 async def send_task_to_url(agent_url: str, user_message: str) -> str:
     """
     Envoie un message à un agent A2A via son URL directe.

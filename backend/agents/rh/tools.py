@@ -327,6 +327,208 @@ async def get_team_stack(user_id: int) -> dict:
         }
     
 
+async def delete_leave(
+    user_id: int,
+    leave_id: int = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> dict:
+    """
+    Annule une demande de congé existante.
+
+    Modes supportés :
+    - leave_id : annule un congé précis
+    - start_date seule : annule le congé qui couvre cette date
+    - start_date + end_date : annule tous les congés qui chevauchent la période
+
+    Seuls les congés avec statut 'pending' ou 'approved' peuvent être annulés.
+    """
+    async with AsyncSessionLocal() as db:
+        today = date.today()
+
+        # ── 1. Trouve l'employee ───────────────────────
+        result = await db.execute(
+            select(Employee).where(Employee.user_id == user_id)
+        )
+        employee = result.scalar_one_or_none()
+        if not employee:
+            return {"error": "Employé introuvable"}
+
+        # ── 2. Trouve le congé / les congés ────────────
+        if leave_id:
+            result = await db.execute(
+                select(Leave).where(
+                    and_(
+                        Leave.id == leave_id,
+                        Leave.employee_id == employee.id,
+                    )
+                )
+            )
+            leave = result.scalar_one_or_none()
+
+            if not leave:
+                return {
+                    "error": "not_found",
+                    "message": "Aucun congé trouvé correspondant à ces critères.",
+                }
+
+            if leave.status not in ("pending", "approved"):
+                return {
+                    "error": "invalid_status",
+                    "message": f"Impossible d'annuler un congé avec le statut '{leave.status}'.",
+                }
+
+            if leave.start_date <= today:
+                return {
+                    "error": "past_leave_locked",
+                    "message": (
+                        "Impossible d'annuler un congé déjà commencé ou passé "
+                        f"(du {leave.start_date} au {leave.end_date})."
+                    ),
+                }
+
+            old_status = leave.status
+            leave.status = "cancelled"
+            recovered_days = leave.days_count or 0
+            await db.commit()
+
+            return {
+                "success": True,
+                "mode": "single",
+                "count": 1,
+                "leave_id": leave.id,
+                "start_date": str(leave.start_date),
+                "end_date": str(leave.end_date),
+                "days_count": leave.days_count,
+                "total_days_recovered": recovered_days,
+                "old_status": old_status,
+                "new_status": "cancelled",
+                "message": (
+                    f"Congé du {leave.start_date} au {leave.end_date} "
+                    f"({recovered_days} jour(s)) annulé avec succès. "
+                    f"Jours récupérés : {recovered_days}."
+                ),
+            }
+        elif start_date:
+            target_start = date.fromisoformat(start_date)
+            target_end = date.fromisoformat(end_date) if end_date else target_start
+
+            if target_end < target_start:
+                return {
+                    "error": "invalid_range",
+                    "message": "La date de fin doit être après la date de début.",
+                }
+
+            # Si une période est fournie, annule TOUS les congés qui chevauchent la période.
+            # Cela évite d'annuler arbitrairement le premier congé trouvé.
+            result = await db.execute(
+                select(Leave).where(
+                    and_(
+                        Leave.employee_id == employee.id,
+                        Leave.status.in_(["pending", "approved"]),
+                        Leave.start_date <= target_end,
+                        Leave.end_date >= target_start,
+                    )
+                ).order_by(Leave.start_date.asc(), Leave.id.asc())
+            )
+            leaves = result.scalars().all()
+
+            if not leaves:
+                return {
+                    "error": "not_found",
+                    "message": (
+                        "Aucun congé actif trouvé correspondant à cette date"
+                        if not end_date
+                        else f"Aucun congé actif trouvé sur la période du {target_start} au {target_end}."
+                    ),
+                }
+
+            eligible_leaves = [l for l in leaves if l.start_date > today]
+            blocked_leaves = [l for l in leaves if l.start_date <= today]
+
+            if not eligible_leaves:
+                return {
+                    "error": "past_leave_locked",
+                    "message": (
+                        "Aucun congé annulable sur cette période : "
+                        "les congés déjà commencés ou passés ne peuvent pas être annulés."
+                    ),
+                    "blocked_count": len(blocked_leaves),
+                    "blocked_leaves": [
+                        {
+                            "leave_id": l.id,
+                            "start_date": str(l.start_date),
+                            "end_date": str(l.end_date),
+                            "status": l.status,
+                        }
+                        for l in blocked_leaves
+                    ],
+                }
+
+            cancelled = []
+            total_days = 0
+            for leave in eligible_leaves:
+                old_status = leave.status
+                leave.status = "cancelled"
+                days = leave.days_count or 0
+                total_days += days
+                cancelled.append({
+                    "leave_id": leave.id,
+                    "start_date": str(leave.start_date),
+                    "end_date": str(leave.end_date),
+                    "days_count": days,
+                    "old_status": old_status,
+                    "new_status": "cancelled",
+                })
+
+            await db.commit()
+
+            if len(cancelled) == 1:
+                c = cancelled[0]
+                return {
+                    "success": True,
+                    "mode": "single",
+                    "count": 1,
+                    "leave_id": c["leave_id"],
+                    "start_date": c["start_date"],
+                    "end_date": c["end_date"],
+                    "days_count": c["days_count"],
+                    "total_days_recovered": c["days_count"],
+                    "old_status": c["old_status"],
+                    "new_status": "cancelled",
+                    "message": (
+                        f"Congé du {c['start_date']} au {c['end_date']} "
+                        f"({c['days_count']} jour(s)) annulé avec succès. "
+                        f"Jours récupérés : {c['days_count']}."
+                    ),
+                }
+
+            return {
+                "success": True,
+                "mode": "range",
+                "count": len(cancelled),
+                "total_days_recovered": total_days,
+                "cancelled_leaves": cancelled,
+                "blocked_count": len(blocked_leaves),
+                "blocked_leaves": [
+                    {
+                        "leave_id": l.id,
+                        "start_date": str(l.start_date),
+                        "end_date": str(l.end_date),
+                        "status": l.status,
+                    }
+                    for l in blocked_leaves
+                ],
+                "message": (
+                    f"{len(cancelled)} congés annulés avec succès "
+                    f"sur la période du {target_start} au {target_end}. "
+                    f"Jours récupérés : {total_days}."
+                ),
+            }
+        else:
+            return {"error": "Veuillez préciser l'identifiant du congé ou la date."}
+
+
 async def check_leave_balance(user_id: int, requested_days: int = 0) -> dict:
     """
     Vérifie le solde de congés disponible.
