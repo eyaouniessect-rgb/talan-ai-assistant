@@ -4,10 +4,12 @@
 # ═══════════════════════════════════════════════════════════
 from dotenv import load_dotenv
 import json
+import re
 from datetime import date
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
+from a2a.types import TaskStatusUpdateEvent, TaskStatus, TaskState
 from a2a.utils import new_agent_text_message
 
 from langchain_core.tools import tool
@@ -21,6 +23,20 @@ from app.core.rbac import check_tool_permission, tool_permission_denied_message
 from langsmith import trace
 
 load_dotenv()
+
+
+async def _enqueue_final(event_queue: EventQueue, text: str, task_id: str, context_id: str, status_emitted: int) -> None:
+    """Envoie l'événement final : TaskStatusUpdateEvent si du streaming a déjà été émis, sinon Message."""
+    if status_emitted > 0:
+        msg = new_agent_text_message(text, context_id=context_id, task_id=task_id)
+        await event_queue.enqueue_event(TaskStatusUpdateEvent(
+            task_id=task_id,
+            context_id=context_id,
+            status=TaskStatus(state=TaskState.completed, message=msg),
+            final=True,
+        ))
+    else:
+        await event_queue.enqueue_event(new_agent_text_message(text))
 
 
 # ── Rôle utilisateur courant (injecté par execute()) ─────
@@ -306,18 +322,19 @@ class RHAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
     ) -> None:
         global _current_role
+
         user_input = context.get_user_input()
         _current_role = _extract_role_from_message(user_input)
+
+        task_id = context.task_id or "task"
+        context_id = context.context_id or "ctx"
 
         print(f"\n{'='*50}")
         print(f"🤖 RHAgent ReAct (Groq 120B) — Message reçu : {user_input[:200]}")
         print(f"🔐 Rôle utilisateur : {_current_role}")
         print(f"{'='*50}")
 
-        # ── Tentative avec failover ────────────────────────
         max_retries = 3
-        result = None
-        final_response = None
 
         with trace(
             name="rh_agent.execute",
@@ -325,11 +342,47 @@ class RHAgentExecutor(AgentExecutor):
             inputs={"user_input": user_input[:1000], "role": _current_role},
             tags=["agent", "rh"],
         ) as ls_run:
+
             for attempt in range(max_retries):
+                result_messages = None
+                status_events_emitted = 0
+
                 try:
-                    result = await self.react_agent.ainvoke({
-                        "messages": [HumanMessage(content=user_input)]
-                    })
+                    async for event in self.react_agent.astream_events(
+                        {"messages": [HumanMessage(content=user_input)]},
+                        version="v2",
+                    ):
+                        etype = event["event"]
+
+                        if etype == "on_tool_start":
+                            tool_name = event["name"]
+                            tool_args = event["data"].get("input") or {}
+                            if not isinstance(tool_args, dict):
+                                tool_args = {}
+                            step_text = _tool_to_human_text(tool_name, tool_args)
+                            print(f"  🔧 [STREAM] Tool start: {tool_name}({tool_args})")
+
+                            status_msg = new_agent_text_message(
+                                step_text,
+                                context_id=context_id,
+                                task_id=task_id,
+                            )
+                            await event_queue.enqueue_event(TaskStatusUpdateEvent(
+                                task_id=task_id,
+                                context_id=context_id,
+                                status=TaskStatus(
+                                    state=TaskState.working,
+                                    message=status_msg,
+                                ),
+                                final=False,
+                            ))
+                            status_events_emitted += 1
+
+                        elif etype == "on_chain_end":
+                            output = event["data"].get("output", {})
+                            if isinstance(output, dict) and "messages" in output:
+                                result_messages = output["messages"]
+
                     break
 
                 except Exception as e:
@@ -337,14 +390,9 @@ class RHAgentExecutor(AgentExecutor):
                         print(f"⚠️ Quota tokens dépassé (RH) : {str(e)[:120]}")
                         final_response = FRIENDLY_QUOTA_MSG
                         ls_run.end(outputs={"response": final_response, "error": "quota"})
-                        response_with_steps = json.dumps({
-                            "response": final_response,
-                            "react_steps": [],
-                        }, ensure_ascii=False)
-                        message = new_agent_text_message(response_with_steps)
-                        await event_queue.enqueue_event(message)
+                        await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
-                    elif _is_fallback_error(e) and rotate_llm_key():
+                    elif _is_fallback_error(e) and rotate_llm_key() and status_events_emitted == 0:
                         print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
                         self._build_react_agent()
                         continue
@@ -352,76 +400,61 @@ class RHAgentExecutor(AgentExecutor):
                         print(f"❌ Erreur ReAct : {str(e)}")
                         final_response = f"Erreur lors du traitement : {str(e)}"
                         ls_run.end(outputs={"response": final_response, "error": str(e)})
-                        response_with_steps = json.dumps({
-                            "response": final_response,
-                            "react_steps": [],
-                        }, ensure_ascii=False)
-                        message = new_agent_text_message(response_with_steps)
-                        await event_queue.enqueue_event(message)
+                        await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
-
-            if result is None:
+            else:
                 final_response = "Toutes les clés API sont temporairement indisponibles. Veuillez réessayer."
                 ls_run.end(outputs={"response": final_response, "error": "all_keys_exhausted"})
-                response_with_steps = json.dumps({
-                    "response": final_response,
-                    "react_steps": [],
-                }, ensure_ascii=False)
-                message = new_agent_text_message(response_with_steps)
-                await event_queue.enqueue_event(message)
+                await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                 return
 
-            # ── Extrait les steps du cycle ReAct ──────────────
             react_steps = []
             tool_calls_map = {}
+            final_response = "L'agent n'a pas retourné de réponse."
 
-            for msg in result["messages"]:
-                msg_type = type(msg).__name__
-                if msg_type == "AIMessage" and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        step_text = _tool_to_human_text(tc['name'], tc['args'])
-                        react_steps.append(step_text)
-                        tool_calls_map[tc['id']] = len(react_steps) - 1
+            if result_messages:
+                print(f"\n{'─'*50}")
+                print("🧠 CYCLE ReAct — RHAgent :")
 
-                elif msg_type == "ToolMessage":
-                    obs = _format_observation(msg.content)
-                    if obs:
-                        tool_call_id = getattr(msg, 'tool_call_id', None)
-                        if tool_call_id and tool_call_id in tool_calls_map:
-                            idx = tool_calls_map[tool_call_id]
+                for msg in result_messages:
+                    msg_type = type(msg).__name__
+                    if msg_type == "AIMessage":
+                        if msg.content:
+                            print(f"  🤔 Think  : {msg.content[:300]}")
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                step_text = _tool_to_human_text(tc['name'], tc['args'])
+                                react_steps.append(step_text)
+                                tool_calls_map[tc['id']] = len(react_steps) - 1
+                                print(f"  🔧 Act    : {tc['name']}({tc['args']})")
+                    elif msg_type == "ToolMessage":
+                        print(f"  👁️  Observe: {msg.content[:200]}")
+                        obs = _format_observation(msg.content)
+                        tc_id = getattr(msg, 'tool_call_id', None)
+                        if tc_id and tc_id in tool_calls_map and obs:
+                            idx = tool_calls_map[tc_id]
                             react_steps[idx] += f"\n   → {obs}"
+                    elif msg_type == "HumanMessage":
+                        print(f"  👤 Human  : {msg.content[:200]}")
 
-            # ── Log terminal ──────────────────────────────────
-            print(f"\n{'─'*50}")
-            print("🧠 CYCLE ReAct :")
-            for msg in result["messages"]:
-                msg_type = type(msg).__name__
-                if msg_type == "HumanMessage":
-                    print(f"  👤 Human  : {msg.content[:500]}")
-                elif msg_type == "AIMessage":
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            print(f"  🔧 Act    : {tc['name']}({tc['args']})")
-                    else:
-                        print(f"  🤖 Answer : {msg.content[:200]}")
-                elif msg_type == "ToolMessage":
-                    print(f"  👁️  Observe: {msg.content[:100]}")
-            print(f"{'─'*50}\n")
+                print(f"{'─'*50}\n")
+                final_response = result_messages[-1].content
 
-            final_response = result["messages"][-1].content
+            ui_hint = _detect_ui_hint(final_response)
+            print(f"  🎨 UI Hint détecté : {ui_hint}")
+
             ls_run.end(outputs={
-                "response": final_response[:500],
+                "response": final_response[:500] if final_response else "",
                 "react_steps": react_steps,
                 "steps_count": len(react_steps),
+                "ui_hint": ui_hint,
             })
 
-            response_with_steps = json.dumps({
-                "response": final_response,
-                "react_steps": react_steps,
-            }, ensure_ascii=False)
+            response_data = {"response": final_response, "react_steps": react_steps}
+            if ui_hint:
+                response_data["ui_hint"] = ui_hint
 
-            message = new_agent_text_message(response_with_steps)
-            await event_queue.enqueue_event(message)
+            await _enqueue_final(event_queue, json.dumps(response_data, ensure_ascii=False), task_id, context_id, status_events_emitted)
 
     async def cancel(
         self,
@@ -434,6 +467,45 @@ class RHAgentExecutor(AgentExecutor):
 # ══════════════════════════════════════════════════════
 # FONCTIONS UTILITAIRES
 # ══════════════════════════════════════════════════════
+
+def _normalize(text: str) -> str:
+    """Normalise les caractères Unicode exotiques produits par le LLM."""
+    return (
+        text.lower()
+        .replace("\u2011", "-")
+        .replace("\u2010", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u202f", " ")
+        .replace("\u00a0", " ")
+        .replace("\u00ab", '"')
+        .replace("\u00bb", '"')
+    )
+
+
+def _detect_ui_hint(text: str) -> "dict | None":
+    """Analyse la réponse pour suggérer un composant UI interactif au frontend."""
+    t = _normalize(text)
+
+    is_oui_non = (
+        "souhaitez-vous" in t or
+        "voulez-vous" in t or
+        "confirmez-vous" in t or
+        bool(re.search(r"oui\s*/\s*non", t)) or
+        bool(re.search(r"r.pondez.*oui", t)) or
+        ("oui" in t and "non" in t and "?" in t)
+    )
+    is_time_or_title = bool(re.search(r"quelle heure|quel titre|quel jour", t))
+    if is_oui_non and not is_time_or_title:
+        return {"type": "confirm", "options": ["Oui", "Non"]}
+
+    if re.search(r"dates de (d.but|fin)|p.riode souhait.e|date de debut.*date de fin", t):
+        return {"type": "date_range"}
+
+    if re.search(r"quelle date|a quelle date|precisez la date|choisissez une date|quel jour|nouvelle date", t):
+        return {"type": "date_picker"}
+
+    return None
 
 def _tool_to_human_text(tool_name: str, args: dict) -> str:
     mapping = {

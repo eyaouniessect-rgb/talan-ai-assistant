@@ -15,6 +15,73 @@ export const sendMessageApi = async (message, conversationId = null) => {
 }
 
 
+/**
+ * Générateur asynchrone SSE pour le streaming de réponses.
+ * Yields parsed JSON event objects from the /chat/stream endpoint.
+ *
+ * Event types:
+ *   { type: 'step_start',     step_id, agent, text }
+ *   { type: 'step_done',      step_id, agent, result }
+ *   { type: 'step_unavailable', step_id, agent, text }
+ *   { type: 'step_skipped',   step_id, agent }
+ *   { type: 'needs_input',    step_id, agent, text, ui_hint }
+ *   { type: 'done',           conversation_id, ui_hint }
+ *   { type: 'error',          text }
+ */
+export async function* sendMessageStream(message, conversationId) {
+  const realId = conversationId && conversationId < 1_000_000_000_000
+    ? conversationId
+    : null
+
+  const token = localStorage.getItem('token')
+
+  const response = await fetch('http://localhost:8000/chat/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ message, conversation_id: realId }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // Les messages SSE sont séparés par \n\n
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() // garde le dernier chunk incomplet
+
+      for (const part of parts) {
+        const line = part.trim()
+        if (line.startsWith('data: ')) {
+          const jsonStr = line.slice(6).trim()
+          if (jsonStr) {
+            try {
+              yield JSON.parse(jsonStr)
+            } catch (_) {
+              // ignore les messages malformés
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+}
+
 
 export const getConversationsApi = async () => {
   const response = await api.get('/chat/conversations')
@@ -27,4 +94,3 @@ export const getMessagesApi = async (conversationId) => {
   const response = await api.get(`/chat/conversations/${conversationId}/messages`)
   return response.data
 }
-

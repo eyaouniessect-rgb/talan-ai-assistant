@@ -10,6 +10,7 @@ import {
   Zap,
   CheckCircle,
   Loader,
+  AlertTriangle,
   Calendar,
   Clock,
   Mail,
@@ -50,9 +51,15 @@ function formatAssistantContent(content = "") {
   );
 }
 
-function ThinkingCard({ steps }) {
+function ThinkingCard({ steps, streaming }) {
   const [open, setOpen] = useState(true);
   if (!steps || steps.length === 0) return null;
+
+  // Compte les étapes terminées (done + unavailable + skipped)
+  const finishedCount = steps.filter(
+    (s) => s.status === "done" || s.status === "unavailable" || s.status === "skipped"
+  ).length;
+
   return (
     <div className="border border-cyan/30 bg-cyan/5 rounded-xl mb-3 overflow-hidden">
       <button
@@ -67,18 +74,29 @@ function ThinkingCard({ steps }) {
         <span className="text-xs font-semibold text-cyan">
           Étapes de traitement
         </span>
+        {streaming && (
+          <Loader size={12} className="text-cyan animate-spin shrink-0" />
+        )}
         <span className="ml-auto text-xs text-slate-400">
-          {steps.filter((s) => s.status === "done").length}/{steps.length}
+          {finishedCount}/{steps.length}
         </span>
       </button>
       {open && (
         <div className="px-4 pb-3 space-y-1 border-t border-cyan/20">
           {steps.map((step, i) => (
-            <div key={i} className="thinking-step">
+            <div key={step.step_id || i} className="thinking-step">
               {step.status === "done" ? (
                 <CheckCircle size={13} className="text-green-500 shrink-0" />
-              ) : (
+              ) : step.status === "running" ? (
                 <Loader size={13} className="text-cyan animate-spin shrink-0" />
+              ) : step.status === "unavailable" ? (
+                <AlertTriangle size={13} className="text-orange-400 shrink-0" />
+              ) : step.status === "skipped" ? (
+                <span className="w-3 h-3 shrink-0 text-slate-300 text-xs leading-none">—</span>
+              ) : step.status === "waiting" ? (
+                <Clock size={13} className="text-yellow-400 shrink-0" />
+              ) : (
+                <Loader size={13} className="text-slate-300 shrink-0" />
               )}
               <span className="text-xs text-slate-600">{step.text}</span>
             </div>
@@ -359,12 +377,22 @@ function Message({ msg, isLast, onSend }) {
         </div>
       )}
       <div className={clsx("flex flex-col max-w-2xl", isUser && "items-end")}>
-        {!isUser && <ThinkingCard steps={msg.steps} />}
+        {!isUser && (
+          <ThinkingCard steps={msg.steps} streaming={msg.streaming === true} />
+        )}
         <div className={isUser ? "message-user" : "message-assistant"}>
           {isUser ? (
             <p className="text-sm leading-relaxed whitespace-pre-wrap">
               {msg.content}
             </p>
+          ) : msg.streaming && !msg.content ? (
+            /* Spinner initial — avant que la première étape SSE n'arrive */
+            <div className="flex items-center gap-2 py-1">
+              <Loader size={14} className="text-cyan animate-spin shrink-0" />
+              <span className="text-xs text-slate-400">
+                L'assistant analyse votre demande...
+              </span>
+            </div>
           ) : (
             <div className="prose-chat">
               <ReactMarkdown
@@ -387,7 +415,7 @@ function Message({ msg, isLast, onSend }) {
             </div>
           )}
         </div>
-        {!isUser && isLast && msg.ui_hint && (
+        {!isUser && isLast && msg.ui_hint && !msg.streaming && (
           <InteractiveHint hint={msg.ui_hint} onSend={onSend} />
         )}
         <span className="text-xs text-slate-400 mt-1 px-1">{msg.time}</span>
@@ -433,6 +461,9 @@ export default function Chat() {
   const isPM = user?.role === "pm";
   const quick = isPM ? QUICK_PM : QUICK_CONSULTANT;
   const active = conversations.find((c) => c.id === activeId);
+
+  // Détermine si un message est actuellement en streaming
+  const hasStreamingMessage = active?.messages?.some((m) => m.streaming === true);
 
   useEffect(() => {
     loadConversations();
@@ -548,7 +579,8 @@ export default function Chat() {
             />
           ))}
 
-          {isTyping && <TypingIndicator />}
+          {/* TypingIndicator uniquement si pas encore de message streaming affiché */}
+          {isTyping && !hasStreamingMessage && <TypingIndicator />}
           <div ref={bottomRef} />
         </div>
 

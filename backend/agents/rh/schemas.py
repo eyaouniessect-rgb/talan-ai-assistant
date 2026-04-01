@@ -177,7 +177,7 @@ def build_agent_card(host: str, port: int) -> AgentCard:
         version="1.0.0",
         default_input_modes=["text"],
         default_output_modes=["text"],
-        capabilities=AgentCapabilities(streaming=False),
+        capabilities=AgentCapabilities(streaming=True),
         skills=[
             skill_create_leave,
             skill_delete_leave,

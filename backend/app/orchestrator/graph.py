@@ -1,8 +1,7 @@
 # app/orchestrator/graph.py
 # ═══════════════════════════════════════════════════════════
-# Graphe LangGraph simplifié
-# Flux : Node1 (routeur) → Node3 (discovery + dispatch) → Node4 (save) → END
-# Node2 (RBAC) supprimé — le RBAC est maintenant dans chaque agent par tool
+# Graphe LangGraph avec planificateur et exécuteur de plan
+# Flux : Node1 (planner) → Node3 (executor) → Node4 (save) → END
 # ═══════════════════════════════════════════════════════════
 
 from langgraph.graph import StateGraph, END
@@ -10,7 +9,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langchain_core.messages import AIMessage
 from app.orchestrator.state import AssistantState
 from app.orchestrator.nodes.node1_intent import node1_detect_intent
-from app.orchestrator.nodes.node3_dispatch import node3_dispatch
+from app.orchestrator.nodes.node3_executor import node3_executor   # remplace node3_dispatch
 from app.a2a.discovery import discovery
 from dotenv import load_dotenv
 import psycopg
@@ -57,14 +56,14 @@ def node4_save_ai_message(state: AssistantState) -> AssistantState:
 def build_base_graph():
     graph = StateGraph(AssistantState)
 
-    graph.add_node("node1_router",     node1_detect_intent)
-    graph.add_node("node3_dispatch",   node3_dispatch)
+    graph.add_node("node1_router",     node1_detect_intent)   # node1 reste tel quel
+    graph.add_node("node3_executor",   node3_executor)       # remplace node3_dispatch
     graph.add_node("node4_save_ai_msg", node4_save_ai_message)
 
-    # Flux direct : Node1 → Node3 → Node4 → END
+    # Flux : Node1 → Node3 → Node4 → END
     graph.set_entry_point("node1_router")
-    graph.add_edge("node1_router",      "node3_dispatch")
-    graph.add_edge("node3_dispatch",    "node4_save_ai_msg")
+    graph.add_edge("node1_router",      "node3_executor")
+    graph.add_edge("node3_executor",    "node4_save_ai_msg")
     graph.add_edge("node4_save_ai_msg", END)
 
     return graph
@@ -88,7 +87,7 @@ async def init_graph():
         checkpointer=checkpointer
     )
     print("✅ Graphe prêt.")
-    print("📊 Flux : Node1 (routeur) → Node3 (dispatch) → Node4 (save) → END")
+    print("📊 Flux : Node1 (routeur/planner) → Node3 (executor) → Node4 (save) → END")
 
 
 def get_graph():
