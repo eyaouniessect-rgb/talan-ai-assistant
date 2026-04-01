@@ -45,12 +45,14 @@ class DiscoveredAgent:
         self.skills = [s.get("id", "") for s in card.get("skills", [])]
         self.description = card.get("description", "")
         self.version = card.get("version", "unknown")
+        # ── Capacité de streaming ──────────────────────────
+        self.supports_streaming = card.get("capabilities", {}).get("streaming", False)
 
     def has_skill(self, skill_id: str) -> bool:
         return skill_id in self.skills
 
     def __repr__(self):
-        return f"Agent({self.name}, skills={self.skills}, url={self.url})"
+        return f"Agent({self.name}, skills={self.skills}, streaming={self.supports_streaming}, url={self.url})"
 
 
 class AgentDiscovery:
@@ -88,7 +90,8 @@ class AgentDiscovery:
                         logger.warning(f"   ❌ {name} — DOWN ({type(result).__name__})")
                 elif result is not None:
                     new_cache[name] = result
-                    logger.info(f"   ✅ {name} — UP (skills: {result.skills})")
+                    print(f"   ✅ {name} — UP skills={result.skills} streaming={result.supports_streaming}")
+                    logger.info(f"   ✅ {name} — UP (skills: {result.skills}, streaming: {result.supports_streaming})")
 
             self._cache = new_cache
             self._last_scan = now

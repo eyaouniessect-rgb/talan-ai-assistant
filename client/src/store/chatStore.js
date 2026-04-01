@@ -1,6 +1,6 @@
 // src/store/chatStore.js
 import { create } from 'zustand'
-import { sendMessageApi, getConversationsApi, getMessagesApi } from '../api/chat'
+import { sendMessageStream, getConversationsApi, getMessagesApi } from '../api/chat'
 
 // ── Helpers ───────────────────────────────────────────────
 const now = () =>
@@ -8,16 +8,6 @@ const now = () =>
 
 const formatDate = (dateStr) =>
   new Date(dateStr).toLocaleDateString('fr')
-
-const buildSteps = (data) => [
-  { status: 'done', text: `Intention : ${data.intent}` },
-  { status: 'done', text: `Agent : ${data.target_agent}` },
-  ...(data.steps || []),
-]
-
-// ID temporaire = timestamp (> 1 trillion)
-// ID réel = petit nombre PostgreSQL
-const isTempId = (id) => id && id >= 1_000_000_000_000
 
 // ── Chat Store ────────────────────────────────────────────
 export const useChatStore = create((set, get) => ({
@@ -43,7 +33,7 @@ export const useChatStore = create((set, get) => ({
       // Active la première conversation et charge ses messages
       if (conversations.length > 0) {
         set({ activeId: conversations[0].id })
-        console.log("active id",conversations[0].id)
+        console.log("active id", conversations[0].id)
         await get().loadMessages(conversations[0].id)
       }
     } catch (error) {
@@ -83,8 +73,6 @@ export const useChatStore = create((set, get) => ({
   },
 
 
-
-
   // ── Change de conversation active ─────────────────────
   setActive: async (id) => {
     set({ activeId: id })
@@ -93,8 +81,6 @@ export const useChatStore = create((set, get) => ({
       await get().loadMessages(id)
     }
   },
-
-
 
 
   // ── Nouvelle conversation ──────────────────────────────
@@ -127,8 +113,7 @@ export const useChatStore = create((set, get) => ({
   },
 
 
-  
-  // ── Envoie un message ──────────────────────────────────
+  // ── Envoie un message (streaming) ─────────────────────
   sendMessage: async (text) => {
     const currentActiveId = get().activeId
 
@@ -148,58 +133,172 @@ export const useChatStore = create((set, get) => ({
       isTyping: true,
     }))
 
+    // 2. Ajoute un message assistant placeholder avec streaming: true
+    const placeholderMsg = {
+      role: 'assistant',
+      content: '',
+      time: now(),
+      steps: [],
+      ui_hint: null,
+      streaming: true,
+    }
+
+    set(s => ({
+      conversations: s.conversations.map(c =>
+        c.id === currentActiveId
+          ? { ...c, messages: [...c.messages, placeholderMsg] }
+          : c
+      ),
+    }))
+
+    // Helper pour mettre à jour le dernier message assistant
+    const updateLastMsg = (updater) => {
+      set(s => ({
+        conversations: s.conversations.map(c => {
+          if (c.id !== currentActiveId) return c
+          const msgs = [...c.messages]
+          if (msgs.length === 0) return c
+          msgs[msgs.length - 1] = updater(msgs[msgs.length - 1])
+          return { ...c, messages: msgs }
+        }),
+      }))
+    }
+
     try {
-      // 2. Envoie au backend
-      const data = await sendMessageApi(text, currentActiveId)
+      // 3. Consomme le flux SSE
+      for await (const event of sendMessageStream(text, currentActiveId)) {
+        console.log('[SSE event]', event)
 
-      // 3. Ajoute la réponse assistant
-      const assistantMsg = {
-        role: 'assistant',
-        content: data.response,
-        time: now(),
-        steps: buildSteps(data),
-        ui_hint: data.ui_hint || null,
+        switch (event.type) {
+          case 'step_start':
+            // Ajoute une nouvelle étape en statut 'running'
+            updateLastMsg(msg => ({
+              ...msg,
+              steps: [
+                ...msg.steps,
+                { step_id: event.step_id, status: 'running', text: event.text, agent: event.agent },
+              ],
+            }))
+            break
+
+          case 'step_done':
+            // Met à jour le statut de l'étape et ajoute le résultat au contenu
+            updateLastMsg(msg => ({
+              ...msg,
+              steps: msg.steps.map(s =>
+                s.step_id === event.step_id
+                  ? { ...s, status: 'done' }
+                  : s
+              ),
+              content: msg.content
+                ? msg.content + (event.result ? '\n\n' + event.result : '')
+                : (event.result || ''),
+            }))
+            break
+
+          case 'step_unavailable':
+            // Met à jour le statut de l'étape et ajoute le message d'indisponibilité
+            updateLastMsg(msg => ({
+              ...msg,
+              steps: msg.steps.map(s =>
+                s.step_id === event.step_id
+                  ? { ...s, status: 'unavailable' }
+                  : s
+              ),
+              content: msg.content
+                ? msg.content + (event.text ? '\n\n' + event.text : '')
+                : (event.text || ''),
+            }))
+            break
+
+          case 'step_skipped':
+            // Met à jour le statut de l'étape sans ajouter au contenu
+            updateLastMsg(msg => ({
+              ...msg,
+              steps: msg.steps.map(s =>
+                s.step_id === event.step_id
+                  ? { ...s, status: 'skipped' }
+                  : s
+              ),
+            }))
+            break
+
+          case 'step_progress':
+            // Met à jour le texte affiché de l'étape en cours (tool calls internes de l'agent)
+            updateLastMsg(msg => ({
+              ...msg,
+              steps: msg.steps.map(s =>
+                s.step_id === event.step_id
+                  ? { ...s, text: event.text }
+                  : s
+              ),
+            }))
+            break
+
+          case 'needs_input':
+            // Définit le contenu comme la question posée, arrête le streaming
+            updateLastMsg(msg => ({
+              ...msg,
+              content: event.text || '',
+              ui_hint: event.ui_hint || null,
+              streaming: false,
+              steps: msg.steps.map(s =>
+                s.step_id === event.step_id
+                  ? { ...s, status: 'waiting' }
+                  : s
+              ),
+            }))
+            set({ isTyping: false })
+            break
+
+          case 'done': {
+            // Finalise le message : arrête le streaming, met à jour conv_id
+            const realConvId = event.conversation_id
+            updateLastMsg(msg => ({
+              ...msg,
+              streaming: false,
+              ui_hint: event.ui_hint || msg.ui_hint || null,
+            }))
+            set(s => ({
+              conversations: s.conversations.map(c => {
+                if (c.id !== currentActiveId) return c
+                return {
+                  ...c,
+                  id: realConvId,
+                  loaded: true,
+                  messageCount: c.messages.length,
+                }
+              }),
+              activeId: realConvId,
+              isTyping: false,
+            }))
+            break
+          }
+
+          case 'error':
+            // Affiche l'erreur dans le message assistant
+            updateLastMsg(msg => ({
+              ...msg,
+              content: event.text || 'Une erreur est survenue.',
+              streaming: false,
+            }))
+            set({ isTyping: false })
+            break
+
+          default:
+            console.warn('[SSE] Événement inconnu:', event.type)
+        }
       }
-
-      set(s => ({
-        conversations: s.conversations.map(c =>
-          c.id === currentActiveId
-            ? {
-                ...c,
-                messages: [...c.messages, assistantMsg],
-                messageCount: c.messages.length + 1,
-                id: data.conversation_id, // remplace l'ID temp par le vrai
-                loaded: true,
-                agents: [...new Set([...c.agents, data.target_agent?.toUpperCase()])],
-              }
-            : c
-        ),
-        activeId: data.conversation_id,
-        isTyping: false,
-      }))
     } catch (error) {
-      console.error('Chat error:', error)
+      console.error('Streaming error:', error)
 
-      // En cas d'erreur, affiche un message d'erreur
-      set(s => ({
-        conversations: s.conversations.map(c =>
-          c.id === currentActiveId
-            ? {
-                ...c,
-                messages: [
-                  ...c.messages,
-                  {
-                    role: 'assistant',
-                    content: 'Erreur de connexion au serveur.',
-                    time: now(),
-                    steps: [],
-                  },
-                ],
-              }
-            : c
-        ),
-        isTyping: false,
+      // En cas d'erreur réseau, affiche un message d'erreur
+      updateLastMsg(msg => ({
+        ...msg,
+        content: 'Erreur de connexion au serveur.',
+        streaming: false,
       }))
+      set({ isTyping: false })
     }
   },
 }))

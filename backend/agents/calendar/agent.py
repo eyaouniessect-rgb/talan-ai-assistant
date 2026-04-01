@@ -7,12 +7,27 @@ from langgraph.prebuilt import create_react_agent
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.events import EventQueue
+from a2a.types import TaskStatusUpdateEvent, TaskStatus, TaskState
 from a2a.utils import new_agent_text_message
 from agents.calendar.prompts import CALENDAR_REACT_PROMPT
 from agents.calendar import tools
 from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_quota_error, FRIENDLY_QUOTA_MSG
 from app.core.rbac import check_tool_permission, tool_permission_denied_message
 from langsmith import trace
+
+
+async def _enqueue_final(event_queue: EventQueue, text: str, task_id: str, context_id: str, status_emitted: int) -> None:
+    """Envoie l'événement final : TaskStatusUpdateEvent si du streaming a déjà été émis, sinon Message."""
+    if status_emitted > 0:
+        msg = new_agent_text_message(text, context_id=context_id, task_id=task_id)
+        await event_queue.enqueue_event(TaskStatusUpdateEvent(
+            task_id=task_id,
+            context_id=context_id,
+            status=TaskStatus(state=TaskState.completed, message=msg),
+            final=True,
+        ))
+    else:
+        await event_queue.enqueue_event(new_agent_text_message(text))
 
 
 # ── Rôle et user courants (injectés par execute()) ───────
@@ -353,13 +368,15 @@ class CalendarAgentExecutor(AgentExecutor):
         _current_role    = _extract_role_from_message(user_input)
         _current_user_id = _extract_user_id_from_message(user_input)
 
+        task_id    = context.task_id    or "task"
+        context_id = context.context_id or "ctx"
+
         print(f"\n{'='*50}")
         print(f"📅 CalendarAgent — Message reçu : {user_input[:200]}")
         print(f"🔐 Rôle utilisateur : {_current_role}")
         print(f"{'='*50}")
 
         max_retries = 3
-        result = None
 
         with trace(
             name="calendar_agent.execute",
@@ -367,75 +384,107 @@ class CalendarAgentExecutor(AgentExecutor):
             inputs={"user_input": user_input[:1000], "role": _current_role, "user_id": _current_user_id},
             tags=["agent", "calendar"],
         ) as ls_run:
+
             for attempt in range(max_retries):
+                result_messages = None
+                status_events_emitted = 0
+
                 try:
-                    result = await self.react_agent.ainvoke({
-                        "messages": [HumanMessage(content=user_input)]
-                    })
-                    break
+                    async for event in self.react_agent.astream_events(
+                        {"messages": [HumanMessage(content=user_input)]},
+                        version="v2",
+                    ):
+                        etype = event["event"]
+
+                        # ── Tool start → emit status update ──────────
+                        if etype == "on_tool_start":
+                            tool_name = event["name"]
+                            tool_args = event["data"].get("input") or {}
+                            if not isinstance(tool_args, dict):
+                                tool_args = {}
+                            step_text = _tool_to_human_text(tool_name, tool_args)
+                            print(f"  🔧 [STREAM] Tool start: {tool_name}({tool_args})")
+
+                            status_msg = new_agent_text_message(
+                                step_text,
+                                context_id=context_id,
+                                task_id=task_id,
+                            )
+                            await event_queue.enqueue_event(TaskStatusUpdateEvent(
+                                task_id=task_id,
+                                context_id=context_id,
+                                status=TaskStatus(
+                                    state=TaskState.working,
+                                    message=status_msg,
+                                ),
+                                final=False,
+                            ))
+                            status_events_emitted += 1
+
+                        # ── Chain end → capture final messages ────────
+                        elif etype == "on_chain_end":
+                            output = event["data"].get("output", {})
+                            if isinstance(output, dict) and "messages" in output:
+                                result_messages = output["messages"]
+
+                    break  # success — exit retry loop
 
                 except Exception as e:
                     if _is_quota_error(e):
                         print(f"⚠️ Quota tokens dépassé (Calendar) : {str(e)[:120]}")
                         ls_run.end(outputs={"response": FRIENDLY_QUOTA_MSG, "error": "quota"})
-                        response = json.dumps({
-                            "response": FRIENDLY_QUOTA_MSG,
-                            "react_steps": [],
-                        }, ensure_ascii=False)
-                        message = new_agent_text_message(response)
-                        await event_queue.enqueue_event(message)
+                        await _enqueue_final(event_queue, json.dumps({"response": FRIENDLY_QUOTA_MSG, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
-                    elif _is_fallback_error(e) and rotate_llm_key():
-                        print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation vers clé suivante")
+                    elif _is_fallback_error(e) and rotate_llm_key() and status_events_emitted == 0:
+                        print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
                         self._build_react_agent()
                         continue
-
-                    print(f"❌ Erreur (tentative {attempt+1}) : {str(e)}")
-                    if attempt == max_retries - 1:
-                        ls_run.end(outputs={"response": f"Erreur : {str(e)}", "error": str(e)})
-                        response = json.dumps({
-                            "response": f"Erreur : {str(e)}",
-                            "react_steps": []
-                        }, ensure_ascii=False)
-                        message = new_agent_text_message(response)
-                        await event_queue.enqueue_event(message)
+                    else:
+                        print(f"❌ Erreur ReAct : {str(e)}")
+                        final_err = f"Erreur : {str(e)}"
+                        ls_run.end(outputs={"response": final_err, "error": str(e)})
+                        await _enqueue_final(event_queue, json.dumps({"response": final_err, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
+            else:
+                # All retries exhausted
+                final_response = "Toutes les clés API sont temporairement indisponibles. Veuillez réessayer."
+                ls_run.end(outputs={"response": final_response, "error": "all_keys_exhausted"})
+                await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
+                return
 
-            # ── Extraction + Log Think/Act/Observe ───────────
+            # ── Build react_steps with observations from final messages ──
             react_steps = []
             tool_calls_map = {}
+            final = "L'agent n'a pas retourné de réponse."
 
-            print(f"\n{'─'*50}")
-            print("🧠 CYCLE ReAct — CalendarAgent :")
+            if result_messages:
+                print(f"\n{'─'*50}")
+                print("🧠 CYCLE ReAct — CalendarAgent :")
 
-            for msg in result["messages"]:
-                msg_type = type(msg).__name__
+                for msg in result_messages:
+                    msg_type = type(msg).__name__
+                    if msg_type == "AIMessage":
+                        if msg.content:
+                            print(f"  🤔 Think  : {msg.content[:300]}")
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                human_label = _tool_to_human_text(tc['name'], tc['args'])
+                                react_steps.append(human_label)
+                                tool_calls_map[tc['id']] = len(react_steps) - 1
+                                print(f"  🔧 Act    : {tc['name']}({tc['args']})")
+                    elif msg_type == "ToolMessage":
+                        tc_id = getattr(msg, 'tool_call_id', None)
+                        obs_human = _format_observation(msg.content)
+                        print(f"  👁️  Observe: {msg.content[:200]}")
+                        if tc_id and tc_id in tool_calls_map:
+                            idx = tool_calls_map[tc_id]
+                            if obs_human:
+                                react_steps[idx] += f"\n   → {obs_human}"
+                    elif msg_type == "HumanMessage":
+                        print(f"  👤 Human  : {msg.content[:200]}")
 
-                if msg_type == "AIMessage":
-                    if msg.content:
-                        print(f"  🤔 Think  : {msg.content[:300]}")
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            human_label = _tool_to_human_text(tc['name'], tc['args'])
-                            react_steps.append(human_label)
-                            tool_calls_map[tc['id']] = len(react_steps) - 1
-                            print(f"  🔧 Act    : {tc['name']}({tc['args']})")
-
-                elif msg_type == "ToolMessage":
-                    tool_call_id = getattr(msg, 'tool_call_id', None)
-                    obs_human = _format_observation(msg.content)
-                    print(f"  👁️  Observe: {msg.content[:200]}")
-                    if tool_call_id and tool_call_id in tool_calls_map:
-                        idx = tool_calls_map[tool_call_id]
-                        if obs_human:
-                            react_steps[idx] += f"\n   → {obs_human}"
-
-                elif msg_type == "HumanMessage":
-                    print(f"  👤 Human  : {msg.content[:200]}")
-
-            print(f"{'─'*50}\n")
-
-            final = result["messages"][-1].content
+                print(f"{'─'*50}\n")
+                final = result_messages[-1].content
 
             ui_hint = _detect_ui_hint(final)
             print(f"  🎨 UI Hint détecté : {ui_hint}")
@@ -451,10 +500,7 @@ class CalendarAgentExecutor(AgentExecutor):
             if ui_hint:
                 response_data["ui_hint"] = ui_hint
 
-            response = json.dumps(response_data, ensure_ascii=False)
-
-            message = new_agent_text_message(response)
-            await event_queue.enqueue_event(message)
+            await _enqueue_final(event_queue, json.dumps(response_data, ensure_ascii=False), task_id, context_id, status_events_emitted)
 
     async def cancel(self, context, event_queue):
         pass
