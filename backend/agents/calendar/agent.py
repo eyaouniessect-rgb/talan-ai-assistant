@@ -1,4 +1,5 @@
 # Logique ReAct de l'Agent Calendar.
+import asyncio
 import json
 import re
 from langchain_core.tools import tool
@@ -7,32 +8,23 @@ from langgraph.prebuilt import create_react_agent
 
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.events import EventQueue
-from a2a.types import TaskStatusUpdateEvent, TaskStatus, TaskState
-from a2a.utils import new_agent_text_message
 from agents.calendar.prompts import CALENDAR_REACT_PROMPT
 from agents.calendar import tools
-from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_quota_error, FRIENDLY_QUOTA_MSG
+from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_tpm_error, _is_context_error, FRIENDLY_QUOTA_MSG, FRIENDLY_CONTEXT_MSG
 from app.core.rbac import check_tool_permission, tool_permission_denied_message
+from utils.streaming import enqueue_final as _enqueue_final_shared, enqueue_working, calendar_tool_to_human_text
 from langsmith import trace
 
 
-async def _enqueue_final(event_queue: EventQueue, text: str, task_id: str, context_id: str, status_emitted: int) -> None:
-    """Envoie l'événement final : TaskStatusUpdateEvent si du streaming a déjà été émis, sinon Message."""
-    if status_emitted > 0:
-        msg = new_agent_text_message(text, context_id=context_id, task_id=task_id)
-        await event_queue.enqueue_event(TaskStatusUpdateEvent(
-            task_id=task_id,
-            context_id=context_id,
-            status=TaskStatus(state=TaskState.completed, message=msg),
-            final=True,
-        ))
-    else:
-        await event_queue.enqueue_event(new_agent_text_message(text))
+async def _enqueue_final(event_queue: EventQueue, text: str, task_id: str, context_id: str, status_emitted: int = 0) -> None:
+    """Délègue à utils.streaming.enqueue_final — toujours TaskStatusUpdateEvent."""
+    await _enqueue_final_shared(event_queue, text, task_id, context_id)
 
 
-# ── Rôle et user courants (injectés par execute()) ───────
-_current_role    = "consultant"
+# ── Rôle, user et account courants (injectés par execute()) ───────
+_current_role       = "consultant"
 _current_user_id: int | None = None
+_current_account_id: "str | None" = None  # clé dans le tokens.json MCP (= str(user_id))
 
 
 def _extract_role_from_message(text: str) -> str:
@@ -40,7 +32,7 @@ def _extract_role_from_message(text: str) -> str:
     for line in text.split("\n"):
         if line.strip().lower().startswith("role utilisateur"):
             role = line.split(":")[-1].strip().lower()
-            if role in ("consultant", "pm"):
+            if role in ("consultant", "pm", "rh"):
                 return role
     return "consultant"
 
@@ -184,11 +176,23 @@ async def _check_rbac(tool_name: str) -> str | None:
 # ── TOOL WRAPPERS (avec RBAC) ────────────────────────
 
 @tool
-async def check_calendar_conflicts(start_date: str, end_date: str) -> str:
-    """Vérifie les conflits/disponibilités entre deux dates."""
+async def check_calendar_conflicts(start_date: str, end_date: str, start_time: str = None, end_time: str = None) -> str:
+    """Vérifie les conflits sur un créneau précis.
+    - Pour vérifier un créneau horaire précis (ex: 15h-16h) :
+      check_calendar_conflicts("2026-04-21", "2026-04-21", start_time="15:00", end_time="16:00")
+    - Pour vérifier une journée entière (ex: congé) :
+      check_calendar_conflicts("2026-04-21", "2026-04-21")
+    Toujours passer start_time et end_time quand l'utilisateur donne une heure précise."""
     denied = await _check_rbac("check_calendar_conflicts")
     if denied: return denied
-    return json.dumps(await tools.check_calendar_conflicts(start_date, end_date), ensure_ascii=False)
+    # Combine date + time si fournis
+    if start_time:
+        start = f"{start_date}T{start_time}:00"
+        end   = f"{end_date}T{end_time}:00" if end_time else f"{end_date}T{start_time}:00"
+    else:
+        start = start_date
+        end   = end_date
+    return json.dumps(await tools.check_calendar_conflicts(start, end, account_id=_current_account_id), ensure_ascii=False)
 
 
 @tool
@@ -196,7 +200,7 @@ async def get_calendar_events(start_date: str, end_date: str) -> str:
     """Retourne la liste des événements entre deux dates."""
     denied = await _check_rbac("get_calendar_events")
     if denied: return denied
-    return json.dumps(await tools.get_calendar_events(start_date, end_date), ensure_ascii=False)
+    return json.dumps(await tools.get_calendar_events(start_date, end_date, account_id=_current_account_id), ensure_ascii=False)
 
 
 @tool
@@ -214,7 +218,7 @@ async def create_meeting(
     if denied: return denied
     start_iso = f"{start_date}T{start_time}:00"
     end_iso   = f"{start_date}T{end_time}:00"
-    result = await tools.create_meeting(title, start_iso, end_iso, attendees=attendees, add_meet=add_meet, location=location)
+    result = await tools.create_meeting(title, start_iso, end_iso, attendees=attendees, add_meet=add_meet, location=location, account_id=_current_account_id)
 
     if result.get("success") and _current_user_id:
         employee_id = await _get_employee_id(_current_user_id)
@@ -260,14 +264,37 @@ async def update_meeting(
     Met à jour un événement existant (titre, heure, participants, lien Meet, lieu).
     remove_meet=True : supprime le lien Google Meet de la réunion (passage en présentiel).
     location : lieu physique à ajouter/modifier (ex: 'Building 2, Talan').
+    Remarque : si start_time ou end_time sont fournis sans start_date, la date actuelle
+    de l'événement est automatiquement récupérée.
     """
     denied = await _check_rbac("update_meeting")
     if denied: return denied
+
+    # Si des heures sont fournies sans date → récupère la date depuis l'événement existant
+    if (start_time or end_time) and not start_date:
+        try:
+            from agents.calendar.mcp_client import call_mcp as _call_mcp
+            evt_data = await _call_mcp("get-event", {"calendarId": "primary", "eventId": event_id}, account_id=_current_account_id)
+            raw_evt  = evt_data.get("event", evt_data) if isinstance(evt_data, dict) else {}
+            raw_start = (raw_evt.get("start") or {}).get("dateTime", "") if isinstance(raw_evt, dict) else ""
+            if raw_start:
+                start_date = raw_start[:10]  # 'YYYY-MM-DD'
+                print(f"  📅 [update_meeting] start_date récupéré depuis l'événement : {start_date}")
+            else:
+                return json.dumps({
+                    "error": "Impossible de récupérer la date de l'événement. Veuillez préciser la date (ex: '2026-04-06').",
+                }, ensure_ascii=False)
+        except Exception as _e:
+            print(f"  ⚠️ [update_meeting] Erreur get-event : {_e}")
+            return json.dumps({
+                "error": f"Impossible de récupérer les détails de l'événement : {_e}",
+            }, ensure_ascii=False)
+
     start_iso = f"{start_date}T{start_time}:00" if start_date and start_time else None
     end_iso   = f"{start_date}T{end_time}:00"   if start_date and end_time   else None
     result = await tools.update_meeting(
         event_id, title=title, start=start_iso, end=end_iso,
-        attendees=attendees, remove_meet=remove_meet, location=location,
+        attendees=attendees, remove_meet=remove_meet, location=location, account_id=_current_account_id,
     )
 
     if result.get("success") and _current_user_id:
@@ -308,7 +335,7 @@ async def delete_meeting(event_id: str) -> str:
     denied = await _check_rbac("delete_meeting")
     if denied: return denied
     saved_title = await _get_saved_event_title(event_id) or event_id
-    result = await tools.delete_meeting(event_id)
+    result = await tools.delete_meeting(event_id, account_id=_current_account_id)
 
     if result.get("success") and _current_user_id:
         employee_id = await _get_employee_id(_current_user_id)
@@ -329,7 +356,84 @@ async def search_meetings(query: str) -> str:
     """Recherche des événements par mot-clé."""
     denied = await _check_rbac("search_meetings")
     if denied: return denied
-    return json.dumps(await tools.search_meetings(query), ensure_ascii=False)
+    return json.dumps(await tools.search_meetings(query, account_id=_current_account_id), ensure_ascii=False)
+
+
+@tool
+async def lookup_user_by_name(name: str) -> str:
+    """
+    Recherche un utilisateur dans la base de données par son prénom ou nom complet.
+    Retourne son email et ses informations. Utilise cet outil pour trouver l'email
+    d'un participant avant de créer une réunion.
+    """
+    try:
+        from sqlalchemy import select, or_
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.user import User
+
+        async with AsyncSessionLocal() as session:
+            search = f"%{name.lower()}%"
+            result = await session.execute(
+                select(User).where(
+                    or_(
+                        User.name.ilike(search),
+                    )
+                )
+            )
+            users = result.scalars().all()
+
+            if not users:
+                return json.dumps({"found": False, "message": f"Aucun utilisateur trouvé pour '{name}'"}, ensure_ascii=False)
+
+            matches = [{"name": u.name, "email": u.email} for u in users]
+            return json.dumps({"found": True, "users": matches}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@tool
+async def get_my_manager() -> str:
+    """
+    Retourne l'email et le nom du manager direct de l'utilisateur connecté.
+    Utiliser quand l'utilisateur dit "mon manager", "ajouter mon manager", etc.
+    Ne jamais demander l'email du manager si cet outil peut le fournir.
+    """
+    try:
+        from sqlalchemy import select
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.hris import Employee
+        from app.database.models.user import User
+
+        if not _current_user_id:
+            return json.dumps({"error": "user_id non disponible"}, ensure_ascii=False)
+
+        async with AsyncSessionLocal() as session:
+            # Trouve l'employé + son manager_id
+            result = await session.execute(
+                select(Employee).where(Employee.user_id == _current_user_id)
+            )
+            employee = result.scalar_one_or_none()
+            if not employee or not employee.manager_id:
+                return json.dumps({"error": "Aucun manager configuré pour cet employé"}, ensure_ascii=False)
+
+            # Trouve le manager
+            mgr_result = await session.execute(
+                select(Employee, User)
+                .join(User, Employee.user_id == User.id)
+                .where(Employee.id == employee.manager_id)
+            )
+            row = mgr_result.first()
+            if not row:
+                return json.dumps({"error": "Manager introuvable"}, ensure_ascii=False)
+
+            _, mgr_user = row
+            return json.dumps({
+                "found": True,
+                "name": mgr_user.name,
+                "email": mgr_user.email,
+            }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
 TOOLS = [
@@ -339,6 +443,8 @@ TOOLS = [
     update_meeting,
     delete_meeting,
     search_meetings,
+    lookup_user_by_name,
+    get_my_manager,
 ]
 
 
@@ -362,11 +468,12 @@ class CalendarAgentExecutor(AgentExecutor):
         )
 
     async def execute(self, context, event_queue):
-        global _current_role, _current_user_id
+        global _current_role, _current_user_id, _current_account_id
 
         user_input = context.get_user_input()
         _current_role    = _extract_role_from_message(user_input)
         _current_user_id = _extract_user_id_from_message(user_input)
+        _current_account_id = str(_current_user_id) if _current_user_id is not None else None
 
         task_id    = context.task_id    or "task"
         context_id = context.context_id or "ctx"
@@ -376,7 +483,7 @@ class CalendarAgentExecutor(AgentExecutor):
         print(f"🔐 Rôle utilisateur : {_current_role}")
         print(f"{'='*50}")
 
-        max_retries = 3
+        max_retries = 8
 
         with trace(
             name="calendar_agent.execute",
@@ -402,23 +509,9 @@ class CalendarAgentExecutor(AgentExecutor):
                             tool_args = event["data"].get("input") or {}
                             if not isinstance(tool_args, dict):
                                 tool_args = {}
-                            step_text = _tool_to_human_text(tool_name, tool_args)
+                            step_text = calendar_tool_to_human_text(tool_name, tool_args)
                             print(f"  🔧 [STREAM] Tool start: {tool_name}({tool_args})")
-
-                            status_msg = new_agent_text_message(
-                                step_text,
-                                context_id=context_id,
-                                task_id=task_id,
-                            )
-                            await event_queue.enqueue_event(TaskStatusUpdateEvent(
-                                task_id=task_id,
-                                context_id=context_id,
-                                status=TaskStatus(
-                                    state=TaskState.working,
-                                    message=status_msg,
-                                ),
-                                final=False,
-                            ))
+                            await enqueue_working(event_queue, step_text, task_id, context_id)
                             status_events_emitted += 1
 
                         # ── Chain end → capture final messages ────────
@@ -430,10 +523,20 @@ class CalendarAgentExecutor(AgentExecutor):
                     break  # success — exit retry loop
 
                 except Exception as e:
-                    if _is_quota_error(e):
-                        print(f"⚠️ Quota tokens dépassé (Calendar) : {str(e)[:120]}")
+                    if _is_tpm_error(e) and rotate_llm_key():
+                        print(f"⚠️ TPM dépassé (Calendar tentative {attempt+1}/{max_retries}), rotation clé + attente 3s")
+                        self._build_react_agent()
+                        await asyncio.sleep(3)
+                        continue
+                    elif _is_tpm_error(e):
+                        print(f"⚠️ TPM dépassé (Calendar) — toutes les clés épuisées")
                         ls_run.end(outputs={"response": FRIENDLY_QUOTA_MSG, "error": "quota"})
                         await _enqueue_final(event_queue, json.dumps({"response": FRIENDLY_QUOTA_MSG, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
+                        return
+                    elif _is_context_error(e):
+                        print(f"⚠️ Contexte trop long (Calendar) : {str(e)[:120]}")
+                        ls_run.end(outputs={"response": FRIENDLY_CONTEXT_MSG, "error": "context"})
+                        await _enqueue_final(event_queue, json.dumps({"response": FRIENDLY_CONTEXT_MSG, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
                     elif _is_fallback_error(e) and rotate_llm_key() and status_events_emitted == 0:
                         print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
@@ -441,7 +544,7 @@ class CalendarAgentExecutor(AgentExecutor):
                         continue
                     else:
                         print(f"❌ Erreur ReAct : {str(e)}")
-                        final_err = f"Erreur : {str(e)}"
+                        final_err = "Une erreur inattendue s'est produite. Veuillez réessayer ou reformuler votre demande."
                         ls_run.end(outputs={"response": final_err, "error": str(e)})
                         await _enqueue_final(event_queue, json.dumps({"response": final_err, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
@@ -468,7 +571,7 @@ class CalendarAgentExecutor(AgentExecutor):
                             print(f"  🤔 Think  : {msg.content[:300]}")
                         if msg.tool_calls:
                             for tc in msg.tool_calls:
-                                human_label = _tool_to_human_text(tc['name'], tc['args'])
+                                human_label = calendar_tool_to_human_text(tc['name'], tc['args'])
                                 react_steps.append(human_label)
                                 tool_calls_map[tc['id']] = len(react_steps) - 1
                                 print(f"  🔧 Act    : {tc['name']}({tc['args']})")
@@ -499,6 +602,9 @@ class CalendarAgentExecutor(AgentExecutor):
             response_data = {"response": final, "react_steps": react_steps}
             if ui_hint:
                 response_data["ui_hint"] = ui_hint
+                # Si le LLM pose une question (confirmation, choix, date…), signaler needs_input
+                # pour que l'orchestrateur mette l'étape en pause et attende la réponse utilisateur
+                response_data["needs_input"] = True
 
             await _enqueue_final(event_queue, json.dumps(response_data, ensure_ascii=False), task_id, context_id, status_events_emitted)
 
@@ -581,46 +687,6 @@ def _detect_ui_hint(text: str) -> "dict | None":
     return None
 
 
-def _tool_to_human_text(tool_name: str, args: dict) -> str:
-    """Convertit un appel d'outil en texte lisible pour l'utilisateur."""
-    match tool_name:
-        case "get_calendar_events":
-            start = args.get("start_date", "")[:10]
-            end   = args.get("end_date", "")[:10]
-            if start == end:
-                return f"📅 Consultation des événements du {start}..."
-            return f"📅 Consultation des événements du {start} au {end}..."
-
-        case "check_calendar_conflicts":
-            start = args.get("start_date", "")[:10]
-            end   = args.get("end_date", "")[:10]
-            return f"🔍 Vérification des disponibilités du {start} au {end}..."
-
-        case "search_meetings":
-            return f"🔎 Recherche d'événements : « {args.get('query', '')} »..."
-
-        case "create_meeting":
-            title = args.get("title", "Sans titre")
-            date  = args.get("start_date", "")
-            start_t = args.get("start_time", "")
-            return f"➕ Création de l'événement « {title} » le {date} à {start_t}..."
-
-        case "update_meeting":
-            parts = []
-            if args.get("title"):
-                parts.append(f"titre → « {args['title']} »")
-            if args.get("start_time"):
-                parts.append(f"heure → {args.get('start_time')}–{args.get('end_time', '?')}")
-            detail = ", ".join(parts) if parts else "événement"
-            return f"✏️ Modification : {detail}..."
-
-        case "delete_meeting":
-            return f"🗑️ Suppression de l'événement (ID: {args.get('event_id', '')[:8]}...)..."
-
-        case _:
-            return f"⚙️ {tool_name}..."
-
-
 def _format_observation(content: str) -> str:
     """Convertit la réponse d'un outil en résumé lisible."""
     try:
@@ -658,12 +724,21 @@ def _format_observation(content: str) -> str:
                 if "event" in raw:
                     raw = raw["event"]
                 title = raw.get("summary", "")
-                start = (raw.get("start") or {}).get("dateTime", "")[:16].replace("T", " à ")
+                raw_start = (raw.get("start") or {}).get("dateTime", "")
+                raw_end   = (raw.get("end")   or {}).get("dateTime", "")
+                # Affiche heure début → heure fin pour que le LLM puisse valider
+                start_str = raw_start[11:16] if len(raw_start) >= 16 else ""
+                end_str   = raw_end[11:16]   if len(raw_end)   >= 16 else ""
+                time_str  = f"{start_str}–{end_str}" if start_str and end_str else ""
                 link = raw.get("htmlLink", "")
-                detail = f"« {title} »" + (f" — {start}" if start else "")
+                detail = f"« {title} »" + (f" — {time_str}" if time_str else "")
                 if link:
                     detail += f" ([voir]({link}))"
-                return f"Événement {detail} ✅"
+                # Vérification honnête : le Meet link est-il encore présent ?
+                hangout = raw.get("hangoutLink", "")
+                if hangout:
+                    detail += f" ⚠️ ATTENTION : le lien Google Meet est ENCORE PRÉSENT ({hangout}) — la suppression n'a pas fonctionné"
+                return f"Événement mis à jour : {detail} ✅ (heures réelles dans Google Calendar : {time_str})"
             if "message" in data:
                 return f"{data['message']} ✅"
 

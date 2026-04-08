@@ -3,14 +3,14 @@
 # Agent RH — ReAct (GPT-OSS 120B) avec failover clés Groq
 # ═══════════════════════════════════════════════════════════
 from dotenv import load_dotenv
+import asyncio
 import json
 import re
 from datetime import date
+from typing import Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.types import TaskStatusUpdateEvent, TaskStatus, TaskState
-from a2a.utils import new_agent_text_message
 
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
@@ -18,25 +18,17 @@ from langgraph.prebuilt import create_react_agent
 
 from agents.rh.prompts import RH_REACT_PROMPT
 from agents.rh import tools as rh_tools
-from app.core.groq_client import build_llm, rotate_llm_key, _is_fallback_error, _is_quota_error, FRIENDLY_QUOTA_MSG
+from app.core.groq_client import build_llm, build_llm_groq_fallback, rotate_llm_key, _is_fallback_error, _is_tpm_error, _is_context_error, FRIENDLY_QUOTA_MSG, FRIENDLY_CONTEXT_MSG  # noqa: F401
 from app.core.rbac import check_tool_permission, tool_permission_denied_message
+from utils.streaming import enqueue_final as _enqueue_final_shared, enqueue_working, rh_tool_to_human_text
 from langsmith import trace
 
 load_dotenv()
 
 
-async def _enqueue_final(event_queue: EventQueue, text: str, task_id: str, context_id: str, status_emitted: int) -> None:
-    """Envoie l'événement final : TaskStatusUpdateEvent si du streaming a déjà été émis, sinon Message."""
-    if status_emitted > 0:
-        msg = new_agent_text_message(text, context_id=context_id, task_id=task_id)
-        await event_queue.enqueue_event(TaskStatusUpdateEvent(
-            task_id=task_id,
-            context_id=context_id,
-            status=TaskStatus(state=TaskState.completed, message=msg),
-            final=True,
-        ))
-    else:
-        await event_queue.enqueue_event(new_agent_text_message(text))
+async def _enqueue_final(event_queue: EventQueue, text: str, task_id: str, context_id: str, status_emitted: int = 0) -> None:
+    """Délègue à utils.streaming.enqueue_final — toujours TaskStatusUpdateEvent."""
+    await _enqueue_final_shared(event_queue, text, task_id, context_id)
 
 
 # ── Rôle utilisateur courant (injecté par execute()) ─────
@@ -81,7 +73,7 @@ def _extract_role_from_message(text: str) -> str:
     for line in text.split("\n"):
         if line.strip().lower().startswith("role utilisateur"):
             role = line.split(":")[-1].strip().lower()
-            if role in ("consultant", "pm"):
+            if role in ("consultant", "pm", "rh"):
                 return role
     return "consultant"
 
@@ -169,7 +161,7 @@ async def delete_leave(
 
 
 @tool
-async def get_my_leaves(user_id: int, status_filter: str = None) -> str:
+async def get_my_leaves(user_id: int, status_filter: Optional[str] = None) -> str:
     """Retourne les congés d'un employé."""
     denied = await _check_rbac("get_my_leaves")
     if denied: return denied
@@ -179,7 +171,7 @@ async def get_my_leaves(user_id: int, status_filter: str = None) -> str:
 
 @tool
 async def get_team_availability(user_id: int) -> str:
-    """Retourne la disponibilité de l'équipe."""
+    """Retourne la disponibilité de l'équipe de l'utilisateur connecté."""
     denied = await _check_rbac("get_team_availability")
     if denied: return denied
     result = await rh_tools.get_team_availability(user_id=user_id)
@@ -187,11 +179,46 @@ async def get_team_availability(user_id: int) -> str:
 
 
 @tool
-async def get_team_stack(user_id: int) -> str:
-    """Retourne les compétences techniques de l'équipe."""
+async def get_team_availability_by_name(team_name: str) -> str:
+    """Retourne la disponibilité des membres d'une équipe spécifique par son nom (ex: 'Salesforce', 'Data', 'Cloud')."""
+    denied = await _check_rbac("get_team_availability")
+    if denied: return denied
+    result = await rh_tools.get_team_availability_by_name(team_name=team_name)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def get_team_stack(
+    user_id: int,
+    skill_filter: str = None,
+    my_team_only: Optional[bool] = False,
+    team_filter: Optional[str] = None,
+    dept_filter: Optional[str] = None,
+) -> str:
+    """Retourne les compétences techniques selon le rôle de l'utilisateur.
+
+    Scope automatique :
+      - consultant          → toujours son équipe uniquement
+      - pm/rh               → toute l'entreprise par défaut
+
+    Paramètre my_team_only (pm/rh) :
+      - True  → "qui dans MON équipe sait X ?" → restreint à la propre équipe du pm
+      - False → "qui dans l'entreprise sait X ?" → toute l'entreprise
+
+    Filtres optionnels (pm/rh, my_team_only=False) :
+      - skill_filter : technologie précise (ex: 'Java', 'React')
+      - team_filter  : nom d'équipe explicite (ex: 'Data Ops')
+      - dept_filter  : département (ex: 'cloud', 'data')"""
     denied = await _check_rbac("get_team_stack")
     if denied: return denied
-    result = await rh_tools.get_team_stack(user_id=user_id)
+    result = await rh_tools.get_team_stack(
+        user_id=user_id,
+        caller_role=_current_role,
+        skill_filter=skill_filter,
+        my_team_only=my_team_only,
+        team_filter=team_filter,
+        dept_filter=dept_filter,
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -202,7 +229,10 @@ async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str)
     if denied: return denied
     try:
         from agents.calendar.tools import check_calendar_conflicts as cal_check
-        result = await cal_check(start_date, end_date)
+        account_id = str(user_id)
+        print(f"  📅 [check_calendar_conflicts] user_id={user_id} → account_id='{account_id}' | période={start_date} → {end_date}")
+        result = await cal_check(start_date, end_date, account_id=account_id)
+        print(f"  📅 [check_calendar_conflicts] résultat MCP : {result}")
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         print(f"⚠️ Calendar MCP indisponible : {e}")
@@ -253,14 +283,88 @@ async def reschedule_meeting(
 
 
 @tool
-async def notify_manager(user_id: int, message: str) -> str:
-    """Notifie le manager de l'employé via Slack."""
+async def remove_meeting_attendee(
+    event_id: str,
+    event_title: str,
+    email_to_remove: str,
+) -> str:
+    """
+    Retire un participant d'une réunion existante via l'agent Calendar.
+    Récupère automatiquement la liste des participants puis met à jour l'événement.
+
+    event_id        : ID Google Calendar de l'événement (champ 'id' des conflicts).
+    event_title     : titre de la réunion (pour la confirmation).
+    email_to_remove : adresse email du participant à retirer.
+    """
+    denied = await _check_rbac("reschedule_meeting")
+    if denied: return denied
+    from app.a2a.client import send_task
+    today = date.today().strftime("%Y-%m-%d")
+    print(f"  🗑️ [remove_meeting_attendee] event_id={event_id} | retirer={email_to_remove}")
+    message = (
+        f"Date du jour : {today}\n"
+        f"Retire le participant '{email_to_remove}' de la réunion avec l'event_id '{event_id}' "
+        f"(titre : '{event_title}'). "
+        f"Utilise get_event avec cet event_id pour récupérer la liste actuelle des participants, "
+        f"puis appelle update_meeting avec la liste mise à jour sans '{email_to_remove}'. "
+        f"Ne fais aucune recherche par titre."
+    )
+    try:
+        response = await send_task("calendar", message)
+        print(f"  🗑️ [remove_meeting_attendee] réponse Calendar : {str(response)[:200]}")
+        return json.dumps({"success": True, "response": response}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"Impossible de retirer '{email_to_remove}' de '{event_title}' : {str(e)}"}, ensure_ascii=False)
+
+
+@tool
+async def notify_manager(
+    manager_email: str,
+    employee_name: str,
+    start_date: str,
+    end_date: str,
+    days_count: int,
+) -> str:
+    """Notifie le manager par email qu'une demande de congé a été déposée.
+    Utiliser les valeurs retournées par create_leave : manager_email, employee_name, start_date, end_date, days_count."""
     denied = await _check_rbac("notify_manager")
     if denied: return denied
-    return json.dumps({
-        "success": True,
-        "message": f"✅ [MOCK] Notification envoyée au manager : {message}"
-    })
+    subject = f"Nouvelle demande de congé — {employee_name}"
+    body = (
+        f"Bonjour,\n\n"
+        f"{employee_name} a déposé une demande de congé.\n\n"
+        f"  Période : du {start_date} au {end_date} ({days_count} jour(s) ouvré(s))\n"
+        f"  Statut  : En attente d'approbation\n\n"
+        f"Cordialement,\nTalan Assistant"
+    )
+    result = await rh_tools.send_email(
+        to_email=manager_email,
+        subject=subject,
+        body=body,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def send_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    cc_emails: list = None,
+) -> str:
+    """[RH UNIQUEMENT] Envoie un email générique au nom de Talan.
+    Le LLM génère subject et body selon la demande de l'utilisateur.
+    Exemples : demander un justificatif, informer un employé, contacter une équipe.
+    cc_emails : liste optionnelle d'emails en copie."""
+    denied = await _check_rbac("send_email")
+    if denied: return denied
+    result = await rh_tools.send_email(
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        cc_emails=cc_emails or [],
+    )
+    return json.dumps(result, ensure_ascii=False)
 
 
 @tool
@@ -269,6 +373,79 @@ async def check_leave_balance(user_id: int, requested_days: int = 0) -> str:
     denied = await _check_rbac("check_leave_balance")
     if denied: return denied
     result = await rh_tools.check_leave_balance(user_id=user_id, requested_days=requested_days)
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ── OUTILS RÉSERVÉS AU RÔLE RH ────────────────────────
+
+@tool
+async def approve_leave_request(employee_name: str) -> str:
+    """
+    [RH UNIQUEMENT] Approuve la demande de congé en attente d'un employé.
+    Si plusieurs employés correspondent au nom, retourne la liste pour choisir.
+    """
+    denied = await _check_rbac("approve_leave_request")
+    if denied: return denied
+    result = await rh_tools.approve_leave_request(employee_name=employee_name)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def reject_leave_request(employee_name: str, reason: str = "") -> str:
+    """
+    [RH UNIQUEMENT] Rejette la demande de congé en attente d'un employé.
+    Si plusieurs employés correspondent, retourne la liste pour choisir.
+    """
+    denied = await _check_rbac("reject_leave_request")
+    if denied: return denied
+    result = await rh_tools.reject_leave_request(employee_name=employee_name, reason=reason)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def get_leaves_by_filter(
+    status: str = None,
+    department: str = None,
+    team: str = None,
+    employee_name: str = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> str:
+    """
+    [RH UNIQUEMENT] Récupère les demandes de congé filtrées.
+    Filtres combinables : status (pending/approved/rejected/cancelled),
+    department, team, employee_name, start_date (YYYY-MM-DD), end_date (YYYY-MM-DD).
+    """
+    denied = await _check_rbac("get_leaves_by_filter")
+    if denied: return denied
+    result = await rh_tools.get_leaves_by_filter(
+        status=status, department=department, team=team,
+        employee_name=employee_name, start_date=start_date, end_date=end_date,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def update_employee_info(
+    employee_name: str,
+    job_title: str = None,
+    seniority: str = None,
+    manager_name: str = None,
+    team_name: str = None,
+) -> str:
+    """
+    [RH UNIQUEMENT] Met à jour les informations d'un employé :
+    job_title, seniority (junior/mid/senior/lead/principal), manager_name, team_name.
+    """
+    denied = await _check_rbac("update_employee_info")
+    if denied: return denied
+    result = await rh_tools.update_employee_info(
+        employee_name=employee_name,
+        job_title=job_title,
+        seniority=seniority,
+        manager_name=manager_name,
+        team_name=team_name,
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -282,10 +459,18 @@ TOOLS = [
     delete_leave,
     get_my_leaves,
     get_team_availability,
+    get_team_availability_by_name,
     get_team_stack,
     check_calendar_conflicts,
     reschedule_meeting,
+    remove_meeting_attendee,
     notify_manager,
+    send_email,
+    # Outils RH manager
+    approve_leave_request,
+    reject_leave_request,
+    get_leaves_by_filter,
+    update_employee_info,
 ]
 
 
@@ -303,12 +488,14 @@ class RHAgentExecutor(AgentExecutor):
     def __init__(self) -> None:
         self._build_react_agent()
 
-    def _build_react_agent(self) -> None:
-        """Construit le ReAct agent avec la clé Groq active."""
-        llm = build_llm(
+    def _build_react_agent(self, use_groq_fallback: bool = False) -> None:
+        """Construit le ReAct agent.
+        use_groq_fallback=True → force Groq (quand NVIDIA a échoué).
+        """
+        llm = (build_llm_groq_fallback if use_groq_fallback else build_llm)(
             model="openai/gpt-oss-120b",
             temperature=0,
-            max_tokens=2048,
+            max_tokens=1500,
         )
         self.react_agent = create_react_agent(
             model=llm,
@@ -351,6 +538,7 @@ class RHAgentExecutor(AgentExecutor):
                     async for event in self.react_agent.astream_events(
                         {"messages": [HumanMessage(content=user_input)]},
                         version="v2",
+                        config={"recursion_limit": 12},
                     ):
                         etype = event["event"]
 
@@ -359,23 +547,9 @@ class RHAgentExecutor(AgentExecutor):
                             tool_args = event["data"].get("input") or {}
                             if not isinstance(tool_args, dict):
                                 tool_args = {}
-                            step_text = _tool_to_human_text(tool_name, tool_args)
+                            step_text = rh_tool_to_human_text(tool_name, tool_args)
                             print(f"  🔧 [STREAM] Tool start: {tool_name}({tool_args})")
-
-                            status_msg = new_agent_text_message(
-                                step_text,
-                                context_id=context_id,
-                                task_id=task_id,
-                            )
-                            await event_queue.enqueue_event(TaskStatusUpdateEvent(
-                                task_id=task_id,
-                                context_id=context_id,
-                                status=TaskStatus(
-                                    state=TaskState.working,
-                                    message=status_msg,
-                                ),
-                                final=False,
-                            ))
+                            await enqueue_working(event_queue, step_text, task_id, context_id)
                             status_events_emitted += 1
 
                         elif etype == "on_chain_end":
@@ -386,19 +560,32 @@ class RHAgentExecutor(AgentExecutor):
                     break
 
                 except Exception as e:
-                    if _is_quota_error(e):
-                        print(f"⚠️ Quota tokens dépassé (RH) : {str(e)[:120]}")
+                    # ⚠️ context_error AVANT tpm_error : "request too large" matche
+                    # aussi "tokens per minute" → il faut court-circuiter en premier.
+                    if _is_context_error(e):
+                        print(f"⚠️ Contexte trop long (RH) : {str(e)[:120]}")
+                        final_response = FRIENDLY_CONTEXT_MSG
+                        ls_run.end(outputs={"response": final_response, "error": "context"})
+                        await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
+                        return
+                    elif _is_tpm_error(e) and rotate_llm_key():
+                        print(f"⚠️ TPM dépassé (RH tentative {attempt+1}/{max_retries}), rotation clé Groq + attente 3s")
+                        self._build_react_agent(use_groq_fallback=True)
+                        await asyncio.sleep(3)
+                        continue
+                    elif _is_tpm_error(e):
+                        print(f"⚠️ TPM dépassé (RH) — toutes les clés Groq épuisées ({max_retries} tentatives)")
                         final_response = FRIENDLY_QUOTA_MSG
                         ls_run.end(outputs={"response": final_response, "error": "quota"})
                         await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
                     elif _is_fallback_error(e) and rotate_llm_key() and status_events_emitted == 0:
-                        print(f"⚠️ Clé Groq échouée (tentative {attempt+1}/{max_retries}) → rotation")
-                        self._build_react_agent()
+                        print(f"⚠️ [Groq RH] Clé invalide (tentative {attempt+1}/{max_retries}) → rotation")
+                        self._build_react_agent(use_groq_fallback=True)
                         continue
                     else:
                         print(f"❌ Erreur ReAct : {str(e)}")
-                        final_response = f"Erreur lors du traitement : {str(e)}"
+                        final_response = "Une erreur inattendue s'est produite. Veuillez réessayer ou reformuler votre demande."
                         ls_run.end(outputs={"response": final_response, "error": str(e)})
                         await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
                         return
@@ -423,7 +610,7 @@ class RHAgentExecutor(AgentExecutor):
                             print(f"  🤔 Think  : {msg.content[:300]}")
                         if msg.tool_calls:
                             for tc in msg.tool_calls:
-                                step_text = _tool_to_human_text(tc['name'], tc['args'])
+                                step_text = rh_tool_to_human_text(tc['name'], tc['args'])
                                 react_steps.append(step_text)
                                 tool_calls_map[tc['id']] = len(react_steps) - 1
                                 print(f"  🔧 Act    : {tc['name']}({tc['args']})")
@@ -506,33 +693,6 @@ def _detect_ui_hint(text: str) -> "dict | None":
         return {"type": "date_picker"}
 
     return None
-
-def _tool_to_human_text(tool_name: str, args: dict) -> str:
-    mapping = {
-        "check_leave_balance": "💰 Vérification du solde de congés...",
-        "check_calendar_conflicts": (
-            f"🔍 Vérification du calendrier du {args.get('start_date')} "
-            f"au {args.get('end_date')}..."
-        ),
-        "create_leave": (
-            f"📝 Création du congé du {args.get('start_date')} "
-            f"au {args.get('end_date')}..."
-        ),
-        "delete_leave": (
-            f"🗑️ Annulation du congé"
-            f"{' #' + str(args.get('leave_id')) if args.get('leave_id') else ''}"
-            f"{' du ' + args.get('start_date') if args.get('start_date') else ''}..."
-        ),
-        "notify_manager": "📢 Notification du manager...",
-        "get_my_leaves": (
-            f"📋 Récupération des congés"
-            f"{' en attente' if args.get('status_filter') == 'pending' else ''}..."
-        ),
-        "get_team_availability": "👥 Vérification de la disponibilité de l'équipe...",
-        "get_team_stack": "💼 Récupération des compétences de l'équipe...",
-    }
-    return mapping.get(tool_name, f"⚙️ {tool_name}...")
-
 
 def _format_observation(content: str) -> str:
     try:

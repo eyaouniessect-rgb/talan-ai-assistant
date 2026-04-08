@@ -68,3 +68,49 @@ Cordialement,
         raise
 
     logger.info(f"[EMAIL] Email envoyé avec succès à {to_email}")
+
+
+def send_generic_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    cc_emails: list[str] | None = None,
+) -> None:
+    """
+    Envoie un email générique (contact employé, notification, etc.).
+    En mode DEV (EMAIL_DEV_MODE=true), affiche l'email dans la console.
+    """
+    cc_emails = cc_emails or []
+
+    if EMAIL_DEV_MODE:
+        logger.info("=" * 60)
+        logger.info("[DEV] Email non envoyé — affichage console")
+        logger.info(f"  À       : {to_email}")
+        logger.info(f"  CC      : {', '.join(cc_emails) if cc_emails else '—'}")
+        logger.info(f"  Sujet   : {subject}")
+        logger.info(f"  Corps   :\n{body}")
+        logger.info("=" * 60)
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = f"{EMAIL_FROM_NAME} <{EMAIL_USER}>"
+    msg["To"]      = to_email
+    if cc_emails:
+        msg["Cc"] = ", ".join(cc_emails)
+
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    all_recipients = [to_email] + cc_emails
+
+    logger.info(f"[EMAIL] Envoi de '{subject}' vers {to_email} (CC: {cc_emails})")
+    try:
+        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
+    except Exception:
+        logger.exception(f"[EMAIL] Echec envoi vers {to_email}")
+        raise
+
+    logger.info(f"[EMAIL] Email envoyé avec succès à {to_email}")

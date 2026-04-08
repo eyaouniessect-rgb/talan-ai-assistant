@@ -58,7 +58,7 @@ async def _initialize() -> "str | None":
         return r.headers.get("mcp-session-id")
 
 
-async def call_mcp(tool: str, arguments: dict, _retry: bool = True):
+async def call_mcp(tool: str, arguments: dict, account_id: "str | None" = None, _retry: bool = True):
     """
     Call a Google Calendar MCP tool.
     - Session is initialized once and cached at module level.
@@ -74,6 +74,11 @@ async def call_mcp(tool: str, arguments: dict, _retry: bool = True):
     if _session_id:
         tool_headers["mcp-session-id"] = _session_id
 
+    # Inject account selection for multi-user MCP support
+    call_arguments = dict(arguments)
+    if account_id is not None:
+        call_arguments["account"] = account_id
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
             MCP_URL,
@@ -83,7 +88,7 @@ async def call_mcp(tool: str, arguments: dict, _retry: bool = True):
                 "method": "tools/call",
                 "params": {
                     "name": tool,
-                    "arguments": arguments,
+                    "arguments": call_arguments,
                 },
             },
             headers=tool_headers,
@@ -92,7 +97,7 @@ async def call_mcp(tool: str, arguments: dict, _retry: bool = True):
         # Session expired or invalid — reinitialize once
         if r.status_code in (400, 404) and _retry:
             _session_id = None
-            return await call_mcp(tool, arguments, _retry=False)
+            return await call_mcp(tool, arguments, account_id=account_id, _retry=False)
 
         r.raise_for_status()
         data = _parse_response(r)

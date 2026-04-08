@@ -29,9 +29,9 @@ export default function Login() {
 
   const DEMO_PASSWORD = "Talan2026!";
   const DEMO_ACCOUNTS = {
-    rh:         "mariem.chaabane@talan.tn",
-    consultant: "yassine.cherif@talan.tn",
-    manager:    "ahmed.bensalah@talan.tn",
+    rh:         "ons.rh.talan@gmail.com",
+    consultant: "eyaouniessect@gmail.com",
+    manager:    "imen.ayari@talan.tn",
   };
 
   const quickLogin = async (role) => {
@@ -188,7 +188,7 @@ export default function Login() {
               >
                 <div className="font-medium mb-0.5">RH</div>
                 <div className="text-emerald-500 font-mono">
-                  mariem.chaabane@talan.tn
+                  ons.rh.talan@gmail.com
                 </div>
               </button>
               <button
@@ -197,7 +197,7 @@ export default function Login() {
               >
                 <div className="font-medium mb-0.5">Consultant</div>
                 <div className="text-blue-500 font-mono">
-                  yassine.cherif@talan.tn
+                  eyaouniessect@gmail.com
                 </div>
               </button>
               <button
@@ -206,7 +206,7 @@ export default function Login() {
               >
                 <div className="font-medium mb-0.5">Manager</div>
                 <div className="text-purple-500 font-mono">
-                  ahmed.bensalah@talan.tn
+                  imen.ayari@talan.tn
                 </div>
               </button>
             </div>

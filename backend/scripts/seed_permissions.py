@@ -39,6 +39,12 @@ PERMISSIONS = [
     {"role": "consultant", "action": "get_all_leaves",           "allowed": False},
     {"role": "consultant", "action": "create_user_account",      "allowed": False},
     {"role": "consultant", "action": "deactivate_user",          "allowed": False},
+    {"role": "consultant", "action": "approve_leave_request",    "allowed": False},
+    {"role": "consultant", "action": "reject_leave_request",     "allowed": False},
+    {"role": "consultant", "action": "get_leaves_by_filter",     "allowed": False},
+    {"role": "consultant", "action": "update_employee_info",     "allowed": False},
+    {"role": "consultant", "action": "get_team_availability_by_name", "allowed": True},
+    {"role": "consultant", "action": "send_email",                    "allowed": False},
 
     # ═══════════════════════════════════════════════════
     # PM — tout consultant + vision équipe
@@ -62,11 +68,17 @@ PERMISSIONS = [
     {"role": "pm", "action": "notify_manager",           "allowed": True},
     {"role": "pm", "action": "get_all_leaves",           "allowed": True},   # voir congés équipe
 
-    # Pas de création de comptes
+    # Pas de création de comptes ni admin RH
     {"role": "pm", "action": "approve_leave",            "allowed": False},
     {"role": "pm", "action": "reject_leave",             "allowed": False},
     {"role": "pm", "action": "create_user_account",      "allowed": False},
     {"role": "pm", "action": "deactivate_user",          "allowed": False},
+    {"role": "pm", "action": "approve_leave_request",    "allowed": False},
+    {"role": "pm", "action": "reject_leave_request",     "allowed": False},
+    {"role": "pm", "action": "get_leaves_by_filter",     "allowed": False},
+    {"role": "pm", "action": "update_employee_info",     "allowed": False},
+    {"role": "pm", "action": "get_team_availability_by_name", "allowed": True},
+    {"role": "pm", "action": "send_email",                    "allowed": False},
 
     # ═══════════════════════════════════════════════════
     # RH — administration RH complète
@@ -91,10 +103,17 @@ PERMISSIONS = [
     {"role": "rh", "action": "get_all_leaves",           "allowed": True},
 
     # ── RH Admin tools — exclusif RH ─────────────────
-    {"role": "rh", "action": "approve_leave",            "allowed": True},
-    {"role": "rh", "action": "reject_leave",             "allowed": True},
-    {"role": "rh", "action": "create_user_account",      "allowed": True},
-    {"role": "rh", "action": "deactivate_user",          "allowed": True},
+    {"role": "rh", "action": "approve_leave",                 "allowed": True},
+    {"role": "rh", "action": "reject_leave",                  "allowed": True},
+    {"role": "rh", "action": "create_user_account",           "allowed": True},
+    {"role": "rh", "action": "deactivate_user",               "allowed": True},
+    # Nouveaux tools RH manager
+    {"role": "rh", "action": "approve_leave_request",         "allowed": True},
+    {"role": "rh", "action": "reject_leave_request",          "allowed": True},
+    {"role": "rh", "action": "get_leaves_by_filter",          "allowed": True},
+    {"role": "rh", "action": "update_employee_info",          "allowed": True},
+    {"role": "rh", "action": "get_team_availability_by_name", "allowed": True},
+    {"role": "rh", "action": "send_email",                    "allowed": True},
 ]
 
 

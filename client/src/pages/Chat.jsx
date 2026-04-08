@@ -15,6 +15,12 @@ import {
   Clock,
   Mail,
   X,
+  Users,
+  Search,
+  MessageSquare,
+  Briefcase,
+  Settings2,
+  ArrowRight,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import clsx from "clsx";
@@ -26,6 +32,15 @@ const AGENT_COLORS = {
   Jira: "bg-orange-100 text-orange-700",
   Slack: "bg-purple-100 text-purple-700",
   Calendar: "bg-cyan-100 text-cyan-700",
+};
+
+const AGENT_ICON = {
+  rh:       <Users size={12} />,
+  calendar: <Calendar size={12} />,
+  jira:     <Briefcase size={12} />,
+  slack:    <MessageSquare size={12} />,
+  crm:      <Settings2 size={12} />,
+  chat:     <MessageSquare size={12} />,
 };
 
 const QUICK_CONSULTANT = [
@@ -51,11 +66,24 @@ function formatAssistantContent(content = "") {
   );
 }
 
+function StepStatusIcon({ status }) {
+  if (status === "done")
+    return <CheckCircle size={13} className="text-green-500 shrink-0" />;
+  if (status === "running")
+    return <Loader size={13} className="text-cyan animate-spin shrink-0" />;
+  if (status === "unavailable")
+    return <AlertTriangle size={13} className="text-orange-400 shrink-0" />;
+  if (status === "skipped")
+    return <span className="w-3 h-3 shrink-0 text-slate-300 text-xs leading-none">—</span>;
+  if (status === "waiting")
+    return <Clock size={13} className="text-yellow-400 shrink-0" />;
+  return <Loader size={13} className="text-slate-300 shrink-0" />;
+}
+
 function ThinkingCard({ steps, streaming }) {
   const [open, setOpen] = useState(true);
   if (!steps || steps.length === 0) return null;
 
-  // Compte les étapes terminées (done + unavailable + skipped)
   const finishedCount = steps.filter(
     (s) => s.status === "done" || s.status === "unavailable" || s.status === "skipped"
   ).length;
@@ -71,9 +99,7 @@ function ThinkingCard({ steps, streaming }) {
         ) : (
           <ChevronRight size={15} className="text-cyan shrink-0" />
         )}
-        <span className="text-xs font-semibold text-cyan">
-          Étapes de traitement
-        </span>
+        <span className="text-xs font-semibold text-cyan">Étapes de traitement</span>
         {streaming && (
           <Loader size={12} className="text-cyan animate-spin shrink-0" />
         )}
@@ -81,26 +107,52 @@ function ThinkingCard({ steps, streaming }) {
           {finishedCount}/{steps.length}
         </span>
       </button>
+
       {open && (
-        <div className="px-4 pb-3 space-y-1 border-t border-cyan/20">
-          {steps.map((step, i) => (
-            <div key={step.step_id || i} className="thinking-step">
-              {step.status === "done" ? (
-                <CheckCircle size={13} className="text-green-500 shrink-0" />
-              ) : step.status === "running" ? (
-                <Loader size={13} className="text-cyan animate-spin shrink-0" />
-              ) : step.status === "unavailable" ? (
-                <AlertTriangle size={13} className="text-orange-400 shrink-0" />
-              ) : step.status === "skipped" ? (
-                <span className="w-3 h-3 shrink-0 text-slate-300 text-xs leading-none">—</span>
-              ) : step.status === "waiting" ? (
-                <Clock size={13} className="text-yellow-400 shrink-0" />
-              ) : (
-                <Loader size={13} className="text-slate-300 shrink-0" />
-              )}
-              <span className="text-xs text-slate-600">{step.text}</span>
-            </div>
-          ))}
+        <div className="px-4 pb-3 pt-1 space-y-2 border-t border-cyan/20">
+          {steps.map((step, i) => {
+            const agentIcon = AGENT_ICON[step.agent] ?? <Search size={12} />;
+            const history = step.history;
+            const hasHistory = history && history.length > 1;
+
+            return (
+              <div key={step.step_id || i} className="flex flex-col gap-0.5">
+                {/* Ligne principale de l'étape */}
+                <div className="thinking-step">
+                  <StepStatusIcon status={step.status} />
+                  {/* Icône agent */}
+                  <span className="text-slate-400 shrink-0">{agentIcon}</span>
+                  <span className={`text-xs font-medium ${
+                    step.status === "done" ? "text-slate-600" :
+                    step.status === "running" ? "text-cyan-700" :
+                    step.status === "unavailable" ? "text-orange-500" :
+                    step.status === "waiting" ? "text-yellow-600" :
+                    "text-slate-400"
+                  }`}>
+                    {step.text}
+                  </span>
+                </div>
+
+                {/* Historique des tool calls (affiché sous l'étape principale) */}
+                {hasHistory && (
+                  <div className="ml-6 flex flex-col gap-0.5 border-l-2 border-cyan/20 pl-3">
+                    {history.map((h, hi) => (
+                      <div key={hi} className="flex items-center gap-1.5">
+                        <ArrowRight size={10} className="text-slate-300 shrink-0" />
+                        <span className={`text-xs ${
+                          hi === history.length - 1 && step.status === "running"
+                            ? "text-cyan-600 font-medium"
+                            : "text-slate-400"
+                        }`}>
+                          {h}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -514,6 +566,9 @@ export default function Chat() {
             >
               <div className="text-sm font-medium text-slate-800 truncate mb-1">
                 {conv.title}
+              </div>
+              <div className="text-[10px] text-slate-400 font-mono">
+                ID: {conv.id > 1_000_000_000_000 ? `tmp_${String(conv.id).slice(-4)}` : conv.id}
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-400">{conv.date}</span>

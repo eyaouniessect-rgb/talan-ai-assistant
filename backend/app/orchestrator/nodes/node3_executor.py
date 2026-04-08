@@ -3,7 +3,7 @@
 import asyncio
 import json
 import contextvars
-from datetime import date
+from datetime import date, datetime, timezone
 
 from app.orchestrator.state import AssistantState, PlanStep
 from app.a2a.client import send_task_to_url
@@ -11,7 +11,10 @@ from app.a2a.discovery import discovery
 from langsmith import traceable
 
 MAX_HISTORY = 10
-MAX_AI_RESPONSE_CHARS = 600
+MAX_AI_RESPONSE_CHARS = 300
+
+# Préfixes des messages d'erreur système à exclure de l'historique
+_ERROR_PREFIXES = ("⚠️", "Erreur lors du traitement")
 
 # ── ContextVar pour la queue SSE (streaming) ─────────────
 _stream_queue: contextvars.ContextVar = contextvars.ContextVar('_stream_queue', default=None)
@@ -72,20 +75,23 @@ def _step_start_msg(agent: str, task: str) -> str:
     if agent == "rh":
         if any(k in t for k in ["solde", "reste", "combien"]):
             return "🔍 Je vérifie votre solde de congés..."
-        if any(k in t for k in ["poser", "créer", "creer", "demande", "pose"]):
+        if any(k in t for k in ["poser", "créer", "creer", "pose un", "créer un", "creer un"]):
             return "📝 Je crée votre demande de congé..."
         if any(k in t for k in ["supprimer", "annuler", "retirer"]):
             return "🗑️ J'annule votre congé..."
         return "⚙️ Je traite votre demande RH..."
     if agent == "calendar":
-        if any(k in t for k in ["créer", "creer", "planifier", "réunion", "reunion", "meeting"]):
-            return "📅 Je crée votre réunion dans le calendrier..."
-        if any(k in t for k in ["modifier", "déplacer", "decaler", "annuler", "supprimer"]):
+        # Vérifier annuler/supprimer EN PREMIER pour éviter le match sur "reunion" dans "annuler cette reunion"
+        if any(k in t for k in ["annuler", "supprimer", "cancel"]):
+            return "🗑️ J'annule votre réunion..."
+        if any(k in t for k in ["modifier", "déplacer", "decaler", "reporter"]):
             return "✏️ Je modifie votre réunion..."
         if any(k in t for k in ["rétabli", "retabli", "ancienne", "restau"]):
             return "🔄 Je rétablis votre réunion..."
         if any(k in t for k in ["disponib", "vérifi", "verifie"]):
             return "🔍 Je vérifie les disponibilités..."
+        if any(k in t for k in ["créer", "creer", "planifier", "réunion", "reunion", "meeting"]):
+            return "📅 Je crée votre réunion dans le calendrier..."
         return "📅 Je consulte votre calendrier..."
     if agent == "jira":
         return "🎯 Je consulte vos tickets Jira..."
@@ -130,11 +136,29 @@ def _extract_clean_text(content: str) -> str:
         return content
 
 
+def _strip_markdown_tables(text: str) -> str:
+    """Supprime les lignes de tableau Markdown (| ... |) pour réduire les tokens."""
+    result = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        # Ignorer les lignes de tableau et les séparateurs (|---|)
+        if stripped.startswith("|"):
+            continue
+        result.append(line)
+    return "\n".join(result).strip()
+
+
 def _build_history(trimmed_messages: list) -> str:
     lines = []
     for msg in trimmed_messages[:-1]:
         role = "Utilisateur" if msg.type == "human" else "Assistant"
         clean = _extract_clean_text(msg.content)
+        # Exclure les messages d'erreur système (quota, contexte trop long...)
+        if msg.type != "human" and any(clean.startswith(p) for p in _ERROR_PREFIXES):
+            continue
+        # Supprimer les tableaux Markdown pour économiser des tokens
+        if msg.type != "human":
+            clean = _strip_markdown_tables(clean)
         if msg.type != "human" and len(clean) > MAX_AI_RESPONSE_CHARS:
             clean = clean[:MAX_AI_RESPONSE_CHARS] + "... [tronqué]"
         lines.append(f"{role}: {clean}")
@@ -147,6 +171,75 @@ def _get_step_status(plan: list, step_id: str) -> str:
         if s["step_id"] == step_id:
             return s["status"]
     return "unknown"
+
+
+_CONDITION_KEYWORDS = ["si ", "if ", "seulement si", "only if", "lorsque ", "dans le cas où"]
+
+async def _check_condition(task: str, context: str) -> bool:
+    """
+    Évalue si la condition d'un step conditionnel est remplie.
+    Retourne True → exécuter le step | False → ignorer le step.
+    Utilisé uniquement si la tâche contient un mot-clé conditionnel ET un contexte.
+    """
+    task_lower = task.lower()
+    if not any(kw in task_lower for kw in _CONDITION_KEYWORDS):
+        return True  # Pas de condition → toujours exécuter
+    if not context.strip():
+        return True  # Pas de contexte → on ne peut pas évaluer → exécuter
+
+    from langchain_core.messages import HumanMessage
+    from app.core.groq_client import invoke_with_fallback
+
+    prompt = (
+        f"Résultat de l'étape précédente :\n{context}\n\n"
+        f"Tâche conditionnelle : {task}\n\n"
+        f"D'après le résultat ci-dessus, la condition dans la tâche est-elle remplie ?\n"
+        f"Réponds UNIQUEMENT par OUI ou NON."
+    )
+    try:
+        response = await invoke_with_fallback(
+            model="openai/gpt-oss-120b",
+            messages=[HumanMessage(content=prompt)],
+            max_tokens=5,
+            temperature=0,
+        )
+        result = response.strip().lower()
+        print(f"   🔍 Évaluation condition → '{result}' pour : {task[:80]}")
+        return "oui" in result
+    except Exception as e:
+        print(f"   ⚠️ Évaluation condition échouée ({e}) → exécution par défaut")
+        return True  # En cas d'erreur → exécuter par défaut
+
+
+async def _check_google_token(user_id: int) -> tuple[bool, str]:
+    """
+    Vérifie que l'utilisateur a un token Google Calendar valide en base.
+    Retourne (ok: bool, raison: str).
+      - ok=True  → le token existe et le refresh_token est présent
+      - ok=False → token absent ou refresh_token manquant (accès révoqué)
+    """
+    try:
+        from sqlalchemy import select
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.user import GoogleOAuthToken
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(GoogleOAuthToken).where(GoogleOAuthToken.user_id == user_id)
+            )
+            token = result.scalar_one_or_none()
+
+        if token is None:
+            return False, "not_connected"
+        if not token.refresh_token:
+            return False, "no_refresh_token"
+        # Si expires_at est défini et dépassé, le refresh_token reste valable
+        # (Google invalide le refresh_token seulement si l'accès est révoqué)
+        return True, "ok"
+    except Exception as e:
+        print(f"  ⚠️ _check_google_token erreur : {e}")
+        # En cas d'erreur DB, on laisse passer (l'agent renverra son propre message)
+        return True, "db_error"
 
 
 async def _call_agent(
@@ -289,6 +382,52 @@ async def node3_executor(state: AssistantState) -> AssistantState:
                     context += f"Résultat de l'étape {dep_id} : {dep_text}\n"
 
         full_task = f"{context}{task}"
+
+        # ── Évaluation de la condition (steps conditionnels) ──
+        if deps and context:
+            condition_met = await _check_condition(task, context)
+            if not condition_met:
+                print(f"   ⏭️  {step_id} ({agent}) — condition non remplie → ignoré")
+                step["status"] = "skipped"
+                plan_results[step_id] = json.dumps({
+                    "response": "",
+                    "react_steps": []
+                }, ensure_ascii=False)
+                await _emit(queue, {
+                    "type": "step_skipped",
+                    "step_id": step_id,
+                    "agent": agent,
+                })
+                continue
+
+        # ── Guard Google Calendar : token requis ─────────────
+        if agent == "calendar":
+            token_ok, reason = await _check_google_token(user_id)
+            if not token_ok:
+                if reason == "not_connected":
+                    friendly = (
+                        "⚠️ Votre compte Google Calendar n'est pas encore connecté.\n\n"
+                        "Rendez-vous dans **Paramètres → Google Calendar** et cliquez sur "
+                        "**Connecter Google Calendar** pour autoriser l'assistant à accéder à votre agenda."
+                    )
+                else:
+                    friendly = (
+                        "⚠️ La connexion Google Calendar a expiré ou a été révoquée.\n\n"
+                        "Rendez-vous dans **Paramètres → Google Calendar** et cliquez sur "
+                        "**Reconnecter** pour renouveler l'accès."
+                    )
+                print(f"   🔒 {step_id} (calendar) — token Google absent ({reason}), step ignoré")
+                await _emit(queue, {
+                    "type": "step_unavailable",
+                    "step_id": step_id,
+                    "agent": agent,
+                    "text": friendly,
+                })
+                step["status"] = "unavailable"
+                plan_results[step_id] = json.dumps(
+                    {"response": friendly, "react_steps": []}, ensure_ascii=False
+                )
+                continue
 
         # ── Agent "chat" (traitement local) ───────────────────
         if agent == "chat":

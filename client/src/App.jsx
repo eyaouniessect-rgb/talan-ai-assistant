@@ -1,5 +1,6 @@
 // src/App.jsx
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom'
+import { useEffect } from 'react'
 import { useAuthStore } from './store'
 import Login from './pages/Login'
 import Layout from './components/layout/Layout'
@@ -23,11 +24,28 @@ function RHRoute({ children }) {
   return children
 }
 
+function GoogleOAuthHandler() {
+  const navigate = useNavigate()
+  const location = useLocation()
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    if (params.get('google_connected') === 'true') {
+      // Redirige vers settings avec un paramètre pour indiquer le succès
+      // (le Layout re-fetche le statut Google automatiquement)
+      navigate('/settings?calendar_ok=true', { replace: true })
+    }
+  }, [location.search, navigate])
+
+  return null
+}
+
 export default function App() {
   const user = useAuthStore(s => s.user)
 
   return (
     <BrowserRouter>
+      <GoogleOAuthHandler />
       <Routes>
         <Route path="/" element={user ? <Navigate to={user.role === 'rh' ? '/rh' : '/dashboard'} /> : <Login />} />
         <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>

@@ -27,7 +27,7 @@ def _to_rfc3339_end(date_str: str) -> str:
 # ─────────────────────────────────────────
 # 🔥 CHECK CONFLICTS (get-freebusy)
 # ─────────────────────────────────────────
-async def check_calendar_conflicts(start_date: str, end_date: str):
+async def check_calendar_conflicts(start_date: str, end_date: str, account_id: "str | None" = None):
     """
     Vérifie les conflits via list-events (plus fiable que get-freebusy).
     Si des événements existent sur le créneau → conflits détectés.
@@ -38,7 +38,8 @@ async def check_calendar_conflicts(start_date: str, end_date: str):
             "calendarId": "primary",
             "timeMin": _to_rfc3339(start_date),
             "timeMax": _to_rfc3339_end(end_date),
-        }
+        },
+        account_id=account_id,
     )
     print(f"[check_conflicts] raw MCP response: {data}")
 
@@ -82,14 +83,15 @@ def _trim_event(e: dict) -> dict:
 # ─────────────────────────────────────────
 # 📅 LIST EVENTS
 # ─────────────────────────────────────────
-async def get_calendar_events(start_date: str, end_date: str):
+async def get_calendar_events(start_date: str, end_date: str, account_id: "str | None" = None):
     data = await call_mcp(
         "list-events",
         {
             "calendarId": "primary",
             "timeMin": _to_rfc3339(start_date),
             "timeMax": _to_rfc3339_end(end_date),
-        }
+        },
+        account_id=account_id,
     )
     events = data.get("events", data.get("result", []))
     trimmed = [_trim_event(e) for e in events]
@@ -99,7 +101,7 @@ async def get_calendar_events(start_date: str, end_date: str):
 # ─────────────────────────────────────────
 # ➕ CREATE EVENT
 # ─────────────────────────────────────────
-async def create_meeting(title: str, start: str, end: str, attendees: list[str] | None = None, add_meet: bool = False, location: str | None = None):
+async def create_meeting(title: str, start: str, end: str, attendees: list[str] | None = None, add_meet: bool = False, location: str | None = None, account_id: "str | None" = None):
     # Reject past dates
     try:
         start_clean = start.split("T")[0] if "T" in start else start
@@ -131,7 +133,7 @@ async def create_meeting(title: str, start: str, end: str, attendees: list[str] 
             }
         }
     print(f"[create_meeting] payload → MCP: {payload}")
-    data = await call_mcp("create-event", payload)
+    data = await call_mcp("create-event", payload, account_id=account_id)
     print(f"[create_meeting] MCP response: {data}")
     return {"success": True, "event": data}
 
@@ -147,6 +149,7 @@ async def update_meeting(
     attendees: list[str] | None = None,
     remove_meet: bool = False,
     location: str | None = None,
+    account_id: "str | None" = None,
 ):
     payload: dict = {
         "calendarId": "primary",
@@ -164,17 +167,18 @@ async def update_meeting(
     if attendees is not None:
         payload["attendees"] = [{"email": email} for email in attendees]
     if remove_meet:
-        # Supprime le lien Google Meet sans recréer l'événement
-        payload["conferenceData"] = None
+        # Google Calendar API exige conferenceData={} (pas null) + conferenceDataVersion=1
+        # pour réellement supprimer la conférence
+        payload["conferenceData"] = {}
         payload["conferenceDataVersion"] = 1
-    data = await call_mcp("update-event", payload)
+    data = await call_mcp("update-event", payload, account_id=account_id)
     return {"success": True, "event": data}
 
 
 # ─────────────────────────────────────────
 # ❌ DELETE EVENT
 # ─────────────────────────────────────────
-async def delete_meeting(event_id: str):
+async def delete_meeting(event_id: str, account_id: "str | None" = None):
     try:
         data = await call_mcp(
             "delete-event",
@@ -182,7 +186,8 @@ async def delete_meeting(event_id: str):
                 "calendarId": "primary",
                 "eventId": event_id,
                 "sendUpdates": "all",
-            }
+            },
+            account_id=account_id,
         )
         print(f"[delete_meeting] MCP response: {data}")
 
@@ -240,7 +245,7 @@ def _keyword_match(event: dict, query: str) -> bool:
     # Match si le terme complet OU au moins un token est trouvé
     return q_norm in haystack or any(tok in haystack for tok in tokens)
 
-async def search_meetings(query: str):
+async def search_meetings(query: str, account_id: "str | None" = None):
     """
     Recherche en 3 tentatives :
     1. MCP search-events (terme exact)
@@ -249,7 +254,7 @@ async def search_meetings(query: str):
        et filtre par mot-clé côté Python — garantit de trouver même les titres partiels.
     """
     # ── Tentative 1 — terme original via MCP ─────────────
-    data = await call_mcp("search-events", {"query": query})
+    data = await call_mcp("search-events", {"query": query}, account_id=account_id)
     results = data.get("events", data.get("result", []))
 
     # ── Tentative 2 — variante accentuée/sans accent ──────
@@ -257,14 +262,14 @@ async def search_meetings(query: str):
         query_no_accent = _strip_accents(query)
         if query_no_accent != query:
             # Terme avec accents → essaie sans accent
-            data2 = await call_mcp("search-events", {"query": query_no_accent})
+            data2 = await call_mcp("search-events", {"query": query_no_accent}, account_id=account_id)
             results = data2.get("events", data2.get("result", [])) or results
         else:
             # Terme sans accents → essaie variante accentuée
             ACCENT_MAP = str.maketrans({'e': 'é', 'a': 'à', 'u': 'ù', 'i': 'î', 'o': 'ô'})
             accented = query.translate(ACCENT_MAP)
             if accented != query:
-                data2 = await call_mcp("search-events", {"query": accented})
+                data2 = await call_mcp("search-events", {"query": accented}, account_id=account_id)
                 results = data2.get("events", data2.get("result", [])) or results
 
     # ── Tentative 3 — fallback local sur les 60 prochains jours ──
@@ -275,6 +280,7 @@ async def search_meetings(query: str):
         all_data  = await call_mcp(
             "list-events",
             {"calendarId": "primary", "timeMin": time_min, "timeMax": time_max},
+            account_id=account_id,
         )
         all_events = all_data.get("events", all_data.get("result", []))
         results = [e for e in all_events if _keyword_match(e, query)]

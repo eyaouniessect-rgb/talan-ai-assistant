@@ -39,8 +39,9 @@ class SeniorityEnum(str, enum.Enum):
     JUNIOR    = "junior"
     MID       = "mid"
     SENIOR    = "senior"
-    LEAD      = "lead"
-    PRINCIPAL = "principal"
+    LEAD      = "lead"      # Team Lead
+    HEAD      = "head"      # Dept Head
+    PRINCIPAL = "principal" # Directeur Général
 
 
 class LeaveTypeEnum(str, enum.Enum):
@@ -124,6 +125,7 @@ class Employee(Base):
     team_id       = Column(Integer, ForeignKey("hris.teams.id"), nullable=False)
     manager_id    = Column(Integer, ForeignKey("hris.employees.id"), nullable=True)  # manager hiérarchique
     job_title     = Column(String, nullable=True)
+    phone         = Column(String(20), nullable=True)   # numéro de téléphone
     seniority     = Column(
         SAEnum(SeniorityEnum, name="seniorityenum", schema="hris", native_enum=False),
         nullable=True,
@@ -140,6 +142,7 @@ class Employee(Base):
         "Employee",
         foreign_keys="[Employee.manager_id]",
         primaryjoin="Employee.manager_id == Employee.id",
+        remote_side="Employee.id",
         uselist=False,
     )
 
