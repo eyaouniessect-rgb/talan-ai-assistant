@@ -22,7 +22,7 @@ load_dotenv()
 
 # Historique pour le contexte
 MAX_HISTORY_MESSAGES = 10
-MAX_AI_CHARS_IN_HISTORY = 600
+MAX_AI_CHARS_IN_HISTORY = 200
 
 # Fast path tokens chat-only
 _CHAT_ONLY_TOKENS = {
@@ -101,6 +101,16 @@ Ces agents sont disponibles même s'ils n'apparaissent pas dans la liste ci-dess
 - "chat" est RÉSERVÉ aux salutations et questions méta (bonjour, merci, quelle date, qui es-tu).
 - "chat" ne traite PAS les demandes métier même partielles (congé sans date, réunion sans heure, Slack...).
 - Si la demande concerne un domaine métier (congé, réunion, Slack, Jira...) → utilise l'agent métier, jamais "chat".
+
+══════════════════════════════════════════
+RÈGLE ABSOLUE — PLANIFIER UNIQUEMENT LA NOUVELLE DEMANDE
+══════════════════════════════════════════
+⚠️ L'historique est fourni UNIQUEMENT comme contexte pour comprendre la continuation.
+Tu dois planifier UNIQUEMENT la dernière demande (marquée "NOUVELLE DEMANDE À PLANIFIER").
+Les échanges précédents dans l'historique sont déjà traités — NE LES REPLANIFIE JAMAIS.
+
+Exemple INTERDIT : l'historique montre "refuser le congé de Yassine" et "récupérer les congés"
+→ NE PAS créer de steps pour ces actions passées. Planifie SEULEMENT la nouvelle demande.
 
 ══════════════════════════════════════════
 RÈGLE CONTINUATION DE CONVERSATION
@@ -215,11 +225,16 @@ def _is_gibberish(text: str) -> bool:
     return False
 
 
+_ERROR_PREFIXES = ("⚠️", "Erreur lors du traitement", "Une erreur inattendue")
+
 def _build_history_for_llm(trimmed_messages: list) -> str:
     lines = []
     for msg in trimmed_messages[:-1]:
         role = "Utilisateur" if msg.type == "human" else "Assistant"
         content = msg.content if msg.type == "human" else _extract_clean_text(msg.content)
+        # Exclure les messages d'erreur système pour ne pas gonfler le contexte
+        if msg.type != "human" and any(content.startswith(p) for p in _ERROR_PREFIXES):
+            continue
         if msg.type != "human" and len(content) > MAX_AI_CHARS_IN_HISTORY:
             content = content[:MAX_AI_CHARS_IN_HISTORY] + "..."
         lines.append(f"{role}: {content}")
@@ -359,7 +374,13 @@ async def _generate_plan(state: AssistantState) -> list[PlanStep]:
         agents_section=agents_section,
         today=today_str
     )
-    user_content = f"Historique :\n{history}\n\nMessage : {last_message}"
+    user_content = (
+        f"=== HISTORIQUE (contexte uniquement — NE PAS planifier ces échanges) ===\n"
+        f"{history}\n"
+        f"=== FIN HISTORIQUE ===\n\n"
+        f"=== NOUVELLE DEMANDE À PLANIFIER (UNIQUEMENT CELLE-CI) ===\n"
+        f"{last_message}"
+    )
 
     llm_messages = [
         SystemMessage(content=system_prompt),

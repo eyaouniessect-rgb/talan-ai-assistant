@@ -113,11 +113,13 @@ async def chat_stream(
         db.add(conversation)
         await db.flush()
         await db.commit()
-        print(f"   Nouvelle conversation créée : id={conversation.id}")
+        print(f"   🆕 [CHAT] Nouvelle conversation créée : conv_id={conversation.id} | thread_id='{conversation.id}'")
     else:
-        print(f"   Conversation existante utilisée : id={conversation.id}")
+        print(f"   ♻️  [CHAT] Conversation EXISTANTE réutilisée : conv_id={conversation.id} | thread_id='{conversation.id}'")
+        print(f"   ⚠️  [CHAT] → Le LangGraph va charger l'historique du thread '{conversation.id}' depuis PostgreSQL")
 
     thread_id = str(conversation.id)
+    print(f"   🧵 [CHAT] thread_id utilisé pour LangGraph : '{thread_id}' | conv_id_request={request.conversation_id} | is_real_id={is_real_id}")
     conversation_id = conversation.id  # capture avant le streaming
 
     # 2. Prépare les inputs du graph

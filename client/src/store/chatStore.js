@@ -87,8 +87,9 @@ export const useChatStore = create((set, get) => ({
   newConversation: () => {
     const { conversations } = get()
 
-    // Réutilise une conversation vide si elle existe
-    const emptyConv = conversations.find(c => c.loaded && c.messages.length === 0)
+    // Réutilise uniquement une conversation temporaire (ID > 1e12 = jamais persistée en base)
+    // Une conversation avec un ID réel (< 1e12) peut avoir un historique PostgreSQL → ne pas réutiliser
+    const emptyConv = conversations.find(c => c.loaded && c.messages.length === 0 && c.id > 1_000_000_000_000)
     if (emptyConv) {
       set({ activeId: emptyConv.id })
       return
@@ -115,7 +116,28 @@ export const useChatStore = create((set, get) => ({
 
   // ── Envoie un message (streaming) ─────────────────────
   sendMessage: async (text) => {
-    const currentActiveId = get().activeId
+    let currentActiveId = get().activeId
+
+    // Si aucune conversation active, en créer une localement
+    if (!currentActiveId || !get().conversations.find(c => c.id === currentActiveId)) {
+      const newId = Date.now()
+      set(s => ({
+        conversations: [
+          {
+            id: newId,
+            title: text.slice(0, 40),
+            date: 'Maintenant',
+            agents: [],
+            messageCount: 0,
+            messages: [],
+            loaded: true,
+          },
+          ...s.conversations,
+        ],
+        activeId: newId,
+      }))
+      currentActiveId = newId
+    }
 
     // 1. Ajoute le message user immédiatement (optimistic update)
     const userMsg = { role: 'user', content: text, time: now() }
@@ -224,12 +246,16 @@ export const useChatStore = create((set, get) => ({
             break
 
           case 'step_progress':
-            // Met à jour le texte affiché de l'étape en cours (tool calls internes de l'agent)
+            // Accumule les tool calls dans un historique (ne pas écraser le précédent)
             updateLastMsg(msg => ({
               ...msg,
               steps: msg.steps.map(s =>
                 s.step_id === event.step_id
-                  ? { ...s, text: event.text }
+                  ? {
+                      ...s,
+                      text: event.text,
+                      history: [...(s.history || []), event.text],
+                    }
                   : s
               ),
             }))

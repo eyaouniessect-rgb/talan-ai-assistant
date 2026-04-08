@@ -21,7 +21,7 @@ from app.database.models.hris import (
     SeniorityEnum, SkillLevelEnum,
 )
 from app.database.models.crm import Assignment
-from utils.email import send_credentials_email
+from utils.email import send_credentials_email, send_generic_email
 
 router = APIRouter(prefix="/rh", tags=["RH"])
 logger = logging.getLogger(__name__)
@@ -78,6 +78,7 @@ class TeamOut(BaseModel):
     name: str
     department: str
     manager_name: Optional[str] = None
+    manager_employee_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -87,6 +88,9 @@ class DepartmentOut(BaseModel):
     id: int
     name: str
     team_count: int
+    head_name: Optional[str] = None
+    head_job_title: Optional[str] = None
+    head_employee_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -103,13 +107,20 @@ class EmployeeOut(BaseModel):
     name: str
     email: str
     role: str
+    is_active: bool = True
     job_title: Optional[str] = None
     seniority: Optional[str] = None
+    phone: Optional[str] = None
     hire_date: Optional[str] = None
     leave_balance: int
     team: Optional[str] = None
     department: Optional[str] = None
     manager: Optional[str] = None
+    manager_employee_id: Optional[int] = None
+    manager_email: Optional[str] = None
+    manager_phone: Optional[str] = None
+    manager_job_title: Optional[str] = None
+    manager_seniority: Optional[str] = None
     skills: List[SkillOut] = []
 
 
@@ -254,14 +265,84 @@ async def list_departments(
         select(Department).options(selectinload(Department.teams))
     )
     departments = result.scalars().all()
-    return [
-        DepartmentOut(
+
+    # Charger les HEAD (un par département)
+    heads_result = await db.execute(
+        select(Employee, Team.department_id)
+        .join(Team, Employee.team_id == Team.id)
+        .where(Employee.seniority == SeniorityEnum.HEAD)
+        .options(selectinload(Employee.user))
+    )
+    # Associer chaque head à son département
+    head_by_dept: dict[int, Employee] = {}
+    for h, dept_id in heads_result.all():
+        if dept_id not in head_by_dept:
+            head_by_dept[dept_id] = h
+
+    out = []
+    for d in departments:
+        head = head_by_dept.get(d.id)
+        out.append(DepartmentOut(
             id=d.id,
             name=d.name.value if hasattr(d.name, "value") else d.name,
             team_count=len(d.teams),
+            head_name=head.user.name if head and head.user else None,
+            head_job_title=head.job_title if head else None,
+            head_employee_id=head.id if head else None,
+        ))
+    return out
+
+
+# ═══════════════════════════════════════════════════
+# GET /rh/director — Directeur Général (PRINCIPAL)
+# ═══════════════════════════════════════════════════
+
+@router.get("/director", response_model=EmployeeOut)
+async def get_director(
+    _rh: dict = Depends(require_rh),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Employee)
+        .where(Employee.seniority == SeniorityEnum.PRINCIPAL)
+        .options(
+            selectinload(Employee.user),
+            selectinload(Employee.team).selectinload(Team.department),
+            selectinload(Employee.manager).selectinload(Employee.user),
+            selectinload(Employee.employee_skills).selectinload(EmployeeSkill.skill),
         )
-        for d in departments
+        .limit(1)
+    )
+    e = result.scalar_one_or_none()
+    if not e:
+        raise HTTPException(status_code=404, detail="Directeur introuvable")
+
+    skills = [
+        SkillOut(name=es.skill.name, level=es.level.value if hasattr(es.level, "value") else es.level)
+        for es in e.employee_skills
     ]
+    return EmployeeOut(
+        id=e.id,
+        user_id=e.user_id,
+        name=e.user.name if e.user else "",
+        email=e.user.email if e.user else "",
+        role=e.user.role if e.user else "",
+        is_active=e.user.is_active if e.user else True,
+        job_title=e.job_title,
+        seniority=e.seniority.value if e.seniority and hasattr(e.seniority, "value") else e.seniority,
+        phone=e.phone,
+        hire_date=str(e.hire_date) if e.hire_date else None,
+        leave_balance=e.leave_balance or 0,
+        team=e.team.name if e.team else None,
+        department=None,
+        manager=None,
+        manager_employee_id=None,
+        manager_email=None,
+        manager_phone=None,
+        manager_job_title=None,
+        manager_seniority=None,
+        skills=skills,
+    )
 
 
 # ═══════════════════════════════════════════════════
@@ -286,12 +367,14 @@ async def list_teams(
         dept_name = (
             t.department.name.value if hasattr(t.department.name, "value") else t.department.name
         ) if t.department else None
-        manager_name = t.manager.user.name if t.manager and t.manager.user else None
+        manager_name        = t.manager.user.name if t.manager and t.manager.user else None
+        manager_employee_id = t.manager.id        if t.manager else None
         out.append(TeamOut(
             id=t.id,
             name=t.name,
             department=dept_name,
             manager_name=manager_name,
+            manager_employee_id=manager_employee_id,
         ))
     return out
 
@@ -302,10 +385,14 @@ async def list_teams(
 
 @router.get("/employees", response_model=List[EmployeeOut])
 async def list_employees(
+    department: Optional[str] = None,
+    team: Optional[str] = None,
+    seniority: Optional[str] = None,
+    exclude_management: bool = False,
     _rh: dict = Depends(require_rh),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
+    query = (
         select(Employee)
         .options(
             selectinload(Employee.user),
@@ -314,6 +401,19 @@ async def list_employees(
             selectinload(Employee.employee_skills).selectinload(EmployeeSkill.skill),
         )
     )
+    if team:
+        query = query.join(Employee.team).where(Team.name == team)
+    elif department:
+        query = query.join(Employee.team).join(Team.department).where(
+            Department.name == department
+        )
+    if seniority:
+        query = query.where(Employee.seniority == seniority)
+    elif exclude_management:
+        # Exclure HEAD et PRINCIPAL du listing équipe (ils apparaissent au niveau dept)
+        query = query.where(Employee.seniority.notin_([SeniorityEnum.HEAD, SeniorityEnum.PRINCIPAL]))
+
+    result = await db.execute(query)
     employees = result.scalars().all()
     out = []
     for e in employees:
@@ -325,7 +425,12 @@ async def list_employees(
                 if hasattr(e.team.department.name, "value")
                 else e.team.department.name
             )
-        manager_name = e.manager.user.name if e.manager and e.manager.user else None
+        manager_name        = e.manager.user.name      if e.manager and e.manager.user else None
+        manager_employee_id = e.manager.id             if e.manager else None
+        manager_email       = e.manager.user.email     if e.manager and e.manager.user else None
+        manager_phone       = e.manager.phone          if e.manager else None
+        manager_job_title   = e.manager.job_title      if e.manager else None
+        manager_seniority   = (e.manager.seniority.value if hasattr(e.manager.seniority, "value") else e.manager.seniority) if e.manager else None
         skills = [
             SkillOut(
                 name=es.skill.name,
@@ -339,16 +444,92 @@ async def list_employees(
             name=e.user.name if e.user else "",
             email=e.user.email if e.user else "",
             role=e.user.role if e.user else "",
+            is_active=e.user.is_active if e.user else True,
             job_title=e.job_title,
             seniority=e.seniority.value if e.seniority and hasattr(e.seniority, "value") else e.seniority,
+            phone=e.phone,
             hire_date=str(e.hire_date) if e.hire_date else None,
             leave_balance=e.leave_balance or 0,
             team=team_name,
             department=dept_name,
             manager=manager_name,
+            manager_employee_id=manager_employee_id,
+            manager_email=manager_email,
+            manager_phone=manager_phone,
+            manager_job_title=manager_job_title,
+            manager_seniority=manager_seniority,
             skills=skills,
         ))
     return out
+
+
+# ═══════════════════════════════════════════════════
+# GET /rh/employees/{employee_id} — Fiche d'un employé
+# ═══════════════════════════════════════════════════
+
+@router.get("/employees/{employee_id}", response_model=EmployeeOut)
+async def get_employee(
+    employee_id: int,
+    _rh: dict = Depends(require_rh),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Employee)
+        .where(Employee.id == employee_id)
+        .options(
+            selectinload(Employee.user),
+            selectinload(Employee.team).selectinload(Team.department),
+            selectinload(Employee.manager).selectinload(Employee.user),
+            selectinload(Employee.employee_skills).selectinload(EmployeeSkill.skill),
+        )
+    )
+    e = result.scalar_one_or_none()
+    if not e:
+        raise HTTPException(status_code=404, detail="Employé introuvable")
+
+    team_name = e.team.name if e.team else None
+    dept_name = None
+    if e.team and e.team.department:
+        dept_name = (
+            e.team.department.name.value
+            if hasattr(e.team.department.name, "value")
+            else e.team.department.name
+        )
+    manager_name        = e.manager.user.name      if e.manager and e.manager.user else None
+    manager_employee_id = e.manager.id             if e.manager else None
+    manager_email       = e.manager.user.email     if e.manager and e.manager.user else None
+    manager_phone       = e.manager.phone          if e.manager else None
+    manager_job_title   = e.manager.job_title      if e.manager else None
+    manager_seniority   = (e.manager.seniority.value if hasattr(e.manager.seniority, "value") else e.manager.seniority) if e.manager else None
+    skills = [
+        SkillOut(
+            name=es.skill.name,
+            level=es.level.value if hasattr(es.level, "value") else es.level,
+        )
+        for es in e.employee_skills
+    ]
+    return EmployeeOut(
+        id=e.id,
+        user_id=e.user_id,
+        name=e.user.name if e.user else "",
+        email=e.user.email if e.user else "",
+        role=e.user.role if e.user else "",
+        is_active=e.user.is_active if e.user else True,
+        job_title=e.job_title,
+        seniority=e.seniority.value if e.seniority and hasattr(e.seniority, "value") else e.seniority,
+        phone=e.phone,
+        hire_date=str(e.hire_date) if e.hire_date else None,
+        leave_balance=e.leave_balance or 0,
+        team=team_name,
+        department=dept_name,
+        manager=manager_name,
+        manager_employee_id=manager_employee_id,
+        manager_email=manager_email,
+        manager_phone=manager_phone,
+        manager_job_title=manager_job_title,
+        manager_seniority=manager_seniority,
+        skills=skills,
+    )
 
 
 # ═══════════════════════════════════════════════════
@@ -391,6 +572,19 @@ class LeaveOut(BaseModel):
 
 class RejectBody(BaseModel):
     reason: Optional[str] = None
+
+
+class UpdateEmployeeRequest(BaseModel):
+    job_title:   Optional[str] = None
+    seniority:   Optional[str] = None   # junior | mid | senior | lead | principal
+    team_id:     Optional[int] = None
+    manager_id:  Optional[int] = None   # employee id du manager
+
+
+class ContactEmailRequest(BaseModel):
+    subject:    str
+    body:       str
+    cc_emails:  List[str] = []
 
 
 # ═══════════════════════════════════════════════════
@@ -493,3 +687,102 @@ async def reject_leave(
     ))
     await db.commit()
     return {"success": True, "status": "rejected"}
+
+
+# ═══════════════════════════════════════════════════
+# PATCH /rh/employees/{employee_id} — Modifier un employé
+# ═══════════════════════════════════════════════════
+
+@router.patch("/employees/{employee_id}")
+async def update_employee(
+    employee_id: int,
+    body: UpdateEmployeeRequest,
+    _rh: dict = Depends(require_rh),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Employee)
+        .options(selectinload(Employee.user), selectinload(Employee.team))
+        .where(Employee.id == employee_id)
+    )
+    employee = result.scalar_one_or_none()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employé introuvable")
+
+    if body.job_title is not None:
+        employee.job_title = body.job_title
+    if body.seniority is not None:
+        try:
+            employee.seniority = SeniorityEnum(body.seniority)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Seniority invalide : {body.seniority}")
+    if body.team_id is not None:
+        team_result = await db.execute(select(Team).where(Team.id == body.team_id))
+        if not team_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Équipe introuvable")
+        employee.team_id = body.team_id
+    if body.manager_id is not None:
+        mgr_result = await db.execute(select(Employee).where(Employee.id == body.manager_id))
+        if not mgr_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Manager introuvable")
+        employee.manager_id = body.manager_id
+
+    db.add(employee)
+    await db.commit()
+    await db.refresh(employee)
+    return {"success": True, "employee_id": employee.id}
+
+
+# ═══════════════════════════════════════════════════
+# POST /rh/employees/{employee_id}/contact — Envoyer email à un employé
+# ═══════════════════════════════════════════════════
+
+@router.post("/employees/{employee_id}/contact")
+async def contact_employee(
+    employee_id: int,
+    body: ContactEmailRequest,
+    _rh: dict = Depends(require_rh),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Employee)
+        .options(selectinload(Employee.user))
+        .where(Employee.id == employee_id)
+    )
+    employee = result.scalar_one_or_none()
+    if not employee or not employee.user:
+        raise HTTPException(status_code=404, detail="Employé introuvable")
+
+    try:
+        send_generic_email(
+            to_email=employee.user.email,
+            subject=body.subject,
+            body=body.body,
+            cc_emails=body.cc_emails,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur envoi email : {str(e)}")
+
+    return {"success": True, "sent_to": employee.user.email}
+
+
+# ═══════════════════════════════════════════════════
+# PATCH /rh/users/{user_id}/toggle-active — Activer/Désactiver un compte
+# ═══════════════════════════════════════════════════
+
+@router.patch("/users/{user_id}/toggle-active")
+async def toggle_user_active(
+    user_id: int,
+    _rh: dict = Depends(require_rh),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+
+    user.is_active = not user.is_active
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return {"success": True, "user_id": user.id, "is_active": user.is_active}

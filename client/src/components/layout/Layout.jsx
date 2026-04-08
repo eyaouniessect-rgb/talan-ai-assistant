@@ -1,9 +1,64 @@
-import { useState } from 'react'
-import { Outlet, useLocation } from 'react-router-dom'
+import { useState, useEffect } from 'react'
+import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import Sidebar from './Sidebar'
-import { Bell, Menu, Search } from 'lucide-react'
+import { Bell, Menu, Search, Calendar, X, AlertTriangle } from 'lucide-react'
 import { useAuthStore, useNotifStore } from '../../store'
-import { useNavigate } from 'react-router-dom'
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
+function GoogleCalendarBanner({ token, onDismiss }) {
+  const [status, setStatus] = useState(null) // null | object
+  const nav = useNavigate()
+
+  useEffect(() => {
+    if (!token) return
+    fetch(`${API_BASE}/auth/google/status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(setStatus)
+      .catch(() => {})
+  }, [token])
+
+  // Pas de bannière si statut inconnu ou si déjà connecté (sans révocation)
+  if (!status) return null
+  if (status.connected && !status.needs_reconnect) return null
+
+  const isRevoked   = status.needs_reconnect
+  const bgClass     = isRevoked ? 'bg-amber-50 border-amber-200' : 'bg-cyan/5 border-cyan/20'
+  const iconClass   = isRevoked ? 'text-amber-500' : 'text-cyan'
+  const textClass   = isRevoked ? 'text-amber-800' : 'text-navy'
+  const subClass    = isRevoked ? 'text-amber-600' : 'text-slate-500'
+  const btnClass    = isRevoked
+    ? 'bg-amber-500 hover:bg-amber-600 text-white'
+    : 'bg-cyan hover:bg-cyan/90 text-white'
+
+  const message = isRevoked
+    ? 'La connexion Google Calendar a expiré. Reconnectez votre compte pour continuer à gérer votre agenda.'
+    : 'Connectez votre Google Calendar pour utiliser les fonctions agenda de l\'assistant.'
+
+  return (
+    <div className={`border-b px-5 py-2.5 flex items-center gap-3 shrink-0 ${bgClass}`}>
+      {isRevoked
+        ? <AlertTriangle size={16} className={iconClass + ' shrink-0'} />
+        : <Calendar size={16} className={iconClass + ' shrink-0'} />
+      }
+      <span className={`text-xs flex-1 ${subClass}`}>{message}</span>
+      <button
+        onClick={() => nav('/settings')}
+        className={`text-xs px-3 py-1.5 rounded-lg font-medium shrink-0 transition-colors ${btnClass}`}
+      >
+        {isRevoked ? 'Reconnecter' : 'Connecter Google Calendar'}
+      </button>
+      <button
+        onClick={onDismiss}
+        className="text-slate-400 hover:text-slate-600 shrink-0 transition-colors"
+      >
+        <X size={14} />
+      </button>
+    </div>
+  )
+}
 
 const PAGE_TITLES = {
   '/dashboard': 'Dashboard',
@@ -16,13 +71,25 @@ const PAGE_TITLES = {
 
 export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [bannerDismissed, setBannerDismissed] = useState(false)
   const location = useLocation()
-  const user = useAuthStore(s => s.user)
+  const user  = useAuthStore(s => s.user)
+  const token = useAuthStore(s => s.token)
   const notifications = useNotifStore(s => s.notifications)
   const unread = notifications.filter(n=>!n.read).length
   const nav = useNavigate()
 
   const title = PAGE_TITLES[location.pathname] || 'Talan Assistant'
+
+  // Réinitialise la bannière quand l'utilisateur change de compte
+  useEffect(() => {
+    setBannerDismissed(false)
+  }, [user?.id])
+
+  // Masquer la bannière sur la page Settings (l'utilisateur est déjà en train de configurer)
+  const showBanner = !bannerDismissed
+    && user?.role !== 'rh'
+    && location.pathname !== '/settings'
 
   return (
     <div className="flex h-screen bg-slate-50 overflow-hidden">
@@ -56,6 +123,14 @@ export default function Layout() {
             </div>
           </div>
         </header>
+
+        {/* Bannière Google Calendar — si non connecté et pas sur /settings */}
+        {showBanner && (
+          <GoogleCalendarBanner
+            token={token}
+            onDismiss={() => setBannerDismissed(true)}
+          />
+        )}
 
         <main className="flex-1 overflow-auto">
           <Outlet/>

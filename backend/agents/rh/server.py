@@ -14,11 +14,13 @@ from a2a.server.tasks import InMemoryTaskStore
 from agents.rh.agent import RHAgentExecutor
 from agents.rh.schemas import build_agent_card
 from agents.shared.auth_middleware import A2AAuthMiddleware
+from app.core.groq_client import set_agent_offset
 
 
 def main() -> None:
     print("Starting RHAgent A2A Server...")
     load_dotenv()
+    set_agent_offset(0)  # RH agent : clés 1-8 (offset 0)
 
     HOST = os.getenv("AGENT_HOST", "localhost")
     PORT = int(os.getenv("AGENT_RH_PORT", 8001))
