@@ -4,23 +4,33 @@ from alembic import context
 import sys
 import os
 
-# ── Fix du path — pointe vers la racine du projet ────────
-# __file__ = backend/app/database/migrations/env.py
-# on remonte 4 niveaux pour arriver à backend/
+# Fix du path — pointe vers la racine backend/
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')))
 
-# ── Import Base + TOUS les modèles ────────────────────────
+# Import unique via models/__init__.py — tous les modèles sont enregistrés sur Base.metadata
+# Alembic détecte uniquement les modèles importés ici, d'où l'import global
 from app.database.connection import Base
-from app.database.models.user import User
-from app.database.models.hris import Employee, Leave, Team
-from app.database.models.crm import Client, Project
-from app.database.models.permissions import Permission
-from app.database.models.chat import Conversation, Message
+from app.database.models import (
+    # public
+    User, GoogleOAuthToken, Conversation, Message, Permission,
+    # hris
+    Department, Team, Employee,
+    Skill, EmployeeSkill,
+    Leave, LeaveLog,
+    CalendarEvent, CalendarEventLog,
+    # crm
+    Client, Project, Assignment,
+    # project_management
+    PipelineState,
+    Epic, UserStory, StoryDependency,
+    Sprint, Task, TaskDependency,
+)
 
 config = context.config
 fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
 
 def run_migrations_offline():
     url = config.get_main_option("sqlalchemy.url")
@@ -32,6 +42,7 @@ def run_migrations_offline():
     )
     with context.begin_transaction():
         context.run_migrations()
+
 
 def run_migrations_online():
     connectable = engine_from_config(
@@ -46,6 +57,7 @@ def run_migrations_online():
         )
         with context.begin_transaction():
             context.run_migrations()
+
 
 if context.is_offline_mode():
     run_migrations_offline()

@@ -1,6 +1,6 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import { useAuthStore, useNotifStore } from '../../store'
-import { LayoutDashboard, MessageSquare, Clock, Bell, Settings, Rocket, LogOut, Zap, X, ShieldCheck } from 'lucide-react'
+import { LayoutDashboard, MessageSquare, Clock, Bell, Settings, Rocket, LogOut, Zap, X, ShieldCheck, FolderOpen } from 'lucide-react'
 import clsx from 'clsx'
 
 const NAV = [
@@ -79,12 +79,19 @@ export default function Sidebar({ open, onClose }) {
           ))}
 
           {isPM && (
-            <NavLink to="/nouveau-projet" onClick={onClose}
-              className={({isActive}) => clsx('sidebar-item mt-2', isActive && 'active')}>
-              <Rocket size={18} className="shrink-0"/>
-              <span className="flex-1">Nouveau Projet</span>
-              <span className="text-xs bg-cyan/10 text-cyan px-1.5 py-0.5 rounded-md font-medium">PM</span>
-            </NavLink>
+            <>
+              <NavLink to="/mes-projets" onClick={onClose}
+                className={({isActive}) => clsx('sidebar-item mt-2', isActive && 'active')}>
+                <FolderOpen size={18} className="shrink-0"/>
+                <span className="flex-1">Mes Projets</span>
+                <span className="text-xs bg-cyan/10 text-cyan px-1.5 py-0.5 rounded-md font-medium">PM</span>
+              </NavLink>
+              <NavLink to="/nouveau-projet" onClick={onClose}
+                className={({isActive}) => clsx('sidebar-item', isActive && 'active')}>
+                <Rocket size={18} className="shrink-0"/>
+                <span className="flex-1">Nouveau Projet</span>
+              </NavLink>
+            </>
           )}
 
           {isRH && (

@@ -11,17 +11,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.orchestrator.graph import init_graph
-from app.api.auth import router as auth_router
-from app.api.chat import router as chat_router
-from app.api.events import router as events_router
-from app.api.rh import router as rh_router
-from app.api.google_oauth import router as google_oauth_router
+from agents.pm.graph import init_pm_graph
+
+# Imports des routers depuis la nouvelle structure api/ (sous-dossiers par domaine)
+from app.api.auth.login import router as auth_router
+from app.api.auth.google_oauth import router as google_oauth_router
+from app.api.chat.chat import router as chat_router
+from app.api.rh.rh import router as rh_router
+from app.api.events.events import router as events_router
+from app.api.crm.crm import router as crm_router
+from app.api.documents.documents import router as documents_router
+from app.api.pipeline.pipeline import router as pipeline_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Démarrage ──────────────────────────────────────
-    await init_graph()
+    await init_graph()       # orchestrateur conversationnel
+    await init_pm_graph()    # pipeline PM (12 phases)
     yield
     # ── Arrêt ──────────────────────────────────────────
     print("🛑 Arrêt du serveur.")
@@ -46,6 +53,9 @@ app.include_router(chat_router)
 app.include_router(events_router)
 app.include_router(rh_router)
 app.include_router(google_oauth_router)
+app.include_router(crm_router)
+app.include_router(documents_router)
+app.include_router(pipeline_router)
 
 @app.get("/health")
 async def health():

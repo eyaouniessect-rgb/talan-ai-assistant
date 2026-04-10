@@ -9,6 +9,8 @@ import Chat from './pages/Chat'
 import Historique from './pages/Historique'
 import Notifications from './pages/Notifications'
 import NouveauProjet from './pages/NouveauProjet'
+import MesProjets from './pages/MesProjets'
+import PipelineDetail from './pages/PipelineDetail'
 import Settings from './pages/Settings'
 import RHPage from './pages/rh/RHPage'
 
@@ -54,6 +56,8 @@ export default function App() {
           <Route path="historique" element={<Historique />} />
           <Route path="notifications" element={<Notifications />} />
           <Route path="nouveau-projet" element={<NouveauProjet />} />
+          <Route path="mes-projets" element={<MesProjets />} />
+          <Route path="projet/:id" element={<PipelineDetail />} />
           <Route path="settings" element={<Settings />} />
           <Route path="rh" element={<RHRoute><RHPage /></RHRoute>} />
         </Route>

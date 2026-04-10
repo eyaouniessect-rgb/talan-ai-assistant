@@ -6,7 +6,7 @@
 # ═══════════════════════════════════════════════════════════
 from sqlalchemy import select
 from app.database.connection import AsyncSessionLocal
-from app.database.models.permissions import Permission
+from app.database.models.public.permission import Permission
 
 
 async def check_tool_permission(role: str, tool_name: str) -> bool:

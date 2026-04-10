@@ -13,7 +13,7 @@ from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import selectinload
 from app.database.connection import AsyncSessionLocal
 from app.database.models.hris import Leave, Employee, Team, Department, LeaveLog, SeniorityEnum, EmployeeSkill, Skill
-from app.database.models.user import User
+from app.database.models.public.user import User
 from agents.rh.schemas import (
     CreateLeaveRequest,
     LeaveResponse,
