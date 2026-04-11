@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database.connection import AsyncSessionLocal
-from app.database.models.user import User
+from app.database.models.public.user import User
 from app.database.models.hris import Employee, Team
 from app.core.security import hash_password
 

@@ -369,7 +369,7 @@ async def lookup_user_by_name(name: str) -> str:
     try:
         from sqlalchemy import select, or_
         from app.database.connection import AsyncSessionLocal
-        from app.database.models.user import User
+        from app.database.models.public.user import User
 
         async with AsyncSessionLocal() as session:
             search = f"%{name.lower()}%"
@@ -402,7 +402,7 @@ async def get_my_manager() -> str:
         from sqlalchemy import select
         from app.database.connection import AsyncSessionLocal
         from app.database.models.hris import Employee
-        from app.database.models.user import User
+        from app.database.models.public.user import User
 
         if not _current_user_id:
             return json.dumps({"error": "user_id non disponible"}, ensure_ascii=False)

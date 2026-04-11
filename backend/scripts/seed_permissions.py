@@ -9,7 +9,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database.connection import AsyncSessionLocal
-from app.database.models.permissions import Permission
+from app.database.models.public.permission import Permission
 
 PERMISSIONS = [
     # ═══════════════════════════════════════════════════

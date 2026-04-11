@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from passlib.context import CryptContext
 from sqlalchemy import text
 from app.database.connection import AsyncSessionLocal
-from app.database.models.user import User
+from app.database.models.public.user import User
 from app.database.models.hris import (
     Department, Team, Employee, Skill, EmployeeSkill,
     DepartmentEnum, SeniorityEnum, SkillLevelEnum,
