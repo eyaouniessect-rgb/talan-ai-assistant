@@ -126,11 +126,11 @@ async def upload_document(
         )
 
     # ── 5. Sauvegarde sur disque ──────────────────────────────
-    project_dir = _DOCS_ROOT / str(project_id)
-    project_dir.mkdir(parents=True, exist_ok=True)
+    cdc_dir = _DOCS_ROOT / "cdc"
+    cdc_dir.mkdir(parents=True, exist_ok=True)
 
     safe_filename = f"{uuid.uuid4().hex[:8]}_{filename}"
-    file_path     = str(project_dir / safe_filename)
+    file_path     = str(cdc_dir / safe_filename)
 
     with open(file_path, "wb") as f:
         f.write(file_bytes)

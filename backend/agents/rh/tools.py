@@ -176,21 +176,24 @@ async def get_my_leaves(user_id: int, status_filter: str = None) -> dict:
         }
 
 
-async def get_team_availability(user_id: int) -> dict:
+async def get_team_availability(
+    user_id: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
     """
     Retourne la disponibilité des membres de l'équipe de l'utilisateur.
+    start_date / end_date : période à vérifier (YYYY-MM-DD). Par défaut : aujourd'hui.
     """
+    from datetime import date as date_type
     async with AsyncSessionLocal() as db:
-        # Trouve l'équipe de l'employé
         result = await db.execute(
             select(Employee).where(Employee.user_id == user_id)
         )
         employee = result.scalar_one_or_none()
-
         if not employee:
             return {"error": "Employé introuvable"}
 
-        # Trouve tous les membres de la même équipe
         result = await db.execute(
             select(Employee, User)
             .join(User, Employee.user_id == User.id)
@@ -198,21 +201,26 @@ async def get_team_availability(user_id: int) -> dict:
         )
         members = result.all()
 
-        today = date.today()
+        # Période à vérifier
+        try:
+            check_start = date_type.fromisoformat(start_date) if start_date else date.today()
+            check_end   = date_type.fromisoformat(end_date)   if end_date   else date.today()
+        except ValueError:
+            check_start = check_end = date.today()
 
-        # Vérifie si chaque membre a un congé en cours (exclut l'utilisateur demandeur)
         availability = []
         for emp, user in members:
             if emp.user_id == user_id:
-                continue  # Ne pas inclure soi-même dans la liste d'équipe
+                continue
             if emp.seniority == SeniorityEnum.PRINCIPAL:
-                continue  # Exclut le directeur
+                continue
+            # Congé approuvé qui chevauche la période demandée
             result = await db.execute(
                 select(Leave).where(
                     and_(
                         Leave.employee_id == emp.id,
-                        Leave.start_date <= today,
-                        Leave.end_date >= today,
+                        Leave.start_date <= check_end,
+                        Leave.end_date   >= check_start,
                         Leave.status == "approved",
                     )
                 )
@@ -220,30 +228,34 @@ async def get_team_availability(user_id: int) -> dict:
             active_leave = result.scalar_one_or_none()
 
             availability.append({
-                "name": user.name,
-                "email": user.email,
-                "available": active_leave is None,
-                "on_leave": active_leave is not None,
-                "leave_end_date": str(active_leave.end_date) if active_leave else None,
+                "name":           user.name,
+                "email":          user.email,
+                "available":      active_leave is None,
+                "on_leave":       active_leave is not None,
+                "leave_start_date": str(active_leave.start_date) if active_leave else None,
+                "leave_end_date": str(active_leave.end_date)     if active_leave else None,
             })
 
         return {
-            "success": True,
-            "team_id": employee.team_id,
-            "members": availability,
+            "success":    True,
+            "team_id":    employee.team_id,
+            "period":     {"start": str(check_start), "end": str(check_end)},
+            "members":    availability,
         }
 
 
-async def get_team_availability_by_name(team_name: str) -> dict:
+async def get_team_availability_by_name(
+    team_name: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
     """
     Retourne la disponibilité des membres d'une équipe par son nom (ou département).
-    Exemple : team_name="Salesforce" ou team_name="Data"
+    start_date / end_date : période à vérifier (YYYY-MM-DD). Par défaut : aujourd'hui.
     """
+    from datetime import date as date_type
     async with AsyncSessionLocal() as db:
-        # Cherche l'équipe par nom (insensible à la casse)
-        result = await db.execute(
-            select(Team)
-        )
+        result = await db.execute(select(Team))
         all_teams = result.scalars().all()
 
         matched_team = None
@@ -256,7 +268,6 @@ async def get_team_availability_by_name(team_name: str) -> dict:
         if not matched_team:
             return {"error": f"Équipe '{team_name}' introuvable", "available_teams": [t.name for t in all_teams]}
 
-        # Membres de cette équipe
         result = await db.execute(
             select(Employee, User)
             .join(User, Employee.user_id == User.id)
@@ -264,35 +275,43 @@ async def get_team_availability_by_name(team_name: str) -> dict:
         )
         members = result.all()
 
-        today = date.today()
+        # Période à vérifier
+        try:
+            check_start = date_type.fromisoformat(start_date) if start_date else date.today()
+            check_end   = date_type.fromisoformat(end_date)   if end_date   else date.today()
+        except ValueError:
+            check_start = check_end = date.today()
+
         availability = []
         for emp, user in members:
             if emp.seniority == SeniorityEnum.PRINCIPAL:
-                continue  # Exclut le directeur
+                continue
             result = await db.execute(
                 select(Leave).where(
                     and_(
                         Leave.employee_id == emp.id,
-                        Leave.start_date <= today,
-                        Leave.end_date >= today,
+                        Leave.start_date <= check_end,
+                        Leave.end_date   >= check_start,
                         Leave.status == "approved",
                     )
                 )
             )
             active_leave = result.scalar_one_or_none()
             availability.append({
-                "name": user.name,
-                "email": user.email,
-                "available": active_leave is None,
-                "on_leave": active_leave is not None,
-                "leave_end_date": str(active_leave.end_date) if active_leave else None,
+                "name":           user.name,
+                "email":          user.email,
+                "available":      active_leave is None,
+                "on_leave":       active_leave is not None,
+                "leave_start_date": str(active_leave.start_date) if active_leave else None,
+                "leave_end_date": str(active_leave.end_date)     if active_leave else None,
             })
 
         return {
-            "success": True,
+            "success":   True,
             "team_name": matched_team.name,
-            "team_id": matched_team.id,
-            "members": availability,
+            "team_id":   matched_team.id,
+            "period":    {"start": str(check_start), "end": str(check_end)},
+            "members":   availability,
         }
 
 
@@ -318,8 +337,12 @@ async def get_team_stack(
             select(Employee).where(Employee.user_id == user_id)
         )
         employee = result.scalar_one_or_none()
-        if not employee:
+
+        # RH/PM sans profil employé → autorisé en mode entreprise uniquement
+        if not employee and caller_role not in ("rh", "pm"):
             return {"error": "Employé introuvable"}
+        if not employee and (caller_role in ("rh", "pm")) and my_team_only:
+            return {"error": "Profil employé requis pour filtrer par 'mon équipe'."}
 
         # ── 2. Construit la requête selon le scope ────────────────────────
         query = (
@@ -331,7 +354,7 @@ async def get_team_stack(
             )
         )
 
-        if caller_role == "consultant" or (my_team_only is True):
+        if (caller_role == "consultant" or my_team_only is True) and employee:
             # Scope restreint : son équipe uniquement
             query = query.where(Employee.team_id == employee.team_id)
         else:
@@ -788,24 +811,16 @@ async def approve_leave_request(employee_name: str) -> dict:
 
         # Envoie un email de notification à l'employé
         try:
-            from utils.email import send_generic_email
+            from utils.email import send_leave_approved_email
+            cc = [manager_email] if manager_email else []
             for lv_info in approved:
-                body = (
-                    f"Bonjour {user.name.split()[0]},\n\n"
-                    f"Votre demande de congé a été approuvée ✅\n\n"
-                    f"  Du    : {lv_info['start_date']}\n"
-                    f"  Au    : {lv_info['end_date']}\n"
-                    f"  Durée : {lv_info['days_count']} jour(s) ouvré(s)\n\n"
-                )
-                if manager_name:
-                    body += f"Votre manager {manager_name} a été notifié.\n\n"
-                body += "Cordialement,\nL'équipe RH — Talan Tunisie"
-
-                cc = [manager_email] if manager_email else []
-                send_generic_email(
+                send_leave_approved_email(
                     to_email=user.email,
-                    subject="Votre congé a été approuvé — Talan",
-                    body=body,
+                    employee_name=user.name,
+                    start_date=lv_info["start_date"],
+                    end_date=lv_info["end_date"],
+                    days_count=lv_info["days_count"],
+                    manager_name=manager_name,
                     cc_emails=cc,
                 )
         except Exception as e:
@@ -895,25 +910,17 @@ async def reject_leave_request(employee_name: str, reason: str = "") -> dict:
 
         # Envoie un email de notification à l'employé
         try:
-            from utils.email import send_generic_email
+            from utils.email import send_leave_rejected_email
+            cc = [manager_email] if manager_email else []
             for lv_info in rejected:
-                body = (
-                    f"Bonjour {user.name.split()[0]},\n\n"
-                    f"Votre demande de congé n'a pas pu être approuvée ❌\n\n"
-                    f"  Du    : {lv_info['start_date']}\n"
-                    f"  Au    : {lv_info['end_date']}\n"
-                    f"  Durée : {lv_info['days_count']} jour(s) ouvré(s)\n"
-                    f"  Motif : {reason_text}\n\n"
-                )
-                if manager_name:
-                    body += f"Votre manager {manager_name} a été informé.\n\n"
-                body += "Pour toute question, contactez l'équipe RH.\n\nCordialement,\nL'équipe RH — Talan Tunisie"
-
-                cc = [manager_email] if manager_email else []
-                send_generic_email(
+                send_leave_rejected_email(
                     to_email=user.email,
-                    subject="Votre demande de congé n'a pas été approuvée — Talan",
-                    body=body,
+                    employee_name=user.name,
+                    start_date=lv_info["start_date"],
+                    end_date=lv_info["end_date"],
+                    days_count=lv_info["days_count"],
+                    reason=reason_text,
+                    manager_name=manager_name,
                     cc_emails=cc,
                 )
         except Exception as e:

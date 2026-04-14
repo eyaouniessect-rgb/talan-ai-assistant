@@ -57,3 +57,10 @@ class PipelineStatusEnum(str, enum.Enum):
     PENDING_VALIDATION = "pending_validation" # l'IA a terminé, en attente du PM
     VALIDATED          = "validated"          # PM a approuvé → phase suivante débloquée
     REJECTED           = "rejected"           # PM a refusé → l'IA doit retravailler
+
+
+class ProjectGlobalStatus(str, enum.Enum):
+    NOT_STARTED   = "not_started"   # projet créé, aucune phase lancée
+    IN_PROGRESS   = "in_progress"   # pipeline en cours (IA génère ou PM valide)
+    PENDING_HUMAN = "pending_human" # une phase attend la validation du PM
+    COMPLETED     = "completed"     # 12/12 phases validées

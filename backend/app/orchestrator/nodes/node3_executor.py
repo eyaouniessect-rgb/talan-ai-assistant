@@ -39,7 +39,7 @@ from app.orchestrator.utils import (
 # Paramètres de l'historique
 # ─────────────────────────────────────────────
 
-MAX_HISTORY = 10   # Nombre de messages conservés pour le contexte A2A
+MAX_HISTORY = 15   # Nombre de messages conservés pour le contexte A2A
 
 
 # ─────────────────────────────────────────────

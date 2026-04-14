@@ -23,6 +23,7 @@
 
 from datetime import datetime
 from typing import Optional
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -35,7 +36,7 @@ from app.database.connection import get_db
 from app.database.models.crm.project import Project
 from app.database.models.pm.pipeline_state import PipelineState
 from app.database.models.pm.project_document import ProjectDocument
-from app.database.models.pm.enums import PipelineStatusEnum
+from app.database.models.pm.enums import PipelineStatusEnum, ProjectGlobalStatus
 
 from agents.pm.graph import get_pm_graph
 from agents.pm.db import (
@@ -47,6 +48,8 @@ from agents.pm.state import PMPipelineState
 
 router = APIRouter(prefix="/pipeline", tags=["Pipeline PM"])
 
+_JIRA_ENABLED = bool(os.getenv("JIRA_BASE_URL") and os.getenv("JIRA_API_TOKEN"))
+
 
 # ──────────────────────────────────────────────────────────────
 # RBAC
@@ -56,6 +59,16 @@ async def require_pm(current_user: dict = Depends(get_current_user)) -> dict:
     if current_user["role"] != "pm":
         raise HTTPException(status_code=403, detail="Accès réservé aux Project Managers.")
     return current_user
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/config — Configuration publique du pipeline
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/config")
+async def get_pipeline_config():
+    """Retourne la configuration du pipeline visible par le frontend."""
+    return {"jira_enabled": _JIRA_ENABLED}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -101,17 +114,20 @@ async def list_pipeline_projects(
                 current_status = p.status.value if p.status else None
                 break
 
-        # Statut global du projet
+        # Statut global du projet (calculé depuis les phases pipeline)
         if phases_done == 12:
-            global_status = "completed"
-        elif current_status == "pending_validation":
-            global_status = "pending_human"
-        elif current_status == "rejected":
-            global_status = "rejected"
+            global_status = ProjectGlobalStatus.COMPLETED
+        elif any(p.status == PipelineStatusEnum.PENDING_VALIDATION for p in phases):
+            global_status = ProjectGlobalStatus.PENDING_HUMAN
         elif phases_done > 0 or current_status:
-            global_status = "in_progress"
+            global_status = ProjectGlobalStatus.IN_PROGRESS
         else:
-            global_status = "not_started"
+            global_status = ProjectGlobalStatus.NOT_STARTED
+
+        # Synchroniser project.status en DB si différent
+        if project.status != global_status.value:
+            project.status = global_status.value
+            await db.commit()
 
         result.append({
             "project_id":     project.id,
@@ -196,6 +212,16 @@ async def start_pipeline(
             "Uploadez un CDC via POST /projects/{id}/document."
         )
 
+    # ── 3. Valider la clé Jira si Jira est activé ────────────
+    # Priorité : body → clé déjà stockée en DB (relancement du pipeline)
+    resolved_jira_key = (body.jira_project_key or "").strip() or (proj.jira_project_key or "")
+    if _JIRA_ENABLED and not resolved_jira_key:
+        raise HTTPException(
+            400,
+            "La clé du projet Jira est obligatoire (ex: TALAN). "
+            "Renseignez-la dans le champ 'Clé Jira' de l'étape Lancement."
+        )
+
     # ── 3. Vérifier que le graph PM est initialisé ────────────
     pm_graph = get_pm_graph()
     if pm_graph is None:
@@ -209,6 +235,7 @@ async def start_pipeline(
         "user_id":             user_id,
         "document_id":         body.document_id,
         "cdc_text":            "",           # rempli par node_extraction
+        "security_scan":       None,         # rempli par node_extraction
         # Phases — vides au départ
         "epics":               [],
         "stories":             [],
@@ -230,7 +257,7 @@ async def start_pipeline(
         "validation_status":   "pending_ai",
         "human_feedback":      None,
         # Jira
-        "jira_project_key":    body.jira_project_key or "",
+        "jira_project_key":    resolved_jira_key,
         "jira_epic_map":       {},
         "jira_story_map":      {},
         "jira_task_map":       {},
@@ -240,8 +267,13 @@ async def start_pipeline(
         "error":               None,
     }
 
-    # ── 5. Lancement du graph ─────────────────────────────────
-    config = {"configurable": {"thread_id": str(project_id)}}
+    # ── 5. Persistance de la clé Jira + statut projet ─────────
+    proj.jira_project_key = resolved_jira_key or None
+    proj.status           = ProjectGlobalStatus.IN_PROGRESS.value
+    await db.commit()
+
+    # Préfixe "pm_" pour éviter les collisions avec les threads de chat
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
     try:
         await pm_graph.ainvoke(initial_state, config=config)
     except Exception as e:
@@ -304,9 +336,10 @@ async def get_project_pipeline(
         })
 
     return {
-        "project_id":   project_id,
-        "project_name": proj.name,
-        "phases":       phase_list,
+        "project_id":       project_id,
+        "project_name":     proj.name,
+        "jira_project_key": proj.jira_project_key,
+        "phases":           phase_list,
     }
 
 
@@ -361,7 +394,7 @@ async def validate_phase(
         raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
 
     validation_status = "validated" if body.approved else "rejected"
-    config = {"configurable": {"thread_id": str(project_id)}}
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
 
     await pm_graph.aupdate_state(
         config,
@@ -377,6 +410,21 @@ async def validate_phase(
     except Exception as e:
         if "GraphInterrupt" not in type(e).__name__:
             raise HTTPException(500, f"Erreur lors de la reprise du pipeline : {str(e)}")
+
+    # Mettre à jour project.status si toutes les phases sont validées
+    all_phases = await get_all_pipeline_states(project_id)
+    validated_count = sum(1 for p in all_phases if p.status == PipelineStatusEnum.VALIDATED)
+    has_pending     = any(p.status == PipelineStatusEnum.PENDING_VALIDATION for p in all_phases)
+
+    proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+    if proj:
+        if validated_count == 12:
+            proj.status = ProjectGlobalStatus.COMPLETED.value
+        elif has_pending:
+            proj.status = ProjectGlobalStatus.PENDING_HUMAN.value
+        else:
+            proj.status = ProjectGlobalStatus.IN_PROGRESS.value
+        await db.commit()
 
     return {
         "project_id": project_id,

@@ -18,8 +18,8 @@ export default function Login() {
     setLoading(true);
     try {
       await login(email, password);
-      const { user } = useAuthStore.getState()
-      nav(user?.role === 'rh' ? '/rh' : '/dashboard')
+      const { user } = useAuthStore.getState();
+      nav(user?.role === "rh" ? "/rh" : "/dashboard");
     } catch (err) {
       setError("Email ou mot de passe incorrect.");
     } finally {
@@ -29,9 +29,9 @@ export default function Login() {
 
   const DEMO_PASSWORD = "Talan2026!";
   const DEMO_ACCOUNTS = {
-    rh:         "ons.rh.talan@gmail.com",
+    rh: "ons.rh.talan@gmail.com",
     consultant: "eyaouniessect@gmail.com",
-    manager:    "imen.ayari@talan.tn",
+    manager: "bella.totaayouta@gmail.com",
   };
 
   const quickLogin = async (role) => {
@@ -43,7 +43,9 @@ export default function Login() {
       const { user } = useAuthStore.getState();
       nav(user?.role === "rh" ? "/rh" : "/dashboard");
     } catch {
-      setError("Connexion demo échouée — vérifiez que ce compte existe en base.");
+      setError(
+        "Connexion demo échouée — vérifiez que ce compte existe en base.",
+      );
     } finally {
       setLoading(false);
     }
@@ -206,7 +208,7 @@ export default function Login() {
               >
                 <div className="font-medium mb-0.5">Manager</div>
                 <div className="text-purple-500 font-mono">
-                  imen.ayari@talan.tn
+                  bella.totaayouta@gmail.com
                 </div>
               </button>
             </div>

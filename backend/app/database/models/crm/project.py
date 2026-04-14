@@ -18,7 +18,7 @@ class Project(Base):
     id                 = Column(Integer, primary_key=True)
     name               = Column(String, nullable=False)
     client_id          = Column(Integer, ForeignKey("crm.clients.id"), nullable=False)
-    status             = Column(String, default="En cours")   # En cours | Terminé | En attente
+    status             = Column(String, default="not_started")  # ProjectGlobalStatus : not_started | in_progress | pending_human | completed
     progress           = Column(Float, default=0.0)           # 0.0 → 100.0
     start_date         = Column(Date, nullable=True)
     end_date           = Column(Date, nullable=True)
@@ -26,6 +26,10 @@ class Project(Base):
     # PM responsable — FK vers hris.employees (cohérent avec crm.assignments)
     # Dashboard PM : SELECT * FROM crm.projects WHERE project_manager_id = employee.id
     project_manager_id = Column(Integer, ForeignKey("hris.employees.id"), nullable=True)
+
+    # Intégration Jira — clé du projet Jira lié (ex: "TALAN")
+    # Renseignée au lancement du pipeline, utilisée pour synchroniser chaque phase
+    jira_project_key   = Column(String, nullable=True)
 
     created_at         = Column(DateTime, server_default=func.now())
 

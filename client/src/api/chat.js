@@ -45,7 +45,12 @@ export async function* sendMessageStream(message, conversationId) {
   })
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`)
+    // Tenter de parser le corps pour récupérer le détail sécurité
+    let detail = null
+    try { detail = (await response.json()).detail } catch (_) {}
+    const err = new Error(`HTTP ${response.status}`)
+    err.securityBlock = detail?.blocked === true ? detail : null
+    throw err
   }
 
   const reader = response.body.getReader()

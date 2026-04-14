@@ -77,16 +77,18 @@ def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
     Extrait le résultat de la phase courante depuis le state LangGraph.
     Retourne un dict sérialisable (stocké en JSONB dans pm.pipeline_state).
     """
-    # Phase 1 — extraction : calcule les stats depuis cdc_text
+    # Phase 1 — extraction : calcule les stats depuis cdc_text + résultat sécurité
     if phase == "extract":
-        cdc_text  = state.get("cdc_text", "")
-        pages_est = max(1, len(cdc_text) // 2000)
+        cdc_text      = state.get("cdc_text", "")
+        pages_est     = max(1, len(cdc_text) // 2000)
+        security_scan = state.get("security_scan")   # dict ou None
         return {
-            "filename":  None,       # nom du fichier non stocké dans le state
-            "file_size": None,
-            "pages_est": pages_est,
-            "chars":     len(cdc_text),
-            "preview":   cdc_text[:1500],
+            "filename":      None,
+            "file_size":     None,
+            "pages_est":     pages_est,
+            "chars":         len(cdc_text),
+            "preview":       cdc_text[:1500],
+            "security_scan": security_scan,           # inclus dans ai_output DB
         }
 
     phase_field_map = {

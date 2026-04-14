@@ -21,6 +21,7 @@ from langchain_core.messages import HumanMessage
 
 from app.orchestrator.graph import get_graph
 from app.core.security import get_current_user
+from app.core.anti_injection import scan_text
 from app.database.connection import get_db, AsyncSessionLocal
 from app.database.models.public.conversation import Conversation
 from app.database.models.public.message import Message
@@ -96,6 +97,16 @@ async def chat_stream(
     user_id = current_user["user_id"]
     role = current_user["role"]
 
+    # ── Scan de sécurité ─────────────────────────────────────
+    sec = scan_text(request.message)
+    if sec.blocked:
+        top = sec.threats[0] if sec.threats else None
+        detail = f"[{top.severity.upper()}] {top.description}" if top else "Contenu bloqué."
+        raise HTTPException(
+            status_code=400,
+            detail={"blocked": True, "severity": sec.severity, "reason": detail, "threats": sec.to_dict()["threats"]},
+        )
+
     print(f"\n{'='*60}")
     print(f"🌊 STREAMING REQUEST — user_id={user_id} msg={request.message[:60]}")
     print(f"{'='*60}")
@@ -164,6 +175,8 @@ async def chat_stream(
 
     async def event_generator():
         print("   📡 [SSE] Générateur démarré")
+        # Collecte les étapes de traitement pour persistance en DB
+        steps_by_id: dict = {}  # step_id → step dict (état final)
         try:
             while True:
                 try:
@@ -177,7 +190,30 @@ async def chat_stream(
                     print("   🏁 [SSE] Sentinel reçu — graph terminé")
                     break
 
-                print(f"   📤 [SSE] → {event.get('type')} step={event.get('step_id','')}")
+                # ── Accumulation des steps ──────────────────────
+                ev_type  = event.get("type")
+                step_id  = event.get("step_id")
+
+                if step_id is not None:
+                    if ev_type == "step_start":
+                        steps_by_id[step_id] = {
+                            "step_id": step_id,
+                            "status":  "running",
+                            "text":    event.get("text", ""),
+                            "agent":   event.get("agent"),
+                        }
+                    elif ev_type == "step_done" and step_id in steps_by_id:
+                        steps_by_id[step_id]["status"] = "done"
+                    elif ev_type == "step_unavailable" and step_id in steps_by_id:
+                        steps_by_id[step_id]["status"] = "unavailable"
+                    elif ev_type == "step_skipped" and step_id in steps_by_id:
+                        steps_by_id[step_id]["status"] = "skipped"
+                    elif ev_type == "step_progress" and step_id in steps_by_id:
+                        steps_by_id[step_id]["text"] = event.get("text", steps_by_id[step_id]["text"])
+                    elif ev_type == "needs_input" and step_id in steps_by_id:
+                        steps_by_id[step_id]["status"] = "waiting"
+
+                print(f"   📤 [SSE] → {ev_type} step={step_id or ''}")
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
             try:
@@ -205,12 +241,26 @@ async def chat_stream(
                 if ui_hint is None and final_text:
                     ui_hint = _detect_ui_hint(final_text)
 
+                # Convertit le dict ordonné en liste pour la DB
+                steps_list = list(steps_by_id.values())
+
                 try:
                     async with AsyncSessionLocal() as session:
-                        session.add(Message(conversation_id=conversation_id, role="user", content=request.message))
-                        session.add(Message(conversation_id=conversation_id, role="assistant", content=final_text, intent=last_agent, target_agent=last_agent))
+                        session.add(Message(
+                            conversation_id=conversation_id,
+                            role="user",
+                            content=request.message,
+                        ))
+                        session.add(Message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content=final_text,
+                            intent=last_agent,
+                            target_agent=last_agent,
+                            steps=steps_list,
+                        ))
                         await session.commit()
-                    print(f"   💾 [SSE] Messages sauvegardés")
+                    print(f"   💾 [SSE] Messages sauvegardés ({len(steps_list)} étapes)")
                 except Exception as e:
                     print(f"   ⚠️ [SSE] Erreur sauvegarde DB : {e}")
 
@@ -241,6 +291,16 @@ async def chat(
 ):
     user_id = current_user["user_id"]
     role    = current_user["role"]
+
+    # ── Scan de sécurité ─────────────────────────────────────
+    sec = scan_text(request.message)
+    if sec.blocked:
+        top = sec.threats[0] if sec.threats else None
+        detail = f"[{top.severity.upper()}] {top.description}" if top else "Contenu bloqué."
+        raise HTTPException(
+            status_code=400,
+            detail={"blocked": True, "severity": sec.severity, "reason": detail, "threats": sec.to_dict()["threats"]},
+        )
 
     logger.info(f"Nouvelle requête - user_id={user_id} conv_id={request.conversation_id} msg={request.message[:50]}")
 
@@ -360,6 +420,14 @@ async def get_messages(
     )
     messages = result.scalars().all()
     return [
-        {"id": m.id, "role": m.role, "content": m.content, "intent": m.intent, "target_agent": m.target_agent, "timestamp": str(m.timestamp)}
+        {
+            "id":           m.id,
+            "role":         m.role,
+            "content":      m.content,
+            "intent":       m.intent,
+            "target_agent": m.target_agent,
+            "steps":        m.steps or [],
+            "timestamp":    str(m.timestamp),
+        }
         for m in messages
     ]
