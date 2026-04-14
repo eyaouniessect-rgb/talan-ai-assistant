@@ -43,6 +43,10 @@ class PMPipelineState(TypedDict):
     # Utilisé par tous les nodes LLM suivants (epics, stories, etc.)
     cdc_text: str
 
+    # Résultat du scan de sécurité — rempli par node_extraction
+    # Voir app/core/anti_injection.ScanResult.to_dict()
+    security_scan: Optional[dict]
+
 
     # ╔══════════════════════════════════════════════════════╗
     # ║  PHASE 2 — Epics                                    ║

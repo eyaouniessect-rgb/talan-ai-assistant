@@ -183,7 +183,7 @@ SKILLS_MAP: dict[str, str] = {
     # Directeur Général
     "behjet.boussofara@talan.tn": "Leadership, Strategy, Business Development, Agile, Change Management",
     # Innovation Factory Lead
-    "imen.ayari@talan.tn": "Innovation Management, Agile, Product Design, Lean Startup, Team Leadership",
+    "bella.totaayouta@gmail.com": "Innovation Management, Agile, Product Design, Lean Startup, Team Leadership",
     # Dept Heads
     "sana.trabelsi@talan.tn":   "Salesforce, CRM Strategy, Apex, LWC, Team Leadership",
     "mohamed.gharbi@talan.tn":  "Python, SQL, Power BI, Data Architecture, Team Leadership",

@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 from agents.pm.jira import client as jira
 
 load_dotenv()
-_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "TALAN")
+# _PROJECT_KEY n'est plus une constante globale.
+# Chaque fonction reçoit project_key depuis le state du pipeline (1 clé par projet).
 
 
 # ──────────────────────────────────────────────────────────────
@@ -28,25 +29,25 @@ def _get_issue_type_id(name: str) -> str:
     """Résout le nom d'un type d'issue vers son ID numérique."""
     if name in _TYPE_CACHE:
         return _TYPE_CACHE[name]
-    types = jira.get(f"issuetype")
+    types = jira.get("issuetype")
     for t in types:
         _TYPE_CACHE[t["name"]] = t["id"]
-    return _TYPE_CACHE.get(name, name)   # fallback : retourne le nom
+    return _TYPE_CACHE.get(name, name)
 
 
 # ──────────────────────────────────────────────────────────────
 # PHASE 2 — Epics
 # ──────────────────────────────────────────────────────────────
 
-def create_epic(title: str, description: str) -> str:
+def create_epic(title: str, description: str, project_key: str) -> str:
     """
-    Crée un Epic dans Jira.
+    Crée un Epic dans Jira dans le projet identifié par project_key.
     Retourne la clé Jira (ex: "TALAN-1").
     """
-    print(f"[Jira] create_epic : {title}")
+    print(f"[Jira] create_epic : {title} → projet {project_key}")
     body = {
         "fields": {
-            "project":     {"key": _PROJECT_KEY},
+            "project":     {"key": project_key},
             "summary":     title,
             "description": _text_doc(description),
             "issuetype":   {"name": "Epic"},
@@ -63,32 +64,33 @@ def create_epic(title: str, description: str) -> str:
 # ──────────────────────────────────────────────────────────────
 
 def create_story(
-    title:              str,
-    description:        str,
+    title:               str,
+    description:         str,
     acceptance_criteria: list[str],
-    epic_key:           str | None = None,
-    story_points:       int | None = None,
+    project_key:         str,
+    epic_key:            str | None = None,
+    story_points:        int | None = None,
 ) -> str:
     """
-    Crée une User Story dans Jira, liée à son Epic.
+    Crée une User Story dans Jira dans le projet project_key, liée à son Epic.
     Retourne la clé Jira (ex: "TALAN-5").
     """
-    print(f"[Jira] create_story : {title[:60]}")
-    ac_text = "\n".join(f"- {c}" for c in (acceptance_criteria or []))
+    print(f"[Jira] create_story : {title[:60]} → projet {project_key}")
+    ac_text   = "\n".join(f"- {c}" for c in (acceptance_criteria or []))
     full_desc = description
     if ac_text:
         full_desc += f"\n\n*Critères d'acceptation :*\n{ac_text}"
 
     fields: dict = {
-        "project":     {"key": _PROJECT_KEY},
+        "project":     {"key": project_key},
         "summary":     title,
         "description": _text_doc(full_desc),
         "issuetype":   {"name": "Story"},
     }
     if epic_key:
-        fields["customfield_10014"] = epic_key   # Epic Link (standard Jira Next-gen)
+        fields["customfield_10014"] = epic_key
     if story_points:
-        fields["story_points"] = story_points    # peut nécessiter customfield_10016
+        fields["story_points"] = story_points
 
     result = jira.post("issue", {"fields": fields})
     key = result["key"]
@@ -103,16 +105,17 @@ def create_story(
 def create_task(
     title:        str,
     description:  str,
+    project_key:  str,
     parent_key:   str | None = None,
 ) -> str:
     """
-    Crée une tâche technique dans Jira.
+    Crée une tâche technique dans Jira dans le projet project_key.
     Si parent_key fourni → Sub-task liée à la Story parente.
     """
-    print(f"[Jira] create_task : {title[:60]}")
+    print(f"[Jira] create_task : {title[:60]} → projet {project_key}")
     issue_type = "Subtask" if parent_key else "Task"
     fields: dict = {
-        "project":     {"key": _PROJECT_KEY},
+        "project":     {"key": project_key},
         "summary":     title,
         "description": _text_doc(description),
         "issuetype":   {"name": issue_type},
@@ -130,11 +133,10 @@ def create_task(
 # PHASE 10 — Sprints
 # ──────────────────────────────────────────────────────────────
 
-def get_board_id() -> int | None:
-    """Récupère l'ID du board Jira du projet."""
+def get_board_id(project_key: str) -> int | None:
+    """Récupère l'ID du board Jira du projet identifié par project_key."""
     try:
-        # API Agile Jira
-        import requests, os
+        import requests
         url   = os.getenv("JIRA_BASE_URL", "").rstrip("/")
         email = os.getenv("JIRA_EMAIL", "")
         token = os.getenv("JIRA_API_TOKEN", "")
@@ -142,7 +144,7 @@ def get_board_id() -> int | None:
             f"{url}/rest/agile/1.0/board",
             auth=(email, token),
             headers={"Accept": "application/json"},
-            params={"projectKeyOrId": _PROJECT_KEY},
+            params={"projectKeyOrId": project_key},
             timeout=10,
         )
         if r.ok:

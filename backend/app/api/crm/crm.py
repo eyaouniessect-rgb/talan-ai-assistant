@@ -19,6 +19,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
@@ -128,7 +129,11 @@ async def list_projects(
     if not employee_id:
         raise HTTPException(403, "Votre compte n'est pas lié à un profil employé.")
 
-    q = select(Project).where(Project.project_manager_id == employee_id)
+    q = (
+        select(Project)
+        .where(Project.project_manager_id == employee_id)
+        .options(selectinload(Project.client))
+    )
     if client_id is not None:
         q = q.where(Project.client_id == client_id)
     result = await db.execute(q.order_by(Project.created_at.desc()))

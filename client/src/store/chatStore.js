@@ -51,13 +51,7 @@ export const useChatStore = create((set, get) => ({
         time: new Date(m.timestamp).toLocaleTimeString('fr', {
           hour: '2-digit', minute: '2-digit',
         }),
-        steps:
-          m.role === 'assistant' && m.intent
-            ? [
-                { status: 'done', text: `Intention : ${m.intent}` },
-                { status: 'done', text: `Agent : ${m.target_agent}` },
-              ]
-            : [],
+        steps: m.role === 'assistant' ? (m.steps || []) : [],
       }))
 
       set(s => ({
@@ -318,12 +312,28 @@ export const useChatStore = create((set, get) => ({
     } catch (error) {
       console.error('Streaming error:', error)
 
-      // En cas d'erreur réseau, affiche un message d'erreur
-      updateLastMsg(msg => ({
-        ...msg,
-        content: 'Erreur de connexion au serveur.',
-        streaming: false,
-      }))
+      if (error.securityBlock) {
+        const block = error.securityBlock
+        const severityLabel = { critical: '🔴 CRITIQUE', high: '🟠 ÉLEVÉ', medium: '🟡 MOYEN', low: '🟢 FAIBLE' }[block.severity] || block.severity
+        const threatLines = (block.threats || [])
+          .map(t => `• **${t.type?.replace(/_/g, ' ')}** (${t.severity}) — ${t.description}`)
+          .join('\n')
+        const content = [
+          `⛔ **Message bloqué — Menace de sécurité détectée**`,
+          `Niveau : ${severityLabel}`,
+          block.reason ? `Raison : ${block.reason}` : '',
+          threatLines ? `\n${threatLines}` : '',
+        ].filter(Boolean).join('\n')
+
+        updateLastMsg(msg => ({ ...msg, content, streaming: false }))
+      } else {
+        updateLastMsg(msg => ({
+          ...msg,
+          content: 'Erreur de connexion au serveur.',
+          streaming: false,
+        }))
+      }
+
       set({ isTyping: false })
     }
   },

@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from agents.pm.state import PMPipelineState
 from agents.pm.agents.extraction.service import validate_file, extract_text
+from app.core.anti_injection import scan_text, scan_filename
 from app.database.connection import AsyncSessionLocal
 from app.database.models.pm.project_document import ProjectDocument
 
@@ -100,25 +101,41 @@ async def node_extraction(state: PMPipelineState) -> dict:
     print(cdc_text[:500])
     print(f"[EXTRACTION] --- Fin aperçu ---\n")
 
-    # ── 5. Log JSON (visible dans les logs backend) ──────────
-    import json
-    print(f"[EXTRACTION] Résultat JSON :")
-    print(json.dumps({
-        "filename":  filename,
-        "extension": ext,
-        "file_size": file_size,
-        "pages_est": pages_est,
-        "preview":   cdc_text[:200],
-    }, ensure_ascii=False, indent=2))
+    # ── 5. Scan de sécurité ───────────────────────────────────
+    print(f"[EXTRACTION] Scan de sécurité (prompt/SQL/MCP/code injection)...")
+
+    # Double extension sur le nom de fichier
+    fname_scan = scan_filename(filename)
+
+    # Contenu du document
+    content_scan = scan_text(cdc_text)
+
+    # Fusionner les deux résultats (worst-case severity)
+    all_threats = fname_scan.threats + content_scan.threats
+    if all_threats:
+        from app.core.anti_injection import ScanResult, _SEVERITY_RANK, Severity
+        max_rank     = max(_SEVERITY_RANK[t.severity] for t in all_threats)
+        max_severity = next(s for s, r in _SEVERITY_RANK.items() if r == max_rank)
+        security_result = ScanResult(is_safe=False, severity=max_severity.value, threats=all_threats)
+    else:
+        security_result = content_scan  # is_safe=True
+
+    if security_result.is_safe:
+        print(f"[EXTRACTION] ✓ Scan sécurité OK — aucune menace détectée")
+    else:
+        print(f"[EXTRACTION] ⚠ {len(security_result.threats)} menace(s) détectée(s) — sévérité : {security_result.severity.upper()}")
+        for t in security_result.threats:
+            print(f"[EXTRACTION]   [{t.severity.upper()}] {t.pattern} : {t.description}")
 
     # ── 6. Passe en attente de validation humaine ─────────────
-    # node_validate lit cdc_text depuis le state pour calculer les stats
+    # node_validate lit cdc_text + security_scan depuis le state
     # et persiste PENDING_VALIDATION + interrupt()
     print(f"\n[EXTRACTION] → Passage à node_validate (validation humaine requise)")
     print(f"{'='*60}\n")
 
     return {
-        "cdc_text":          cdc_text,   # texte complet — lu par epics/stories/...
+        "cdc_text":          cdc_text,
+        "security_scan":     security_result.to_dict(),
         "current_phase":     "extract",
         "validation_status": "pending_human",
         "error":             None,

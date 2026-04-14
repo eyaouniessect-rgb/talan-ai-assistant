@@ -39,7 +39,7 @@ load_dotenv()
 # Paramètres de l'historique
 # ─────────────────────────────────────────────
 
-MAX_HISTORY_MESSAGES = 10     # Nombre max de messages conservés pour le contexte LLM
+MAX_HISTORY_MESSAGES = 15    # Nombre max de messages conservés pour le contexte LLM
 MAX_AI_CHARS_IN_HISTORY = 200 # Longueur max d'une réponse IA dans l'historique
 
 # Modèles LLM essayés dans l'ordre pour la planification

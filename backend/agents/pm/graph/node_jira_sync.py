@@ -11,19 +11,16 @@ from agents.pm.state import PMPipelineState
 from agents.pm.jira  import actions
 
 load_dotenv()
-_JIRA_ENABLED      = bool(os.getenv("JIRA_BASE_URL") and os.getenv("JIRA_API_TOKEN"))
-_JIRA_PROJECT_KEY  = os.getenv("JIRA_PROJECT_KEY", "")
+_JIRA_ENABLED = bool(os.getenv("JIRA_BASE_URL") and os.getenv("JIRA_API_TOKEN"))
 
 
 async def node_jira_sync(state: PMPipelineState) -> dict:
-    phase = state.get("current_phase", "")
-
-    # Clé projet : state (wizard) en priorité, sinon .env
-    jira_project_key = state.get("jira_project_key") or _JIRA_PROJECT_KEY
+    phase            = state.get("current_phase", "")
+    jira_project_key = (state.get("jira_project_key") or "").strip()
 
     print(f"\n{'#'*60}")
     print(f"# JIRA SYNC — Phase '{phase}'")
-    print(f"#   jira_project_key = '{jira_project_key}' (source: {'state' if state.get('jira_project_key') else '.env'})")
+    print(f"#   jira_project_key = '{jira_project_key}'")
     print(f"#   JIRA_ENABLED     = {_JIRA_ENABLED}")
     print(f"#   JIRA_BASE_URL    = {os.getenv('JIRA_BASE_URL', 'NON DEFINI')}")
     print(f"{'#'*60}")
@@ -32,8 +29,9 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
         print("[JIRA SYNC] SKIP — JIRA_BASE_URL ou JIRA_API_TOKEN manquant dans .env")
         return {}
 
+    # La clé projet est obligatoire — pas de fallback .env
     if not jira_project_key:
-        print("[JIRA SYNC] SKIP — JIRA_PROJECT_KEY absent du .env et non fourni dans le wizard")
+        print("[JIRA SYNC] SKIP — jira_project_key absent du state (non renseigné dans le wizard)")
         return {}
 
     # Déjà synchronisé
@@ -79,8 +77,9 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 async def _sync_epics(state: PMPipelineState) -> dict:
-    epics = state.get("epics") or []
-    print(f"\n[JIRA SYNC] >>> EPICS : {len(epics)} epics a creer dans Jira")
+    epics            = state.get("epics") or []
+    jira_project_key = state.get("jira_project_key", "")
+    print(f"\n[JIRA SYNC] >>> EPICS : {len(epics)} epics a creer dans Jira projet '{jira_project_key}'")
 
     if not epics:
         print("[JIRA SYNC] SKIP — state['epics'] est vide")
@@ -93,6 +92,7 @@ async def _sync_epics(state: PMPipelineState) -> dict:
             key = actions.create_epic(
                 title       = epic["title"],
                 description = epic.get("description", ""),
+                project_key = jira_project_key,
             )
             epic_map[i] = key
             print(f"[JIRA SYNC]   [OK] Epic {i+1}/{len(epics)} '{epic['title'][:50]}' → {key}")
@@ -110,9 +110,10 @@ async def _sync_epics(state: PMPipelineState) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 async def _sync_stories(state: PMPipelineState) -> dict:
-    stories   = state.get("stories") or []
-    epic_map  = state.get("jira_epic_map") or {}
-    print(f"\n[JIRA SYNC] >>> STORIES : {len(stories)} stories a creer dans Jira")
+    stories          = state.get("stories") or []
+    epic_map         = state.get("jira_epic_map") or {}
+    jira_project_key = state.get("jira_project_key", "")
+    print(f"\n[JIRA SYNC] >>> STORIES : {len(stories)} stories a creer dans Jira projet '{jira_project_key}'")
     print(f"[JIRA SYNC]   jira_epic_map disponible = {epic_map}")
 
     if not stories:
@@ -133,6 +134,7 @@ async def _sync_stories(state: PMPipelineState) -> dict:
                 title               = story["title"],
                 description         = story.get("description", ""),
                 acceptance_criteria = story.get("acceptance_criteria", []),
+                project_key         = jira_project_key,
                 epic_key            = epic_key,
                 story_points        = story.get("story_points"),
             )
@@ -152,9 +154,10 @@ async def _sync_stories(state: PMPipelineState) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 async def _sync_tasks(state: PMPipelineState) -> dict:
-    tasks     = state.get("tasks") or []
-    story_map = state.get("jira_story_map") or {}
-    print(f"\n[JIRA SYNC] >>> TASKS : {len(tasks)} tasks a creer dans Jira")
+    tasks            = state.get("tasks") or []
+    story_map        = state.get("jira_story_map") or {}
+    jira_project_key = state.get("jira_project_key", "")
+    print(f"\n[JIRA SYNC] >>> TASKS : {len(tasks)} tasks a creer dans Jira projet '{jira_project_key}'")
 
     if not tasks:
         print("[JIRA SYNC] SKIP — state['tasks'] est vide")
@@ -170,6 +173,7 @@ async def _sync_tasks(state: PMPipelineState) -> dict:
             key = actions.create_task(
                 title       = task["title"],
                 description = task.get("description", ""),
+                project_key = jira_project_key,
                 parent_key  = parent_key,
             )
             task_map[i] = key
@@ -195,8 +199,9 @@ async def _sync_sprints(state: PMPipelineState) -> dict:
         print("[JIRA SYNC] SKIP — state['sprints'] est vide")
         return {}
 
-    board_id = actions.get_board_id()
-    print(f"[JIRA SYNC]   board_id = {board_id}")
+    jira_project_key = state.get("jira_project_key", "")
+    board_id = actions.get_board_id(jira_project_key)
+    print(f"[JIRA SYNC]   board_id = {board_id} (projet '{jira_project_key}')")
     if not board_id:
         print("[JIRA SYNC] ERREUR — Board Jira introuvable pour le projet")
         return {}

@@ -170,20 +170,38 @@ async def get_my_leaves(user_id: int, status_filter: Optional[str] = None) -> st
 
 
 @tool
-async def get_team_availability(user_id: int) -> str:
-    """Retourne la disponibilité de l'équipe de l'utilisateur connecté."""
+async def get_team_availability(
+    user_id: int,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> str:
+    """Retourne la disponibilité de l'équipe de l'utilisateur connecté pour une période donnée.
+    start_date / end_date : période YYYY-MM-DD. Si absents, vérifie aujourd'hui.
+    Toujours passer start_date et end_date quand l'utilisateur mentionne une période ('semaine prochaine', 'lundi', etc.)."""
     denied = await _check_rbac("get_team_availability")
     if denied: return denied
-    result = await rh_tools.get_team_availability(user_id=user_id)
+    result = await rh_tools.get_team_availability(
+        user_id=user_id, start_date=start_date, end_date=end_date
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
 @tool
-async def get_team_availability_by_name(team_name: str) -> str:
-    """Retourne la disponibilité des membres d'une équipe spécifique par son nom (ex: 'Salesforce', 'Data', 'Cloud')."""
+async def get_team_availability_by_name(
+    team_name: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> str:
+    """Retourne la liste des membres d'une équipe et leur disponibilité pour une période donnée.
+    Utiliser pour : 'membres de l'équipe X', 'qui est dans X', 'composition de X',
+    'qui est disponible dans X', 'effectif de l'équipe X'.
+    Le nom peut être partiel : 'Innovation' trouvera 'Innovation Factory'.
+    start_date / end_date : période YYYY-MM-DD. Si absents, vérifie aujourd'hui."""
     denied = await _check_rbac("get_team_availability")
     if denied: return denied
-    result = await rh_tools.get_team_availability_by_name(team_name=team_name)
+    result = await rh_tools.get_team_availability_by_name(
+        team_name=team_name, start_date=start_date, end_date=end_date
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -195,17 +213,17 @@ async def get_team_stack(
     team_filter: Optional[str] = None,
     dept_filter: Optional[str] = None,
 ) -> str:
-    """Retourne les compétences techniques selon le rôle de l'utilisateur.
+    """Retourne les COMPÉTENCES TECHNIQUES (skills, stack) des employés.
+    Utiliser UNIQUEMENT pour : 'compétences de l'équipe', 'qui sait faire X',
+    'stack technique', 'qui maîtrise React/Java/Python', 'skills de l'équipe'.
+    ⛔ NE PAS utiliser pour lister les membres d'une équipe — utiliser get_team_availability_by_name.
+    ⛔ NE PAS utiliser si l'utilisateur demande 'membres', 'composition', 'effectif'.
 
     Scope automatique :
       - consultant          → toujours son équipe uniquement
       - pm/rh               → toute l'entreprise par défaut
 
-    Paramètre my_team_only (pm/rh) :
-      - True  → "qui dans MON équipe sait X ?" → restreint à la propre équipe du pm
-      - False → "qui dans l'entreprise sait X ?" → toute l'entreprise
-
-    Filtres optionnels (pm/rh, my_team_only=False) :
+    Filtres optionnels (pm/rh) :
       - skill_filter : technologie précise (ex: 'Java', 'React')
       - team_filter  : nom d'équipe explicite (ex: 'Data Ops')
       - dept_filter  : département (ex: 'cloud', 'data')"""
@@ -227,11 +245,39 @@ async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str)
     """Vérifie les conflits réels dans Google Calendar pour la période de congé donnée."""
     denied = await _check_rbac("check_calendar_conflicts")
     if denied: return denied
+
+    # ── Vérifier si l'utilisateur a connecté Google Calendar ──
+    try:
+        from sqlalchemy import select
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.public.google_oauth_token import GoogleOAuthToken
+        async with AsyncSessionLocal() as db:
+            token_row = (await db.execute(
+                select(GoogleOAuthToken).where(GoogleOAuthToken.user_id == user_id)
+            )).scalar_one_or_none()
+    except Exception:
+        token_row = None
+
+    if not token_row:
+        print(f"  📅 [check_calendar_conflicts] user_id={user_id} → Google Calendar non connecté")
+        return json.dumps({
+            "success": True,
+            "conflicts": [],
+            "calendar_connected": False,
+            "warning": (
+                f"Google Calendar non connecté — impossible de vérifier les réunions "
+                f"prévues du {start_date} au {end_date}. "
+                f"L'utilisateur doit être averti de connecter son agenda."
+            ),
+        }, ensure_ascii=False)
+
+    # ── Appel MCP ──────────────────────────────────────────────
     try:
         from agents.calendar.tools import check_calendar_conflicts as cal_check
         account_id = str(user_id)
         print(f"  📅 [check_calendar_conflicts] user_id={user_id} → account_id='{account_id}' | période={start_date} → {end_date}")
         result = await cal_check(start_date, end_date, account_id=account_id)
+        result["calendar_connected"] = True
         print(f"  📅 [check_calendar_conflicts] résultat MCP : {result}")
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -239,6 +285,7 @@ async def check_calendar_conflicts(user_id: int, start_date: str, end_date: str)
         return json.dumps({
             "success": True,
             "conflicts": [],
+            "calendar_connected": False,
             "message": "Impossible de vérifier le calendrier (service indisponible).",
             "mcp_error": True,
         }, ensure_ascii=False)
@@ -329,20 +376,18 @@ async def notify_manager(
     Utiliser les valeurs retournées par create_leave : manager_email, employee_name, start_date, end_date, days_count."""
     denied = await _check_rbac("notify_manager")
     if denied: return denied
-    subject = f"Nouvelle demande de congé — {employee_name}"
-    body = (
-        f"Bonjour,\n\n"
-        f"{employee_name} a déposé une demande de congé.\n\n"
-        f"  Période : du {start_date} au {end_date} ({days_count} jour(s) ouvré(s))\n"
-        f"  Statut  : En attente d'approbation\n\n"
-        f"Cordialement,\nTalan Assistant"
-    )
-    result = await rh_tools.send_email(
-        to_email=manager_email,
-        subject=subject,
-        body=body,
-    )
-    return json.dumps(result, ensure_ascii=False)
+    try:
+        from utils.email import send_leave_request_email
+        send_leave_request_email(
+            to_email=manager_email,
+            employee_name=employee_name,
+            start_date=start_date,
+            end_date=end_date,
+            days_count=days_count,
+        )
+        return json.dumps({"success": True, "to": manager_email}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"Échec envoi email manager : {str(e)}"}, ensure_ascii=False)
 
 
 @tool
@@ -426,6 +471,63 @@ async def get_leaves_by_filter(
 
 
 @tool
+async def get_my_profile(user_id: int) -> str:
+    """Retourne le profil complet de l'utilisateur connecté : nom, poste, séniorité, équipe, département et nom du manager."""
+    denied = await _check_rbac("get_my_profile")
+    if denied: return denied
+    try:
+        from sqlalchemy import select
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.public.user import User
+        from app.database.models.hris.employee import Employee
+        from app.database.models.hris.team import Team
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Employee, User)
+                .join(User, Employee.user_id == User.id)
+                .where(Employee.user_id == user_id)
+            )
+            row = result.first()
+            if not row:
+                return json.dumps({"error": "Profil employé introuvable."}, ensure_ascii=False)
+
+            emp, user = row
+
+            # Récupère le nom du manager
+            manager_name = None
+            if emp.manager_id:
+                mgr_result = await db.execute(
+                    select(User).join(Employee, Employee.user_id == User.id)
+                    .where(Employee.id == emp.manager_id)
+                )
+                mgr_user = mgr_result.scalar_one_or_none()
+                if mgr_user:
+                    manager_name = mgr_user.name
+
+            # Récupère le nom de l'équipe
+            team_name = None
+            if emp.team_id:
+                team_result = await db.execute(select(Team).where(Team.id == emp.team_id))
+                team = team_result.scalar_one_or_none()
+                if team:
+                    team_name = team.name
+
+            return json.dumps({
+                "name":       user.name,
+                "email":      user.email,
+                "role":       user.role,
+                "job_title":  emp.job_title,
+                "seniority":  emp.seniority,
+                "team":       team_name,
+                "department": emp.department,
+                "manager":    manager_name or "Aucun manager configuré",
+            }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@tool
 async def update_employee_info(
     employee_name: str,
     job_title: str = None,
@@ -458,6 +560,7 @@ TOOLS = [
     create_leave,
     delete_leave,
     get_my_leaves,
+    get_my_profile,
     get_team_availability,
     get_team_availability_by_name,
     get_team_stack,

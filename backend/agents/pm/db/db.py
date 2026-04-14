@@ -53,19 +53,20 @@ async def upsert_pipeline_state(
         if validated_by is not None: values["validated_by"] = validated_by
         if validated_at is not None: values["validated_at"] = validated_at
 
+        # Construire le set_ dynamiquement pour ne pas écraser ai_output avec None
+        # lors des appels de validation (qui ne passent pas de nouvel ai_output)
+        set_ = {"status": status, "updated_at": datetime.utcnow()}
+        if ai_output    is not None: set_["ai_output"]    = ai_output
+        if pm_comment   is not None: set_["pm_comment"]   = pm_comment
+        if validated_by is not None: set_["validated_by"] = validated_by
+        if validated_at is not None: set_["validated_at"] = validated_at
+
         stmt = (
             pg_insert(PipelineState)
             .values(**values)
             .on_conflict_do_update(
                 constraint="uq_pipeline_project_phase",
-                set_={
-                    "status":       status,
-                    "ai_output":    ai_output,
-                    "pm_comment":   pm_comment,
-                    "validated_by": validated_by,
-                    "validated_at": validated_at,
-                    "updated_at":   datetime.utcnow(),
-                },
+                set_=set_,
             )
             .returning(PipelineState)
         )
