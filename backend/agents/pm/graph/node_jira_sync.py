@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 
 from agents.pm.state import PMPipelineState
 from agents.pm.jira  import actions
+from agents.pm.agents.epics.repository   import get_epics,   update_epic_jira_key
+from agents.pm.agents.stories.repository import get_stories, update_story_jira_key
 
 load_dotenv()
 _JIRA_ENABLED = bool(os.getenv("JIRA_BASE_URL") and os.getenv("JIRA_API_TOKEN"))
@@ -40,7 +42,8 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
         print(f"[JIRA SYNC] SKIP — Phase '{phase}' deja synchronisee")
         return {}
 
-    patch = {}
+    patch      = {}
+    sync_ok    = True   # False si la sync a échoué complètement (toutes erreurs)
 
     try:
         if phase == "extract":
@@ -51,6 +54,12 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
 
         elif phase == "stories":
             patch = await _sync_stories(state)
+            # Si aucune story créée alors qu'il y en avait → ne pas marquer synced
+            nb_stories = len(state.get("stories") or [])
+            nb_created = len(patch.get("jira_story_map", {}))
+            if nb_stories > 0 and nb_created == 0:
+                sync_ok = False
+                print(f"[JIRA SYNC] ⚠ Aucune story créée dans Jira ({nb_stories} attendues) — phase NON marquée comme synchronisée")
 
         elif phase == "tasks":
             patch = await _sync_tasks(state)
@@ -62,10 +71,15 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
             print(f"[JIRA SYNC] Phase '{phase}' → pas d'action Jira definie pour cette phase")
 
     except Exception as e:
+        sync_ok = False
         print(f"\n[JIRA SYNC] !! ERREUR phase '{phase}' : {e}")
         print(f"[JIRA SYNC] Pipeline continue malgre l'erreur Jira\n")
 
-    patch["jira_synced_phases"] = already_synced + [phase]
+    # Marquer comme synchronisé seulement si succès (évite de bloquer les retries)
+    if sync_ok:
+        patch["jira_synced_phases"] = already_synced + [phase]
+    else:
+        patch["jira_synced_phases"] = already_synced   # phase retentera au prochain appel
 
     print(f"\n[JIRA SYNC] Termine — jira_synced_phases = {patch['jira_synced_phases']}")
     print(f"{'#'*60}\n")
@@ -78,12 +92,17 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
 
 async def _sync_epics(state: PMPipelineState) -> dict:
     epics            = state.get("epics") or []
+    project_id       = state.get("project_id")
     jira_project_key = state.get("jira_project_key", "")
     print(f"\n[JIRA SYNC] >>> EPICS : {len(epics)} epics a creer dans Jira projet '{jira_project_key}'")
 
     if not epics:
         print("[JIRA SYNC] SKIP — state['epics'] est vide")
         return {}
+
+    # Récupérer les DB IDs des epics pour mettre à jour jira_epic_key après sync
+    db_epics = await get_epics(project_id) if project_id else []
+    db_epic_ids = [e.id for e in db_epics]  # ordre par id = ordre de création
 
     epic_map = {}
     errors   = 0
@@ -96,6 +115,12 @@ async def _sync_epics(state: PMPipelineState) -> dict:
             )
             epic_map[i] = key
             print(f"[JIRA SYNC]   [OK] Epic {i+1}/{len(epics)} '{epic['title'][:50]}' → {key}")
+
+            # Mise à jour DB : jira_epic_key
+            if i < len(db_epic_ids):
+                await update_epic_jira_key(db_epic_ids[i], key)
+                print(f"[JIRA SYNC]   DB mis à jour : epic id={db_epic_ids[i]} → jira_epic_key={key}")
+
         except Exception as e:
             errors += 1
             print(f"[JIRA SYNC]   [ERREUR] Epic {i+1} '{epic.get('title','')}' : {e}")
@@ -110,41 +135,97 @@ async def _sync_epics(state: PMPipelineState) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 async def _sync_stories(state: PMPipelineState) -> dict:
+    import json as _json
+
     stories          = state.get("stories") or []
     epic_map         = state.get("jira_epic_map") or {}
+    project_id       = state.get("project_id")
     jira_project_key = state.get("jira_project_key", "")
-    print(f"\n[JIRA SYNC] >>> STORIES : {len(stories)} stories a creer dans Jira projet '{jira_project_key}'")
-    print(f"[JIRA SYNC]   jira_epic_map disponible = {epic_map}")
+    print(f"\n[JIRA SYNC] >>> STORIES : {len(stories)} stories à créer dans Jira projet '{jira_project_key}'")
+    print(f"[JIRA SYNC]   jira_epic_map = {epic_map}")
 
     if not stories:
         print("[JIRA SYNC] SKIP — state['stories'] est vide")
         return {}
 
     if not epic_map:
-        print("[JIRA SYNC] AVERTISSEMENT — jira_epic_map vide, les stories ne seront pas liees a un Epic")
+        print("[JIRA SYNC] ⚠ jira_epic_map vide — stories créées sans lien epic")
 
-    story_map = {}
+    # Fallback positionnel : si les stories n'ont pas encore de db_id (ancienne exécution)
+    db_stories   = await get_stories(project_id) if project_id else []
+    db_id_by_pos = [s.id for s in db_stories]
+
+    # ── Construire un index des clés Jira déjà existantes ─────
+    # Source 1 : jira_story_map déjà dans le state (clés str ou int)
+    existing_map_raw = state.get("jira_story_map") or {}
+    already_synced_idx: dict[int, str] = {}
+    for k, v in existing_map_raw.items():
+        try:
+            already_synced_idx[int(k)] = v
+        except (ValueError, TypeError):
+            pass
+
+    # Source 2 : jira_issue_key en DB (si la story a un db_id)
+    db_jira_by_id = {s.id: s.jira_issue_key for s in db_stories if s.jira_issue_key}
+
+    story_map = dict(already_synced_idx)   # partir de l'existant → merge
+    skipped   = 0
     errors    = 0
+
     for i, story in enumerate(stories):
+        # Déjà synchronisée ? (via state map ou via DB)
+        existing_key = already_synced_idx.get(i)
+        if not existing_key:
+            db_id_for_check = story.get("db_id") or (db_id_by_pos[i] if i < len(db_id_by_pos) else None)
+            if db_id_for_check:
+                existing_key = db_jira_by_id.get(int(db_id_for_check))
+        if existing_key:
+            story_map[i] = existing_key
+            skipped += 1
+            print(f"[JIRA SYNC]   [SKIP] Story {i+1}/{len(stories)} déjà dans Jira → {existing_key}")
+            continue
+
         try:
             epic_idx = story.get("epic_id")
+            # jira_epic_map peut avoir des clés str ou int selon la sérialisation JSON
             epic_key = epic_map.get(str(epic_idx)) or epic_map.get(epic_idx)
+
+            # Normaliser acceptance_criteria (JSON string ou liste)
+            ac = story.get("acceptance_criteria", [])
+            if isinstance(ac, str):
+                try:
+                    ac = _json.loads(ac)
+                except Exception:
+                    ac = [ac] if ac else []
 
             key = actions.create_story(
                 title               = story["title"],
                 description         = story.get("description", ""),
-                acceptance_criteria = story.get("acceptance_criteria", []),
+                acceptance_criteria = ac,
                 project_key         = jira_project_key,
                 epic_key            = epic_key,
                 story_points        = story.get("story_points"),
             )
             story_map[i] = key
-            print(f"[JIRA SYNC]   [OK] Story {i+1}/{len(stories)} → {key} (epic_key={epic_key})")
+            print(f"[JIRA SYNC]   [OK] Story {i+1}/{len(stories)} → {key} (epic={epic_key})")
+
+            # ── Mise à jour DB : utilise db_id direct si disponible (priorité) ──
+            db_id = story.get("db_id")
+            if db_id:
+                await update_story_jira_key(int(db_id), key)
+                print(f"[JIRA SYNC]   DB: story db_id={db_id} → jira_issue_key={key}")
+            elif i < len(db_id_by_pos):
+                await update_story_jira_key(db_id_by_pos[i], key)
+                print(f"[JIRA SYNC]   DB: story pos_id={db_id_by_pos[i]} → jira_issue_key={key} (fallback positionnel)")
+            else:
+                print(f"[JIRA SYNC]   ⚠ Story {i} : impossible de trouver l'id DB pour mise à jour jira_issue_key")
+
         except Exception as e:
             errors += 1
-            print(f"[JIRA SYNC]   [ERREUR] Story {i+1} '{story.get('title','')[:50]}' : {e}")
+            print(f"[JIRA SYNC]   [ERREUR] Story {i+1} '{story.get('title','')[:60]}' : {e}")
 
-    print(f"\n[JIRA SYNC] Stories : {len(story_map)} creees, {errors} erreurs")
+    newly_created = len(story_map) - len(already_synced_idx)
+    print(f"\n[JIRA SYNC] Stories : {newly_created} nouvelles créées, {skipped} ignorées (déjà sync), {errors} erreurs")
     print(f"[JIRA SYNC] jira_story_map = {story_map}")
     return {"jira_story_map": story_map}
 

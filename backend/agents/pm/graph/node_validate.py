@@ -42,8 +42,10 @@ async def node_validate(state: PMPipelineState) -> dict:
                 status     = PipelineStatusEnum.PENDING_VALIDATION,
                 ai_output  = ai_output,
             )
-        except ValueError as e:
-            print(f"[node_validate] Impossible de persister la phase '{phase}': {e}")
+        except Exception as e:
+            # Ne PAS laisser une erreur DB crasher le graph entier.
+            # Le interrupt() ci-dessous doit toujours s'exécuter.
+            print(f"[node_validate] ⚠ Échec persistence phase '{phase}': {type(e).__name__}: {e}")
 
     # ── 3. Suspendre le graph ─────────────────────────────────
     decision = interrupt({
@@ -77,23 +79,40 @@ def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
     Extrait le résultat de la phase courante depuis le state LangGraph.
     Retourne un dict sérialisable (stocké en JSONB dans pm.pipeline_state).
     """
-    # Phase 1 — extraction : calcule les stats depuis cdc_text + résultat sécurité
+    # Phase 1 — extraction : stats CDC + sécurité + résultat VLM
     if phase == "extract":
-        cdc_text      = state.get("cdc_text", "")
-        pages_est     = max(1, len(cdc_text) // 2000)
-        security_scan = state.get("security_scan")   # dict ou None
+        cdc_text                 = state.get("cdc_text", "")
+        # Priorité : page_count réel (PDF pymupdf) sinon estimation depuis nb chars
+        page_count               = state.get("page_count") or max(1, len(cdc_text) // 2000)
+        image_count              = state.get("image_count") or 0
+        vlm_doc_info             = state.get("vlm_doc_info") or {}
+        security_scan            = state.get("security_scan")
+        architecture_detected    = state.get("architecture_detected", False)
+        architecture_description = state.get("architecture_description")
+        architecture_details     = state.get("architecture_details")
         return {
-            "filename":      None,
-            "file_size":     None,
-            "pages_est":     pages_est,
-            "chars":         len(cdc_text),
-            "preview":       cdc_text[:1500],
-            "security_scan": security_scan,           # inclus dans ai_output DB
+            "filename":                 None,
+            "file_size":                None,
+            "pages_est":                page_count,
+            "chars":                    len(cdc_text),
+            "image_count":              image_count,
+            "oversized_pages":          vlm_doc_info.get("oversized_pages", []),
+            "preview":                  cdc_text,
+            "security_scan":            security_scan,
+            "architecture_detected":    architecture_detected,
+            "architecture_description": architecture_description,
+            "architecture_details":     architecture_details,
+        }
+
+    # Phase 3 — stories : on inclut aussi les epics pour que le front affiche les titres
+    if phase == "stories":
+        return {
+            "stories": state.get("stories", []),
+            "epics":   state.get("epics",   []),
         }
 
     phase_field_map = {
         "epics":           "epics",
-        "stories":         "stories",
         "refinement":      "refined_stories",
         "story_deps":      "story_dependencies",
         "prioritization":  "priorities",

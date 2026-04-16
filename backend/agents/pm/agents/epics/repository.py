@@ -51,6 +51,18 @@ async def save_epics(project_id: int, epics: list[dict]) -> list[Epic]:
         return orm_epics
 
 
+async def update_epic_jira_key(epic_db_id: int, jira_key: str) -> None:
+    """Met à jour jira_epic_key d'un epic après synchronisation Jira."""
+    from sqlalchemy import update as sa_update
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            sa_update(Epic)
+            .where(Epic.id == epic_db_id)
+            .values(jira_epic_key=jira_key)
+        )
+        await session.commit()
+
+
 async def get_epics(project_id: int) -> list[Epic]:
     """Retourne tous les epics d'un projet, triés par id."""
     from sqlalchemy import select

@@ -27,6 +27,8 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Optional
+from typing import Optional
 
 
 # ──────────────────────────────────────────────────────────────
@@ -63,19 +65,22 @@ class Threat:
 
 @dataclass
 class ScanResult:
-    is_safe:  bool
-    severity: str                        # "safe" | "low" | "medium" | "high" | "critical"
-    threats:  list[Threat] = field(default_factory=list)
+    is_safe:      bool
+    severity:     str                        # "safe" | "low" | "medium" | "high" | "critical"
+    threats:      list[Threat] = field(default_factory=list)
+    was_cleaned:  bool = False               # True si les patterns ont été supprimés du texte
+    cleaned_text: Optional[str] = None      # Texte nettoyé (None si pas de nettoyage)
 
     @property
     def blocked(self) -> bool:
-        """Tout threat bloque — même LOW ou MEDIUM."""
-        return not self.is_safe
+        """Bloqué uniquement si menaces présentes ET texte non nettoyé."""
+        return not self.is_safe and not self.was_cleaned
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "is_safe":      self.is_safe,
             "blocked":      self.blocked,
+            "was_cleaned":  self.was_cleaned,
             "severity":     self.severity,
             "threat_count": len(self.threats),
             "threats": [
@@ -90,6 +95,7 @@ class ScanResult:
                 for t in self.threats
             ],
         }
+        return d
 
 
 # ──────────────────────────────────────────────────────────────
@@ -459,6 +465,12 @@ _ALL_PATTERNS = (
     + _compile(_CODE_INJECTION,   ThreatType.CODE_INJECTION)
 )
 
+# Lookup rapide : nom du pattern → regex compilé (utilisé par clean_text)
+_PATTERN_BY_NAME: dict[str, re.Pattern] = {
+    name: compiled
+    for compiled, _sev, name, _desc, _tt in _ALL_PATTERNS
+}
+
 
 def _scan_single(text: str, obfuscated: bool, max_threats: int, seen_patterns: set) -> list[Threat]:
     """Scanne une version du texte et retourne les nouvelles menaces."""
@@ -530,6 +542,22 @@ def scan_text(text: str, *, max_threats: int = 30) -> ScanResult:
         severity = max_severity.value,
         threats  = threats,
     )
+
+
+def clean_text(text: str, threats: list[Threat]) -> str:
+    """
+    Nettoie le texte en remplaçant chaque pattern d'injection détecté
+    par un marqueur [SUPPRIMÉ:<nom_pattern>].
+
+    Appliqué sur le texte original (re.IGNORECASE) — couvre la majorité
+    des menaces directes et obfusquées détectées dans le scan.
+    """
+    cleaned = text
+    for threat in threats:
+        pat = _PATTERN_BY_NAME.get(threat.pattern)
+        if pat:
+            cleaned = pat.sub(f"[SUPPRIMÉ:{threat.pattern}]", cleaned)
+    return cleaned
 
 
 def scan_filename(filename: str) -> ScanResult:

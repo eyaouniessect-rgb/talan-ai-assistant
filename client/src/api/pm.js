@@ -1,9 +1,7 @@
 // src/api/pm.js
 // Façade de compatibilité : ré-exporte les modules API refactorés.
-// Les nouveaux imports recommandés sont:
-// - ./crm
-// - ./projects
-// - ./pipeline
+
+import api from './index'
 
 export {
   getClients,
@@ -23,3 +21,10 @@ export {
   getPipelineDetail,
   validatePhase,
 } from './pipeline'
+
+// ── Dashboard PM ──────────────────────────────────────────────
+export const getPMDashboard = () =>
+  api.get('/dashboard/pm').then(r => r.data)
+
+export const getPMEvents = () =>
+  api.get('/dashboard/pm/events').then(r => r.data)

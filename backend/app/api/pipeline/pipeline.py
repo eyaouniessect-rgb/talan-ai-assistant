@@ -24,14 +24,19 @@
 from datetime import datetime
 from typing import Optional
 import os
+import json
+import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
+from jose import JWTError, jwt
+from app.core.security import SECRET_KEY, ALGORITHM
 from app.database.connection import get_db
 from app.database.models.crm.project import Project
 from app.database.models.pm.pipeline_state import PipelineState
@@ -43,6 +48,11 @@ from agents.pm.db import (
     upsert_pipeline_state,
     get_all_pipeline_states,
     get_employee_id_by_user,
+)
+from agents.pm.agents.stories.repository import (
+    get_stories,
+    update_story,
+    delete_story,
 )
 from agents.pm.state import PMPipelineState
 
@@ -158,6 +168,19 @@ class ValidateRequest(BaseModel):
     """Corps de la requête POST /pipeline/{project_id}/validate."""
     approved: bool
     feedback: Optional[str] = None  # obligatoire si approved=False
+
+
+class UpdateStoryRequest(BaseModel):
+    """Corps de la requête PUT /pipeline/stories/{story_id}."""
+    title:               Optional[str]       = None
+    description:         Optional[str]       = None
+    story_points:        Optional[int]       = None
+    acceptance_criteria: Optional[list[str]] = None
+
+
+class ResyncJiraRequest(BaseModel):
+    """Corps de la requête POST /pipeline/{project_id}/jira-resync."""
+    phase: Optional[str] = None   # ex: "stories", "epics" — défaut = phase courante
 
 
 # ──────────────────────────────────────────────────────────────
@@ -436,3 +459,256 @@ async def validate_phase(
             "Phase rejetée, l'IA va relancer avec votre feedback."
         ),
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/resume — Débloquer un pipeline planté
+# ──────────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/resume")
+async def resume_pipeline(
+    project_id:   int,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Relance un pipeline bloqué (phase pending_ai sans pending_validation en DB).
+
+    Cas d'usage : le graph a crashé en cours d'exécution d'un nœud
+    (exception non capturée avant l'interrupt). On ré-invoque simplement
+    le graph depuis le dernier checkpoint LangGraph.
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    # Vérifier qu'il y a bien une phase en pending_ai (bloquée)
+    phases = await get_all_pipeline_states(project_id)
+    stuck  = [p for p in phases if p.status.value == "pending_ai"]
+    if not stuck and not phases:
+        raise HTTPException(404, f"Aucune phase en cours pour le projet {project_id}.")
+
+    try:
+        await pm_graph.ainvoke(None, config=config)
+    except Exception as e:
+        if "GraphInterrupt" not in type(e).__name__:
+            raise HTTPException(500, f"Erreur lors de la reprise : {str(e)}")
+
+    return {
+        "project_id": project_id,
+        "message": "Pipeline relancé depuis le dernier checkpoint.",
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/jira-resync — Force re-sync Jira d'une phase
+# ──────────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/jira-resync")
+async def jira_resync_phase(
+    project_id:   int,
+    body:         ResyncJiraRequest,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Force la re-synchronisation d'une phase vers Jira sans relancer tout le pipeline.
+
+    Cas d'usage : les stories/epics ont été générés mais la sync Jira a échoué
+    (token invalide, projet Jira inexistant, erreur réseau). On appelle ce endpoint
+    pour rejouer uniquement le nœud jira_sync sur la phase demandée.
+
+    Corps : { "phase": "stories" }  (optionnel — défaut = phase courante du checkpoint)
+    """
+    if not _JIRA_ENABLED:
+        raise HTTPException(400, "Jira n'est pas configuré sur ce serveur.")
+
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    # ── 1. Lire l'état courant depuis le checkpoint LangGraph ─
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet. Lancez d'abord le pipeline.")
+
+    current_state: dict = dict(snapshot.values)
+
+    # ── 2. Déterminer la phase à re-syncer ───────────────────
+    phase = (body.phase or current_state.get("current_phase") or "").strip()
+    if not phase:
+        raise HTTPException(400, "Impossible de déterminer la phase. Fournissez 'phase' dans le corps.")
+
+    syncable = {"epics", "stories", "tasks", "sprints"}
+    if phase not in syncable:
+        raise HTTPException(400, f"Phase '{phase}' non synchronisable. Phases supportées : {sorted(syncable)}.")
+
+    # ── 3. Vérifier la clé Jira ───────────────────────────────
+    jira_key = (current_state.get("jira_project_key") or "").strip()
+    if not jira_key:
+        proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+        jira_key = (proj.jira_project_key or "").strip() if proj else ""
+    if not jira_key:
+        raise HTTPException(400, "Aucune clé projet Jira trouvée. Relancez le pipeline en fournissant une clé Jira.")
+
+    # ── 4. Retirer la phase de jira_synced_phases → force re-sync ─
+    synced = list(current_state.get("jira_synced_phases") or [])
+    if phase in synced:
+        synced.remove(phase)
+
+    # Construire l'état partiel pour le nœud
+    state_for_sync = {
+        **current_state,
+        "current_phase":      phase,
+        "jira_project_key":   jira_key,
+        "jira_synced_phases": synced,
+    }
+
+    # ── 5. Appeler directement le nœud jira_sync ─────────────
+    from agents.pm.graph.node_jira_sync import node_jira_sync
+    try:
+        patch = await node_jira_sync(state_for_sync)
+    except Exception as e:
+        raise HTTPException(500, f"Erreur lors de la re-sync Jira : {str(e)}")
+
+    # ── 6. Persister le patch dans le checkpoint LangGraph ────
+    if patch:
+        await pm_graph.aupdate_state(config, patch, as_node="jira_sync")
+
+    nb_synced = len(patch.get(f"jira_{phase[:-1] if phase.endswith('s') else phase}_map", {}) or patch)
+    return {
+        "project_id":   project_id,
+        "phase":        phase,
+        "jira_key":     jira_key,
+        "patch_keys":   list(patch.keys()) if patch else [],
+        "message":      f"Re-sync Jira phase '{phase}' terminée." if patch else f"Aucun objet créé pour la phase '{phase}'.",
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/{project_id}/stories — Stories du projet (avec IDs DB)
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/{project_id}/stories")
+async def list_stories(
+    project_id:   int,
+    current_user: dict = Depends(require_pm),
+):
+    """Retourne toutes les user stories du projet depuis la DB (avec db_id)."""
+    stories = await get_stories(project_id)
+    return [
+        {
+            "db_id":               s.id,
+            "epic_id":             s.epic_id,
+            "title":               s.title,
+            "description":         s.description,
+            "story_points":        s.story_points,
+            "splitting_strategy":  s.splitting_strategy,
+            "acceptance_criteria": json.loads(s.acceptance_criteria) if s.acceptance_criteria else [],
+            "status":              s.status.value if s.status else "draft",
+            "jira_issue_key":      s.jira_issue_key,
+        }
+        for s in stories
+    ]
+
+
+# ──────────────────────────────────────────────────────────────
+# PUT /pipeline/stories/{story_id} — Modifier une story
+# ──────────────────────────────────────────────────────────────
+
+@router.put("/stories/{story_id}")
+async def update_story_endpoint(
+    story_id:     int,
+    body:         UpdateStoryRequest,
+    current_user: dict = Depends(require_pm),
+):
+    """Modifie les champs éditables d'une user story."""
+    updates = body.model_dump(exclude_none=True)
+    found   = await update_story(story_id, updates)
+    if not found:
+        raise HTTPException(404, f"Story {story_id} introuvable.")
+    return {"story_id": story_id, "updated": True}
+
+
+# ──────────────────────────────────────────────────────────────
+# DELETE /pipeline/stories/{story_id} — Supprimer une story
+# ──────────────────────────────────────────────────────────────
+
+@router.delete("/stories/{story_id}")
+async def delete_story_endpoint(
+    story_id:     int,
+    current_user: dict = Depends(require_pm),
+):
+    """Supprime définitivement une user story."""
+    found = await delete_story(story_id)
+    if not found:
+        raise HTTPException(404, f"Story {story_id} introuvable.")
+    return {"story_id": story_id, "deleted": True}
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/{project_id}/stories/stream — SSE streaming ReAct
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/{project_id}/stories/stream")
+async def stream_stories_events(
+    project_id: int,
+    token:      str = Query(..., description="JWT Bearer token (EventSource ne supporte pas les headers)"),
+):
+    """
+    Server-Sent Events — diffuse en temps réel les événements de génération des stories.
+
+    Événements émis :
+      epic_start     : début du traitement d'un epic
+      tool_start     : démarrage d'un tool (estimate, criteria, review)
+      gap_detected   : gaps fonctionnels détectés par review_coverage
+      retry_start    : régénération ciblée avec les fonctionnalités manquantes
+      coverage_ok    : couverture validée → passage à l'epic suivant
+      epic_done      : stories complètes pour cet epic
+      llm_token      : token LLM en streaming (thinking)
+      done           : génération terminée
+      error          : erreur fatale
+      heartbeat      : keepalive toutes les 15s
+
+    Auth : le JWT est passé en query param ?token=xxx
+    """
+    # Vérification JWT depuis query param (EventSource ne supporte pas les headers)
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        role    = payload.get("role", "")
+        if role != "pm":
+            raise HTTPException(403, "Accès réservé aux PM.")
+    except JWTError:
+        raise HTTPException(401, "Token invalide.")
+
+    from agents.pm.agents.stories.react_agent import get_or_create_queue
+
+    async def event_generator():
+        queue = get_or_create_queue(project_id)
+        try:
+            while True:
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                    if evt.get("type") in ("done", "error"):
+                        break
+                except asyncio.TimeoutError:
+                    # Heartbeat pour maintenir la connexion ouverte
+                    yield 'data: {"type":"heartbeat"}\n\n'
+        except Exception as e:
+            err_msg = str(e)[:200].replace('"', "'")
+            yield f'data: {{"type":"error","message":"{err_msg}"}}\n\n'
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":       "keep-alive",
+        },
+    )
