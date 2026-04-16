@@ -74,28 +74,55 @@ def create_story(
     """
     Crée une User Story dans Jira dans le projet project_key, liée à son Epic.
     Retourne la clé Jira (ex: "TALAN-5").
+
+    Stratégie d'epic link (essaie dans cet ordre) :
+      1. customfield_10014  → projets Classic/Company-managed
+      2. parent.key         → projets NextGen/Team-managed
+      3. sans epic link     → fallback garanti pour créer la story quand même
     """
-    print(f"[Jira] create_story : {title[:60]} → projet {project_key}")
+    print(f"[Jira] create_story : {title[:60]} → projet {project_key} (epic={epic_key})")
     ac_text   = "\n".join(f"- {c}" for c in (acceptance_criteria or []))
     full_desc = description
     if ac_text:
         full_desc += f"\n\n*Critères d'acceptation :*\n{ac_text}"
 
-    fields: dict = {
+    # Champs de base — summary tronqué à 250 chars (limite Jira = 255)
+    base_fields: dict = {
         "project":     {"key": project_key},
-        "summary":     title,
+        "summary":     title[:250],
         "description": _text_doc(full_desc),
         "issuetype":   {"name": "Story"},
     }
-    if epic_key:
-        fields["customfield_10014"] = epic_key
     if story_points:
-        fields["story_points"] = story_points
+        # customfield_10016 = "Story Points" (Jira Cloud standard)
+        base_fields["customfield_10016"] = float(story_points)
 
-    result = jira.post("issue", {"fields": fields})
-    key = result["key"]
-    print(f"[Jira] Story creee : {key}")
-    return key
+    # Séquence de tentatives pour le lien Epic
+    attempts: list[dict] = []
+    if epic_key:
+        attempts.append({**base_fields, "customfield_10014": epic_key})   # Classic
+        attempts.append({**base_fields, "parent": {"key": epic_key}})     # NextGen
+    attempts.append(base_fields)   # Sans lien epic (fallback garanti)
+
+    last_err: Exception | None = None
+    for attempt_fields in attempts:
+        try:
+            result = jira.post("issue", {"fields": attempt_fields})
+            key = result["key"]
+            linked = "epic_link" if "customfield_10014" in attempt_fields \
+                else ("parent" if "parent" in attempt_fields else "sans_epic")
+            print(f"[Jira] Story creee : {key} (stratégie={linked})")
+            return key
+        except RuntimeError as e:
+            last_err = e
+            err_str = str(e)
+            # Réessayer seulement sur une erreur 400 liée au champ epic
+            if "400" in err_str and epic_key:
+                print(f"[Jira]   ⚠ Tentative échouée ({err_str[:120]}) → essai suivant")
+                continue
+            raise   # Autre erreur HTTP → ne pas réessayer
+
+    raise RuntimeError(f"[Jira] create_story échoué sur toutes les tentatives : {last_err}")
 
 
 # ──────────────────────────────────────────────────────────────

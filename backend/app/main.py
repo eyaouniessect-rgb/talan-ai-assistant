@@ -22,6 +22,7 @@ from app.api.events.events import router as events_router
 from app.api.crm.crm import router as crm_router
 from app.api.documents.documents import router as documents_router
 from app.api.pipeline.pipeline import router as pipeline_router
+from app.api.dashboard.pm      import router as dashboard_pm_router
 
 
 @asynccontextmanager
@@ -56,6 +57,7 @@ app.include_router(google_oauth_router)
 app.include_router(crm_router)
 app.include_router(documents_router)
 app.include_router(pipeline_router)
+app.include_router(dashboard_pm_router)
 
 @app.get("/health")
 async def health():

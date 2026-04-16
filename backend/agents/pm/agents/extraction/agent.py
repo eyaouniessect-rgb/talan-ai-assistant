@@ -14,14 +14,17 @@
 import os
 
 from sqlalchemy import select
+from langsmith import traceable
 
 from agents.pm.state import PMPipelineState
 from agents.pm.agents.extraction.service import validate_file, extract_text
+from agents.pm.agents.extraction.vlm_service import detect_architecture_vlm
 from app.core.anti_injection import scan_text, scan_filename
 from app.database.connection import AsyncSessionLocal
 from app.database.models.pm.project_document import ProjectDocument
 
 
+@traceable(name="node_extraction_phase1", run_type="chain")
 async def node_extraction(state: PMPipelineState) -> dict:
     """
     Noeud LangGraph — Phase 1 : extraction du texte CDC.
@@ -113,7 +116,7 @@ async def node_extraction(state: PMPipelineState) -> dict:
     # Fusionner les deux résultats (worst-case severity)
     all_threats = fname_scan.threats + content_scan.threats
     if all_threats:
-        from app.core.anti_injection import ScanResult, _SEVERITY_RANK, Severity
+        from app.core.anti_injection import ScanResult, _SEVERITY_RANK, clean_text
         max_rank     = max(_SEVERITY_RANK[t.severity] for t in all_threats)
         max_severity = next(s for s, r in _SEVERITY_RANK.items() if r == max_rank)
         security_result = ScanResult(is_safe=False, severity=max_severity.value, threats=all_threats)
@@ -127,16 +130,43 @@ async def node_extraction(state: PMPipelineState) -> dict:
         for t in security_result.threats:
             print(f"[EXTRACTION]   [{t.severity.upper()}] {t.pattern} : {t.description}")
 
-    # ── 6. Passe en attente de validation humaine ─────────────
-    # node_validate lit cdc_text + security_scan depuis le state
-    # et persiste PENDING_VALIDATION + interrupt()
+        # Nettoyage du texte : suppression des patterns d'injection
+        print(f"[EXTRACTION] → Nettoyage du texte (suppression des patterns détectés)...")
+        cdc_text = clean_text(cdc_text, security_result.threats)
+        security_result.was_cleaned  = True
+        security_result.cleaned_text = cdc_text[:500]
+        print(f"[EXTRACTION] ✓ Texte nettoyé — traitement continue avec le texte assaini")
+
+    # ── 6. Analyse VLM — détection d'architecture ────────────
+    print(f"\n[EXTRACTION] Analyse VLM (détection d'architecture dans le document)...")
+    architecture_detected, architecture_description, architecture_details, doc_info = (
+        await detect_architecture_vlm(file_bytes=file_bytes, ext=ext)
+    )
+
+    page_count  = doc_info.get("page_count")  or max(1, len(cdc_text) // 2000)
+    image_count = doc_info.get("image_count") or 0
+
+    if architecture_detected:
+        print(f"[EXTRACTION] ✓ Architecture détectée par VLM")
+        layers = (architecture_details or {}).get("layers", [])
+        print(f"[EXTRACTION]   {len(layers)} couche(s) identifiée(s)")
+    else:
+        print(f"[EXTRACTION] ✗ Aucune architecture dans le document — sera générée en phase 8")
+
+    # ── 7. Passe en attente de validation humaine ─────────────
     print(f"\n[EXTRACTION] → Passage à node_validate (validation humaine requise)")
     print(f"{'='*60}\n")
 
     return {
-        "cdc_text":          cdc_text,
-        "security_scan":     security_result.to_dict(),
-        "current_phase":     "extract",
-        "validation_status": "pending_human",
-        "error":             None,
+        "cdc_text":                  cdc_text,
+        "security_scan":             security_result.to_dict(),
+        "architecture_detected":     architecture_detected,
+        "architecture_description":  architecture_description,
+        "architecture_details":      architecture_details,
+        "page_count":                page_count,
+        "image_count":               image_count,
+        "vlm_doc_info":              doc_info,
+        "current_phase":             "extract",
+        "validation_status":         "pending_human",
+        "error":                     None,
     }

@@ -36,10 +36,11 @@ async def node_epics(state: PMPipelineState) -> dict:
     # ── 1. Génération LLM ────────────────────────────────────
     try:
         epics = await generate_epics(cdc_text, human_feedback)
-    except ValueError as e:
+    except Exception as e:
         error_msg = str(e)
-        print(f"[epics] ERREUR LLM : {error_msg}")
-        return {"error": error_msg, "current_phase": "epics"}
+        print(f"[epics] ERREUR : {type(e).__name__}: {error_msg[:200]}")
+        return {"epics": [], "error": error_msg, "current_phase": "epics",
+                "validation_status": "pending_human", "human_feedback": None}
 
     print(f"[epics] {len(epics)} epics générés")
 

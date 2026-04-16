@@ -47,6 +47,32 @@ class PMPipelineState(TypedDict):
     # Voir app/core/anti_injection.ScanResult.to_dict()
     security_scan: Optional[dict]
 
+    # Analyse VLM — remplie par node_extraction (phase 1)
+    # True  → une architecture a été détectée dans le document PDF/DOCX
+    # False → aucune architecture visuelle trouvée → sera générée en phase 8
+    architecture_detected: bool
+
+    # Description textuelle globale extraite par le VLM (4-6 phrases)
+    # None si architecture_detected = False
+    architecture_description: Optional[str]
+
+    # Détails structurés extraits par le VLM :
+    # layers, agents, apis, data_sources, mcp_servers,
+    # security_mechanisms, orchestration, external_services, deployment, etc.
+    # None si architecture_detected = False
+    # Utilisé par node_tech_stack (phase 7) et node_architecture (phase 8)
+    architecture_details: Optional[dict]
+
+    # Nombre réel de pages du document (PDF : pages pymupdf, sinon estimé depuis nb_chars)
+    page_count: Optional[int]
+
+    # Nombre d'images/visuels trouvés dans le document (PDF drawings + embedded images)
+    image_count: Optional[int]
+
+    # Métadonnées détaillées retournées par le service VLM
+    # { page_count, image_count, analyzed_count, oversized_pages }
+    vlm_doc_info: Optional[dict]
+
 
     # ╔══════════════════════════════════════════════════════╗
     # ║  PHASE 2 — Epics                                    ║

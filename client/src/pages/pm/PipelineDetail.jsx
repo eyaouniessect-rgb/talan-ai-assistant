@@ -7,12 +7,14 @@ import {
   AlertCircle,
   Rocket,
   Tag,
+  RefreshCw,
 } from "lucide-react";
 import clsx from "clsx";
 import {
   getPipelineDetail,
   validatePhase,
   startPipeline,
+  resyncJira,
 } from "../../api/pipeline";
 import { getDocument } from "../../api/projects";
 import { PHASES, PHASE_KEY_MAP } from "./constants/phases";
@@ -20,6 +22,7 @@ import PhaseList from "./components/PhaseList";
 import PhaseResult from "./components/PhaseResult";
 import ValidationCard from "./components/ValidationCard";
 import ProcessingCard from "./components/ProcessingCard";
+import StoriesStreamCard from "./components/StoriesStreamCard";
 
 export default function PipelineDetail() {
   const { id } = useParams();
@@ -37,6 +40,8 @@ export default function PipelineDetail() {
   const [startError, setStartError] = useState(null);
   const [jiraKey, setJiraKey] = useState("");
   const [processingState, setProcessingState] = useState(null); // { phase, approved }
+  const [resyncLoading, setResyncLoading] = useState(false);
+  const [resyncResult, setResyncResult] = useState(null); // { ok, message }
 
   const fetchData = useCallback(
     async (silent = false) => {
@@ -147,6 +152,22 @@ export default function PipelineDetail() {
       );
     } finally {
       setStartLoading(false);
+    }
+  };
+
+  const handleResyncJira = async (phaseKey) => {
+    setResyncLoading(true);
+    setResyncResult(null);
+    try {
+      const res = await resyncJira(id, phaseKey);
+      setResyncResult({ ok: true, message: res.message });
+    } catch (e) {
+      setResyncResult({
+        ok: false,
+        message: e.response?.data?.detail || "Erreur lors de la re-sync Jira.",
+      });
+    } finally {
+      setResyncLoading(false);
     }
   };
 
@@ -334,11 +355,26 @@ export default function PipelineDetail() {
                     {activePhaseData.label}
                   </h2>
                 </div>
-                {getPhaseStatus(activePhase) === "done" && (
-                  <span className="flex items-center gap-1 text-xs text-green-600 bg-green-50 px-2.5 py-1 rounded-full">
-                    <CheckCircle size={11} /> Validé
-                  </span>
-                )}
+                <div className="flex items-center gap-2">
+                  {getPhaseStatus(activePhase) === "done" && (
+                    <span className="flex items-center gap-1 text-xs text-green-600 bg-green-50 px-2.5 py-1 rounded-full">
+                      <CheckCircle size={11} /> Validé
+                    </span>
+                  )}
+                  {getPhaseStatus(activePhase) === "done" &&
+                    project?.jira_project_key &&
+                    ["epics", "stories", "tasks", "sprints"].includes(activePhase) && (
+                      <button
+                        onClick={() => handleResyncJira(activePhase)}
+                        disabled={resyncLoading}
+                        title="Forcer la re-synchronisation vers Jira"
+                        className="flex items-center gap-1 text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 px-2.5 py-1 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <RefreshCw size={11} className={resyncLoading ? "animate-spin" : ""} />
+                        {resyncLoading ? "Sync..." : "Re-sync Jira"}
+                      </button>
+                    )}
+                </div>
                 {getPhaseStatus(activePhase) === "active" && (
                   <span className="flex items-center gap-1 text-xs text-amber-600 bg-amber-50 px-2.5 py-1 rounded-full">
                     <AlertCircle size={11} /> En attente
@@ -361,10 +397,14 @@ export default function PipelineDetail() {
               </p>
 
               {getPhaseStatus(activePhase) === "running" ? (
-                <div className="flex items-center gap-3 text-blue-600 text-sm py-4">
-                  <Loader size={18} className="animate-spin shrink-0" /> L'IA
-                  traite cette phase...
-                </div>
+                activePhase === "stories" ? (
+                  <StoriesStreamCard projectId={parseInt(id)} />
+                ) : (
+                  <div className="flex items-center gap-3 text-blue-600 text-sm py-4">
+                    <Loader size={18} className="animate-spin shrink-0" /> L'IA
+                    traite cette phase...
+                  </div>
+                )
               ) : (
                 <PhaseResult
                   phaseId={activePhase}
@@ -378,6 +418,32 @@ export default function PipelineDetail() {
                   {new Date(activePhaseDb.updated_at).toLocaleString("fr-FR")}
                 </p>
               )}
+            </div>
+          )}
+
+          {resyncResult && (
+            <div
+              className={clsx(
+                "card p-3 flex items-center justify-between gap-3 text-sm",
+                resyncResult.ok
+                  ? "border border-green-200 bg-green-50 text-green-800"
+                  : "border border-red-200 bg-red-50 text-red-800",
+              )}
+            >
+              <div className="flex items-center gap-2">
+                {resyncResult.ok ? (
+                  <CheckCircle size={15} className="shrink-0 text-green-500" />
+                ) : (
+                  <AlertCircle size={15} className="shrink-0 text-red-500" />
+                )}
+                <span>{resyncResult.message}</span>
+              </div>
+              <button
+                onClick={() => setResyncResult(null)}
+                className="text-xs opacity-60 hover:opacity-100"
+              >
+                ✕
+              </button>
             </div>
           )}
 
