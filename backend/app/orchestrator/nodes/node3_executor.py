@@ -272,11 +272,28 @@ async def _call_agent(
 
     # ── Construction du message A2A ───────────────────────
     history_section = f"Historique de la conversation :\n{history}\n---\n" if history else ""
+
+    # Pour l'agent Slack : injecter le nom de l'utilisateur courant
+    user_name_section = ""
+    if agent_name == "slack":
+        try:
+            from sqlalchemy import select
+            from app.database.connection import AsyncSessionLocal
+            from app.database.models.public.user import User
+            async with AsyncSessionLocal() as db:
+                row = await db.execute(select(User.name, User.email).where(User.id == user_id))
+                u = row.first()
+                if u:
+                    user_name_section = f"Nom de l'utilisateur connecté : {u.name}\nEmail : {u.email}\n"
+        except Exception:
+            pass
+
     message = (
         f"Date du jour : {today_iso}\n---\n"
+        f"{user_name_section}"          # Nom/Email en tête → utilisé pour la signature des messages
         f"{history_section}"
         f"INSTRUCTION À EXÉCUTER :\n{task}\n---\n"
-        f"Role utilisateur : {role}\nUser ID : {user_id}"
+        f"Role utilisateur : {role}\nUser ID : {user_id}\n"
     )
 
     print(f"      [A2A] Appel agent='{agent_name}' streaming={discovered.supports_streaming}")
