@@ -60,7 +60,9 @@ class PipelineStatusEnum(str, enum.Enum):
 
 
 class ProjectGlobalStatus(str, enum.Enum):
-    NOT_STARTED   = "not_started"   # projet créé, aucune phase lancée
-    IN_PROGRESS   = "in_progress"   # pipeline en cours (IA génère ou PM valide)
-    PENDING_HUMAN = "pending_human" # une phase attend la validation du PM
-    COMPLETED     = "completed"     # 12/12 phases validées
+    NOT_STARTED    = "not_started"    # projet créé, aucune phase lancée
+    IN_PROGRESS    = "in_progress"    # pipeline IA en cours
+    PENDING_HUMAN  = "pending_human"  # une phase attend la validation du PM
+    PIPELINE_DONE  = "pipeline_done"  # 12/12 phases validées — prêt pour le développement
+    IN_DEVELOPMENT = "in_development" # développement en cours (progress 0→100)
+    DELIVERED      = "delivered"      # projet livré (progress = 100)

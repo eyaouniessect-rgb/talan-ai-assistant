@@ -12,6 +12,7 @@ from typing import Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
+from langgraph.errors import GraphRecursionError
 
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
@@ -126,6 +127,21 @@ async def get_slack_user(user_id: str) -> str:
 
 
 @tool
+async def add_slack_reaction(channel: str, timestamp: str, reaction: str) -> str:
+    """
+    Ajoute un emoji réaction à un message Slack.
+    channel   : ID du channel contenant le message
+    timestamp : timestamp du message (champ ts)
+    reaction  : nom de l'emoji sans les :: (ex: thumbsup, white_check_mark)
+    """
+    try:
+        result = await slack_tools.add_reaction(channel=channel, timestamp=timestamp, reaction=reaction)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+
+@tool
 async def find_slack_user(name: str) -> str:
     """
     Cherche un utilisateur Slack par son nom (prénom, nom complet ou email).
@@ -148,6 +164,7 @@ TOOLS = [
     get_thread_replies,
     get_slack_user,
     find_slack_user,
+    add_slack_reaction,
 ]
 
 
@@ -164,6 +181,7 @@ def _tool_to_human_text(tool_name: str, args: dict) -> str:
         "get_thread_replies":   lambda a: f"Récupération du thread dans **{a.get('channel', '?')}**...",
         "get_slack_user":       lambda a: f"Récupération du profil utilisateur `{a.get('user_id', '?')}`...",
         "find_slack_user":      lambda a: f"Recherche de l'utilisateur **{a.get('name', '?')}** dans Slack...",
+        "add_slack_reaction":   lambda a: f"Ajout de la réaction :{a.get('reaction', '?')}: sur le message...",
     }
     fn = mapping.get(tool_name)
     return fn(args) if fn else f"Exécution de {tool_name}..."
@@ -225,7 +243,7 @@ class SlackAgentExecutor(AgentExecutor):
                     async for event in self.react_agent.astream_events(
                         {"messages": [HumanMessage(content=user_input)]},
                         version="v2",
-                        config={"recursion_limit": 10},
+                        config={"recursion_limit": 12},
                     ):
                         etype = event["event"]
 
@@ -246,6 +264,12 @@ class SlackAgentExecutor(AgentExecutor):
 
                     break
 
+                except GraphRecursionError:
+                    print(f"⚠️ Récursion LangGraph dépassée (Slack)")
+                    final_response = "La demande nécessite trop d'étapes. Essayez en précisant le canal directement (ex: #general)."
+                    ls_run.end(outputs={"response": final_response, "error": "recursion"})
+                    await _enqueue_final(event_queue, json.dumps({"response": final_response, "react_steps": []}, ensure_ascii=False), task_id, context_id, status_events_emitted)
+                    return
                 except Exception as e:
                     if _is_context_error(e):
                         print(f"⚠️ Contexte trop long (Slack) : {str(e)[:120]}")
@@ -308,6 +332,32 @@ class SlackAgentExecutor(AgentExecutor):
                 print(f"{'─'*50}\n")
                 final_response = result_messages[-1].content
 
+            # ── Détection needs_input + ui_hint channel_select ──
+            _CHANNEL_KEYWORDS = ["canal", "channel", "canneau", "canaux", "channels"]
+            is_question = final_response.strip().endswith("?")
+            needs_input = is_question
+            ui_hint = None
+
+            if is_question and any(kw in final_response.lower() for kw in _CHANNEL_KEYWORDS):
+                try:
+                    channels_data = await slack_tools.get_channel_list()
+                    channels = channels_data.get("channels", [])
+                    channel_names = [
+                        {"id": c.get("id"), "name": c.get("name")}
+                        for c in channels if c.get("name") and not c.get("is_archived")
+                    ]
+                    if channel_names:
+                        ui_hint = {"type": "channel_select", "channels": channel_names}
+                        print(f"  📋 ui_hint channel_select : {len(channel_names)} channels")
+                except Exception as e:
+                    print(f"  ⚠️ Impossible de charger les channels pour ui_hint : {e}")
+
+            payload = {"response": final_response, "react_steps": react_steps}
+            if needs_input:
+                payload["needs_input"] = True
+            if ui_hint:
+                payload["ui_hint"] = ui_hint
+
             ls_run.end(outputs={
                 "response": final_response[:500] if final_response else "",
                 "react_steps": react_steps,
@@ -315,7 +365,7 @@ class SlackAgentExecutor(AgentExecutor):
 
             await _enqueue_final(
                 event_queue,
-                json.dumps({"response": final_response, "react_steps": react_steps}, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
                 task_id,
                 context_id,
                 status_events_emitted,

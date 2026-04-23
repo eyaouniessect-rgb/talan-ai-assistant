@@ -6,7 +6,7 @@
 # project_manager_id → hris.employees.id : le PM est un employé avec un profil RH complet.
 # Référencé par pm.epics, pm.pipeline_state et pm.sprints pour le pipeline IA.
 
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Boolean, ForeignKey, func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
 
@@ -30,6 +30,9 @@ class Project(Base):
     # Intégration Jira — clé du projet Jira lié (ex: "TALAN")
     # Renseignée au lancement du pipeline, utilisée pour synchroniser chaque phase
     jira_project_key   = Column(String, nullable=True)
+
+    archived           = Column(Boolean, default=False, nullable=False)
+    archive_reason     = Column(String, nullable=True)   # "completed" | "cancelled" | "on_hold" | "other"
 
     created_at         = Column(DateTime, server_default=func.now())
 

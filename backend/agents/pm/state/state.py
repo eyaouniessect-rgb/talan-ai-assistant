@@ -120,11 +120,20 @@ class PMPipelineState(TypedDict):
     #   "round":         int,
     #   "po_comment":    str,
     #   "tech_comment":  str,
-    #   "stories_patch": list[dict]
+    #   "stories_patch": list[dict]  — enrichis avec old_value + db_id
     # }
 
     refined_stories: list[dict]
-    # Stories après consensus PO ↔ Tech Lead (même structure que stories)
+    # Stories après le dernier round appliqué par le PM
+
+    # Stories AVANT le round courant — utilisées pour le revert story-par-story
+    stories_before_round: Optional[list]
+
+    # Numéro du round qui vient de terminer (1-based)
+    current_round: Optional[int]
+
+    # True si le consensus PO↔TL a été atteint lors du dernier round
+    refinement_consensus: Optional[bool]
 
 
     # ╔══════════════════════════════════════════════════════╗

@@ -148,6 +148,18 @@ def _step_start_msg(agent: str, task: str) -> str:
     if agent == "jira":
         return "Je consulte vos tickets Jira..."
     if agent == "slack":
+        if any(k in t for k in ["liste", "lister", "channels", "cannaux", "canaux"]):
+            return "Je recupere la liste des channels Slack..."
+        if any(k in t for k in ["cherche", "trouve", "utilisateur", "profil", "qui est"]):
+            return "Je recherche l'utilisateur dans Slack..."
+        if any(k in t for k in ["lis", "lire", "messages", "derniers", "historique", "montre"]):
+            return "Je lis les messages Slack..."
+        if any(k in t for k in ["recherche", "search", "mots-cles", "keyword"]):
+            return "Je recherche dans Slack..."
+        if any(k in t for k in ["reaction", "emoji", "reagi"]):
+            return "J'ajoute la reaction Slack..."
+        if any(k in t for k in ["thread", "replies", "reponses"]):
+            return "Je recupere le thread Slack..."
         return "J'envoie votre message Slack..."
     if agent == "crm":
         return "Je consulte les donnees CRM..."

@@ -128,6 +128,86 @@ async def get_all_users() -> dict:
     return await call_mcp("slack_get_users", {})
 
 
+async def search_messages(query: str, count: int = 10) -> dict:
+    """
+    Recherche des messages dans Slack par mot-clé.
+    Parcourt l'historique des channels disponibles et filtre côté Python.
+    """
+    query_lower = query.lower()
+
+    # Récupérer la liste des channels
+    channels_data = await call_mcp("slack_list_channels", {"limit": 50})
+    channels = channels_data.get("channels", [])
+    if not channels:
+        return {"ok": False, "error": "Impossible de récupérer les channels"}
+
+    # Récupérer un seul appel slack_get_users pour résoudre les noms
+    user_map: dict[str, str] = {}
+    try:
+        users_data = await call_mcp("slack_get_users", {})
+        members = users_data.get("members") or users_data.get("users") or []
+        for m in members:
+            uid = m.get("id", "")
+            profile = m.get("profile", {})
+            name = (
+                profile.get("real_name") or profile.get("display_name")
+                or m.get("real_name") or m.get("name") or uid
+            )
+            user_map[uid] = name
+    except Exception:
+        pass
+
+    results = []
+    skipped_channels = []
+    for ch in channels:
+        if len(results) >= count:
+            break
+        ch_id = ch.get("id")
+        ch_name = ch.get("name", ch_id)
+        if not ch_id:
+            continue
+        try:
+            hist = await call_mcp("slack_get_channel_history", {"channel_id": ch_id, "limit": 100})
+            for msg in hist.get("messages", []):
+                text = msg.get("text", "")
+                if query_lower in text.lower():
+                    uid      = msg.get("user", "")
+                    bot_id   = msg.get("bot_id", "")
+                    username = msg.get("username", "")
+                    if uid and uid in user_map:
+                        author = user_map[uid]
+                    elif bot_id:
+                        author = username or "Talan Assistant"
+                    else:
+                        author = uid or "Inconnu"
+                    results.append({
+                        "channel": ch_name,
+                        "channel_id": ch_id,
+                        "author": author,
+                        "text": text.replace("\\n", "\n").strip(),
+                        "ts": msg.get("ts", ""),
+                    })
+                    if len(results) >= count:
+                        break
+        except Exception:
+            skipped_channels.append(ch_name)
+            continue
+
+    response = {"ok": True, "messages": results, "total": len(results)}
+    if skipped_channels:
+        response["warning"] = f"Channels inaccessibles (bot non invité) : {', '.join(skipped_channels[:5])}"
+    return response
+
+
+async def add_reaction(channel: str, timestamp: str, reaction: str) -> dict:
+    """Ajoute un emoji réaction à un message Slack."""
+    return await call_mcp("slack_add_reaction", {
+        "channel_id": channel,
+        "timestamp": timestamp,
+        "reaction": reaction,
+    })
+
+
 async def get_user_profile(user_id: str) -> dict:
     """Retourne le profil d'un utilisateur par son ID Slack (U...)."""
     return await call_mcp("slack_get_user_profile", {
