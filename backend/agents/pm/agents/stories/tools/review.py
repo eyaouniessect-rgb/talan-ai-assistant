@@ -5,10 +5,13 @@
 # Utilisé par les @tool wrappers dans react_agent.py
 # ═══════════════════════════════════════════════════════════════
 
+import asyncio
 import json
 import re
 
 from app.core.groq_client import invoke_with_fallback
+
+_RETRY_DELAYS = [3, 7]   # secondes avant 1er et 2e retry
 
 _MODEL = "openai/gpt-oss-120b"
 
@@ -62,35 +65,53 @@ Retourne UNIQUEMENT ce JSON :
   "suggestions": []
 }}"""
 
-    raw = await invoke_with_fallback(
-        model      = _MODEL,
-        messages   = [
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user",   "content": prompt},
-        ],
-        max_tokens  = 768,
-        temperature = 0,
-    )
+    last_error: Exception | None = None
+    attempts = 1 + len(_RETRY_DELAYS)
 
-    clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-    try:
-        data = json.loads(clean)
-        scope_issues   = list(data.get("scope_creep_issues", []))
-        quality_issues = list(data.get("quality_issues", []))
-        gaps           = list(data.get("gaps", []))
+    for attempt in range(attempts):
+        try:
+            raw = await invoke_with_fallback(
+                model      = _MODEL,
+                messages   = [
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user",   "content": prompt},
+                ],
+                max_tokens  = 768,
+                temperature = 0,
+            )
 
-        if scope_issues:
-            print(f"[review]   ⚠ Scope creep détecté pour epic {epic_idx} : {scope_issues}")
-        if quality_issues:
-            print(f"[review]   ⚠ Problèmes qualité pour epic {epic_idx} : {quality_issues}")
+            if not raw or not raw.strip():
+                raise ValueError("Réponse vide du LLM (No message content)")
 
-        return {
-            "coverage_ok":        bool(data.get("coverage_ok", True)),
-            "gaps":               gaps,
-            "scope_creep_issues": scope_issues,
-            "quality_issues":     quality_issues,
-            "suggestions":        list(data.get("suggestions", [])),
-        }
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        print(f"[review] ⚠ JSON invalide → coverage_ok=True (fail-safe) : {e}")
-        return {"coverage_ok": True, "gaps": [], "scope_creep_issues": [], "quality_issues": [], "suggestions": []}
+            clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+            data  = json.loads(clean)
+
+            scope_issues   = list(data.get("scope_creep_issues", []))
+            quality_issues = list(data.get("quality_issues", []))
+            gaps           = list(data.get("gaps", []))
+
+            if scope_issues:
+                print(f"[review]   ⚠ Scope creep détecté pour epic {epic_idx} : {scope_issues}")
+            if quality_issues:
+                print(f"[review]   ⚠ Problèmes qualité pour epic {epic_idx} : {quality_issues}")
+
+            if attempt > 0:
+                print(f"[review]   Epic {epic_idx} OK après {attempt} retry")
+
+            return {
+                "coverage_ok":        bool(data.get("coverage_ok", True)),
+                "gaps":               gaps,
+                "scope_creep_issues": scope_issues,
+                "quality_issues":     quality_issues,
+                "suggestions":        list(data.get("suggestions", [])),
+            }
+
+        except Exception as e:
+            last_error = e
+            if attempt < len(_RETRY_DELAYS):
+                delay = _RETRY_DELAYS[attempt]
+                print(f"[review] ⚠ Epic {epic_idx} tentative {attempt + 1} échouée ({type(e).__name__}: {str(e)[:80]}) → retry dans {delay}s")
+                await asyncio.sleep(delay)
+
+    print(f"[review] ✗ Epic {epic_idx} — {attempts} tentatives échouées → coverage_ok=True fail-safe")
+    return {"coverage_ok": True, "gaps": [], "scope_creep_issues": [], "quality_issues": [], "suggestions": []}

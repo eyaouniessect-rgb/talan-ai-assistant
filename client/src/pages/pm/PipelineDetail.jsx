@@ -15,6 +15,9 @@ import {
   validatePhase,
   startPipeline,
   resyncJira,
+  restartMissingStories,
+  restartRefinement,
+  applyRefinementRound,
 } from "../../api/pipeline";
 import { getDocument } from "../../api/projects";
 import { PHASES, PHASE_KEY_MAP } from "./constants/phases";
@@ -168,6 +171,39 @@ export default function PipelineDetail() {
       });
     } finally {
       setResyncLoading(false);
+    }
+  };
+
+  const handleContinueStories = async () => {
+    try {
+      await restartMissingStories(id);
+    } catch {
+      // ignore — la phase est déjà repassée en pending_ai côté backend
+    }
+    await fetchData(true);
+    // Réactiver le polling
+    pollRef.current = setInterval(() => fetchData(true), 4000);
+  };
+
+  const handleRestartRefinement = async () => {
+    try {
+      await restartRefinement(id);
+    } catch {
+      // ignore — la phase est déjà repassée en pending_ai côté backend
+    }
+    await fetchData(true);
+    pollRef.current = setInterval(() => fetchData(true), 4000);
+  };
+
+  const handleApplyRefinementRound = async (storyChoices, continueRefinement) => {
+    try {
+      await applyRefinementRound(id, storyChoices, continueRefinement);
+    } catch {
+      // ignore
+    }
+    await fetchData(true);
+    if (continueRefinement) {
+      pollRef.current = setInterval(() => fetchData(true), 4000);
     }
   };
 
@@ -409,6 +445,14 @@ export default function PipelineDetail() {
                 <PhaseResult
                   phaseId={activePhase}
                   aiOutput={activePhaseDb?.ai_output}
+                  onContinue={
+                    activePhase === "stories"    ? handleContinueStories   :
+                    activePhase === "refinement" ? handleRestartRefinement :
+                    undefined
+                  }
+                  onApplyRound={
+                    activePhase === "refinement" ? handleApplyRefinementRound : undefined
+                  }
                 />
               )}
 

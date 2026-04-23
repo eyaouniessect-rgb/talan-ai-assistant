@@ -29,6 +29,40 @@ export const updateStory = (storyId, body) =>
 export const deleteStory = (storyId) =>
   api.delete(`/pipeline/stories/${storyId}`).then(r => r.data)
 
+// ── Transition de statut manuel ──────────────────────────────
+// pipeline_done → in_development → delivered
+
+export const advanceProjectStatus = (projectId) =>
+  api.patch(`/pipeline/${projectId}/status`).then(r => r.data)
+
+// ── Archive / Delete ──────────────────────────────────────────
+
+export const archiveProject = (projectId, reason) =>
+  api.patch(`/pipeline/${projectId}/archive`, { reason }).then(r => r.data)
+
+export const unarchiveProject = (projectId) =>
+  api.patch(`/pipeline/${projectId}/unarchive`).then(r => r.data)
+
+export const deleteProject = (projectId) =>
+  api.delete(`/pipeline/${projectId}`).then(r => r.data)
+
+export const getArchivedProjects = () =>
+  api.get('/pipeline/projects', { params: { archived: true } }).then(r => r.data)
+
+// ── Génère les stories manquantes (epics sans stories) ───────
+
+export const restartMissingStories = (projectId) =>
+  api.post(`/pipeline/${projectId}/stories/restart`).then(r => r.data)
+
+export const restartRefinement = (projectId) =>
+  api.post(`/pipeline/${projectId}/refinement/restart`).then(r => r.data)
+
+export const applyRefinementRound = (projectId, storyChoices, continueRefinement) =>
+  api.post(`/pipeline/${projectId}/refinement/round/apply`, {
+    story_choices:       storyChoices,
+    continue_refinement: continueRefinement,
+  }).then(r => r.data)
+
 // ── Jira re-sync ──────────────────────────────────────────────
 
 export const resyncJira = (projectId, phase) =>

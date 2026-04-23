@@ -27,7 +27,7 @@ import os
 import json
 import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -41,7 +41,7 @@ from app.database.connection import get_db
 from app.database.models.crm.project import Project
 from app.database.models.pm.pipeline_state import PipelineState
 from app.database.models.pm.project_document import ProjectDocument
-from app.database.models.pm.enums import PipelineStatusEnum, ProjectGlobalStatus
+from app.database.models.pm.enums import PipelineStatusEnum, PipelinePhaseEnum, ProjectGlobalStatus
 
 from agents.pm.graph import get_pm_graph
 from agents.pm.db import (
@@ -87,6 +87,7 @@ async def get_pipeline_config():
 
 @router.get("/projects")
 async def list_pipeline_projects(
+    archived:     bool         = Query(False, description="Inclure uniquement les projets archivés"),
     current_user: dict         = Depends(require_pm),
     db:           AsyncSession = Depends(get_db),
 ):
@@ -99,9 +100,13 @@ async def list_pipeline_projects(
     if not employee_id:
         return []
 
+    # Par défaut : projets actifs (archived=False). ?archived=true pour les archivés.
     projects = (await db.execute(
         select(Project)
-        .where(Project.project_manager_id == employee_id)
+        .where(
+            Project.project_manager_id == employee_id,
+            Project.archived.is_(archived),
+        )
         .options(selectinload(Project.client))
     )).scalars().all()
 
@@ -126,7 +131,7 @@ async def list_pipeline_projects(
 
         # Statut global du projet (calculé depuis les phases pipeline)
         if phases_done == 12:
-            global_status = ProjectGlobalStatus.COMPLETED
+            global_status = ProjectGlobalStatus.PIPELINE_DONE
         elif any(p.status == PipelineStatusEnum.PENDING_VALIDATION for p in phases):
             global_status = ProjectGlobalStatus.PENDING_HUMAN
         elif phases_done > 0 or current_status:
@@ -148,6 +153,8 @@ async def list_pipeline_projects(
             "current_phase":  current_phase,
             "current_status": current_status,
             "global_status":  global_status,
+            "archived":       project.archived,
+            "archive_reason": project.archive_reason,
             "created_at":     project.created_at.isoformat() if project.created_at else None,
         })
 
@@ -442,7 +449,7 @@ async def validate_phase(
     proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
     if proj:
         if validated_count == 12:
-            proj.status = ProjectGlobalStatus.COMPLETED.value
+            proj.status = ProjectGlobalStatus.PIPELINE_DONE.value
         elif has_pending:
             proj.status = ProjectGlobalStatus.PENDING_HUMAN.value
         else:
@@ -500,6 +507,358 @@ async def resume_pipeline(
         "project_id": project_id,
         "message": "Pipeline relancé depuis le dernier checkpoint.",
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/stories/restart — Génère les epics manquants
+# ──────────────────────────────────────────────────────────────
+
+async def _background_generate_missing_stories(
+    project_id:          int,
+    all_epics:           list[dict],
+    missing_epics:       list[dict],
+    missing_indices:     list[int],
+    existing_stories:    list[dict],
+    human_feedback:      str | None,
+    architecture_details: dict | None,
+) -> None:
+    from agents.pm.agents.stories.service    import generate_stories
+    from agents.pm.agents.stories.repository import save_stories
+
+    try:
+        print(f"[restart_stories] ▶ projet={project_id} | épics manquants={missing_indices}")
+
+        # Génère uniquement pour les epics manquants (indexés 0..N localement)
+        new_stories = await generate_stories(
+            epics                = missing_epics,
+            human_feedback       = human_feedback,
+            architecture_details = architecture_details,
+            project_id           = project_id,
+        )
+
+        # Corrige epic_id local (0..N) → index original dans all_epics
+        local_to_orig = {local: orig for local, orig in enumerate(missing_indices)}
+        for s in new_stories:
+            s["epic_id"] = local_to_orig.get(s.get("epic_id", 0), s.get("epic_id", 0))
+
+        # Fusionne avec les stories déjà générées
+        all_stories = existing_stories + new_stories
+
+        await save_stories(project_id, all_stories)
+        await upsert_pipeline_state(
+            project_id = project_id,
+            phase      = PipelinePhaseEnum.PHASE_3_STORIES,
+            status     = PipelineStatusEnum.PENDING_VALIDATION,
+            ai_output  = {"stories": all_stories, "epics": all_epics},
+        )
+        print(f"[restart_stories] ✓ {len(new_stories)} nouvelles + {len(existing_stories)} existantes = {len(all_stories)} stories")
+    except Exception as e:
+        print(f"[restart_stories] ❌ {e}")
+        await upsert_pipeline_state(
+            project_id = project_id,
+            phase      = PipelinePhaseEnum.PHASE_3_STORIES,
+            status     = PipelineStatusEnum.PENDING_VALIDATION,
+        )
+
+
+@router.post("/{project_id}/stories/restart")
+async def restart_missing_stories(
+    project_id:       int,
+    background_tasks: BackgroundTasks,
+    current_user:     dict         = Depends(require_pm),
+    db:               AsyncSession = Depends(get_db),
+):
+    """Génère les user stories pour les epics qui n'en ont pas encore."""
+    phases = await get_all_pipeline_states(project_id)
+
+    epics_phase = next(
+        (p for p in phases if p.phase.value == PipelinePhaseEnum.PHASE_2_EPICS.value), None
+    )
+    if not epics_phase or not epics_phase.ai_output:
+        raise HTTPException(400, "La phase épics n'a pas de résultat disponible.")
+
+    all_epics = epics_phase.ai_output.get("epics", [])
+    if not all_epics:
+        raise HTTPException(400, "Aucun epic trouvé pour ce projet.")
+
+    # Stories et epics déjà couverts
+    stories_phase = next(
+        (p for p in phases if p.phase.value == PipelinePhaseEnum.PHASE_3_STORIES.value), None
+    )
+    existing_stories: list[dict] = []
+    covered_ids: set[int] = set()
+    if stories_phase and stories_phase.ai_output:
+        existing_stories = stories_phase.ai_output.get("stories", [])
+        covered_ids = {
+            s.get("epic_id") for s in existing_stories if s.get("epic_id") is not None
+        }
+
+    missing_indices = [i for i in range(len(all_epics)) if i not in covered_ids]
+    if not missing_indices:
+        return {"status": "complete", "message": "Toutes les stories sont déjà présentes."}
+
+    missing_epics = [all_epics[i] for i in missing_indices]
+
+    # Architecture (optionnelle)
+    extract_phase = next(
+        (p for p in phases if p.phase.value == PipelinePhaseEnum.PHASE_1_EXTRACTION.value), None
+    )
+    architecture_details = None
+    if extract_phase and extract_phase.ai_output:
+        if extract_phase.ai_output.get("architecture_detected"):
+            architecture_details = extract_phase.ai_output.get("architecture_details")
+
+    human_feedback = stories_phase.pm_comment if stories_phase else None
+
+    # Remettre en pending_ai → le frontend affichera le StoriesStreamCard
+    await upsert_pipeline_state(
+        project_id = project_id,
+        phase      = PipelinePhaseEnum.PHASE_3_STORIES,
+        status     = PipelineStatusEnum.PENDING_AI,
+    )
+
+    background_tasks.add_task(
+        _background_generate_missing_stories,
+        project_id           = project_id,
+        all_epics            = all_epics,
+        missing_epics        = missing_epics,
+        missing_indices      = missing_indices,
+        existing_stories     = existing_stories,
+        human_feedback       = human_feedback,
+        architecture_details = architecture_details,
+    )
+
+    return {
+        "status":  "started",
+        "message": f"Génération lancée pour {len(missing_epics)} epic(s) manquant(s).",
+        "missing": missing_indices,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/refinement/restart — Relancer le raffinement
+# ──────────────────────────────────────────────────────────────
+
+async def _background_run_one_round(
+    project_id:           int,
+    stories:              list,
+    epics:                list,
+    round_number:         int,
+    architecture_details: dict | None,
+    previous_rounds:      list,
+) -> None:
+    """
+    Background task : exécute UN seul round de raffinement et suspend
+    en PENDING_VALIDATION avec awaiting_round_review=True.
+    Le PM valide story par story avant le round suivant.
+    """
+    from agents.pm.agents.refinement.service import run_one_round
+
+    try:
+        stories_before_round = list(stories)
+
+        updated_stories, round_data = await run_one_round(
+            stories              = stories,
+            epics                = epics,
+            round_number         = round_number,
+            architecture_details = architecture_details,
+            previous_rounds      = previous_rounds,
+        )
+
+        all_rounds = previous_rounds + [round_data]
+
+        await upsert_pipeline_state(
+            project_id = project_id,
+            phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
+            status     = PipelineStatusEnum.PENDING_VALIDATION,
+            ai_output  = {
+                "refined_stories":      updated_stories,
+                "stories_before_round": stories_before_round,
+                "current_round":        round_number,
+                "refinement_rounds":    all_rounds,
+                "epics":                epics,
+                "consensus":            round_data.get("consensus", False),
+                "awaiting_round_review": True,
+            },
+        )
+        print(f"[round/{round_number}] ✓ projet={project_id} | en attente validation PM")
+    except Exception as e:
+        print(f"[round/{round_number}] ✗ projet={project_id}: {type(e).__name__}: {e}")
+        await upsert_pipeline_state(
+            project_id = project_id,
+            phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
+            status     = PipelineStatusEnum.PENDING_VALIDATION,
+            ai_output  = None,
+        )
+
+
+@router.post("/{project_id}/refinement/restart")
+async def restart_refinement(
+    project_id:       int,
+    background_tasks: BackgroundTasks,
+    current_user:     dict         = Depends(require_pm),
+    db:               AsyncSession = Depends(get_db),
+):
+    """Relance le raffinement PO↔TL en arrière-plan à partir des stories existantes."""
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config   = {"configurable": {"thread_id": f"pm_{project_id}"}}
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    state: dict = dict(snapshot.values)
+
+    stories              = state.get("stories") or state.get("refined_stories") or []
+    epics                = state.get("epics", [])
+    human_feedback       = state.get("human_feedback")
+    architecture_details = state.get("architecture_details") if state.get("architecture_detected") else None
+
+    if not stories:
+        raise HTTPException(400, "Aucune story disponible pour relancer le raffinement.")
+
+    await upsert_pipeline_state(
+        project_id = project_id,
+        phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
+        status     = PipelineStatusEnum.PENDING_AI,
+        ai_output  = None,
+    )
+
+    background_tasks.add_task(
+        _background_run_one_round,
+        project_id           = project_id,
+        stories              = stories,
+        epics                = epics,
+        round_number         = 1,
+        architecture_details = architecture_details,
+        previous_rounds      = [],
+    )
+
+    return {"status": "started", "message": "Round 1 du raffinement lancé."}
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/refinement/round/apply — Décision PM par story
+# ──────────────────────────────────────────────────────────────
+
+class RoundApplyRequest(BaseModel):
+    story_choices:        dict   # { "db_id_str": "new" | "old" }
+    continue_refinement:  bool = True
+
+
+@router.post("/{project_id}/refinement/round/apply")
+async def apply_refinement_round(
+    project_id:       int,
+    body:             RoundApplyRequest,
+    background_tasks: BackgroundTasks,
+    current_user:     dict         = Depends(require_pm),
+    db:               AsyncSession = Depends(get_db),
+):
+    """
+    Le PM a choisi pour chaque story : garder la version raffinée ("new")
+    ou revenir à la version précédente ("old").
+    Ensuite : lancer le round suivant ou finaliser le raffinement.
+    """
+    phases = await get_all_pipeline_states(project_id)
+    ref_phase = next(
+        (p for p in phases if p.phase.value == PipelinePhaseEnum.PHASE_4_REFINEMENT.value),
+        None,
+    )
+    if not ref_phase or not ref_phase.ai_output:
+        raise HTTPException(404, "Aucun état de raffinement trouvé.")
+
+    ao = ref_phase.ai_output
+    refined_stories     = ao.get("refined_stories", [])
+    stories_before      = ao.get("stories_before_round", [])
+    epics               = ao.get("epics", [])
+    current_round       = ao.get("current_round", 1)
+    all_rounds          = ao.get("refinement_rounds", [])
+    consensus           = ao.get("consensus", False)
+
+    # ── 1. Appliquer les choix du PM (new / old) story par story ─
+    before_by_id = {str(s["db_id"]): s for s in stories_before if s.get("db_id")}
+    merged: list[dict] = []
+    for s in refined_stories:
+        db_id_str = str(s.get("db_id", ""))
+        choice = body.story_choices.get(db_id_str, "new")
+        if choice == "old" and db_id_str in before_by_id:
+            merged.append(dict(before_by_id[db_id_str]))
+        else:
+            merged.append(dict(s))
+
+    # ── 2. Sauvegarder en base ────────────────────────────────────
+    from agents.pm.agents.refinement.repository import save_refined_stories
+    await save_refined_stories(project_id, merged)
+
+    # ── 3. Récupérer le graph + config ───────────────────────────
+    pm_graph = get_pm_graph()
+    config   = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    # ── 4. Mettre à jour le state LangGraph avec les stories choisies ─
+    # Indispensable : les phases suivantes (5, 6…) lisent refined_stories
+    # depuis le checkpoint LangGraph, pas depuis pipeline_state.
+    if pm_graph:
+        await pm_graph.aupdate_state(
+            config,
+            {
+                "refined_stories":      merged,
+                "stories_before_round": None,
+            },
+        )
+
+    # ── 5. Continuer ou finaliser ─────────────────────────────────
+    next_round = current_round + 1
+
+    if body.continue_refinement and not consensus and next_round <= MAX_ROUNDS:
+        architecture_details = None
+        if pm_graph:
+            snapshot = await pm_graph.aget_state(config)
+            if snapshot and snapshot.values:
+                s = dict(snapshot.values)
+                if s.get("architecture_detected"):
+                    architecture_details = s.get("architecture_details")
+
+        await upsert_pipeline_state(
+            project_id = project_id,
+            phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
+            status     = PipelineStatusEnum.PENDING_AI,
+            ai_output  = None,
+        )
+
+        background_tasks.add_task(
+            _background_run_one_round,
+            project_id           = project_id,
+            stories              = merged,
+            epics                = epics,
+            round_number         = next_round,
+            architecture_details = architecture_details,
+            previous_rounds      = all_rounds,
+        )
+        return {"status": "started", "message": f"Round {next_round} lancé en arrière-plan."}
+
+    # ── 6. Finaliser : reprendre l'interrupt LangGraph ────────────
+    # Le graph était suspendu dans node_validate après node_refinement.
+    # On le reprend avec approved=True pour passer à la Phase 5.
+    await upsert_pipeline_state(
+        project_id = project_id,
+        phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
+        status     = PipelineStatusEnum.PENDING_VALIDATION,
+        ai_output  = {
+            "refined_stories":       merged,
+            "stories_before_round":  None,
+            "current_round":         current_round,
+            "refinement_rounds":     all_rounds,
+            "epics":                 epics,
+            "consensus":             consensus,
+            "awaiting_round_review": False,
+        },
+    )
+    return {"status": "finalized", "message": "Raffinement finalisé. Vous pouvez valider la phase."}
+
+
+MAX_ROUNDS = 3
 
 
 # ──────────────────────────────────────────────────────────────
@@ -587,6 +946,164 @@ async def jira_resync_phase(
         "patch_keys":   list(patch.keys()) if patch else [],
         "message":      f"Re-sync Jira phase '{phase}' terminée." if patch else f"Aucun objet créé pour la phase '{phase}'.",
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/status — Transition manuelle de statut
+# ──────────────────────────────────────────────────────────────
+# Transitions autorisées (PM décide) :
+#   pipeline_done  → in_development  (lancement du développement)
+#   in_development → delivered       (projet livré)
+
+MANUAL_TRANSITIONS = {
+    "pipeline_done":  "in_development",
+    "in_development": "delivered",
+}
+
+@router.patch("/{project_id}/status")
+async def update_project_status(
+    project_id:   int,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """Fait avancer le projet vers la prochaine étape manuelle (pipeline_done→in_development→delivered)."""
+    employee_id = await get_employee_id_by_user(current_user["user_id"])
+    proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+    if not proj:
+        raise HTTPException(404, f"Projet {project_id} introuvable.")
+    if proj.project_manager_id != employee_id:
+        raise HTTPException(403, "Ce projet ne vous appartient pas.")
+
+    next_status = MANUAL_TRANSITIONS.get(proj.status)
+    if not next_status:
+        raise HTTPException(400, f"Le statut '{proj.status}' ne permet pas de transition manuelle.")
+
+    proj.status = next_status
+    if next_status == "delivered":
+        proj.progress = 100.0
+    await db.commit()
+
+    return {"project_id": project_id, "status": next_status}
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/unarchive — Désarchiver un projet
+# ──────────────────────────────────────────────────────────────
+
+@router.patch("/{project_id}/unarchive")
+async def unarchive_project(
+    project_id:   int,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """Remet un projet archivé dans la liste active."""
+    employee_id = await get_employee_id_by_user(current_user["user_id"])
+    proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+    if not proj:
+        raise HTTPException(404, f"Projet {project_id} introuvable.")
+    if proj.project_manager_id != employee_id:
+        raise HTTPException(403, "Ce projet ne vous appartient pas.")
+
+    proj.archived       = False
+    proj.archive_reason = None
+    await db.commit()
+
+    return {"project_id": project_id, "archived": False}
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/archive — Archiver un projet
+# ──────────────────────────────────────────────────────────────
+
+ARCHIVE_REASONS = {"completed", "cancelled", "on_hold", "other"}
+
+class ArchiveProjectRequest(BaseModel):
+    reason: str   # completed | cancelled | on_hold | other
+
+
+@router.patch("/{project_id}/archive")
+async def archive_project(
+    project_id:   int,
+    body:         ArchiveProjectRequest,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """Archive un projet (masqué dans la vue principale, visible dans l'onglet Archivés)."""
+    if body.reason not in ARCHIVE_REASONS:
+        raise HTTPException(400, f"Raison invalide. Valeurs acceptées : {sorted(ARCHIVE_REASONS)}")
+
+    employee_id = await get_employee_id_by_user(current_user["user_id"])
+    proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+    if not proj:
+        raise HTTPException(404, f"Projet {project_id} introuvable.")
+    if proj.project_manager_id != employee_id:
+        raise HTTPException(403, "Ce projet ne vous appartient pas.")
+
+    proj.archived       = True
+    proj.archive_reason = body.reason
+    await db.commit()
+
+    return {"project_id": project_id, "archived": True, "reason": body.reason}
+
+
+# ──────────────────────────────────────────────────────────────
+# DELETE /pipeline/{project_id} — Supprimer un projet
+# ──────────────────────────────────────────────────────────────
+
+@router.delete("/{project_id}")
+async def delete_project(
+    project_id:   int,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """Supprime définitivement un projet et toutes ses données pipeline."""
+    employee_id = await get_employee_id_by_user(current_user["user_id"])
+    proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
+    if not proj:
+        raise HTTPException(404, f"Projet {project_id} introuvable.")
+    if proj.project_manager_id != employee_id:
+        raise HTTPException(403, "Ce projet ne vous appartient pas.")
+
+    # Suppression manuelle dans l'ordre des FK (pas de CASCADE en base avant migration)
+    from sqlalchemy import text
+    await db.execute(text("""
+        DELETE FROM project_management.task_dependencies
+        WHERE task_id IN (
+            SELECT t.id FROM project_management.tasks t
+            JOIN project_management.user_stories us ON t.user_story_id = us.id
+            JOIN project_management.epics e ON us.epic_id = e.id
+            WHERE e.project_id = :pid
+        )
+    """), {"pid": project_id})
+    await db.execute(text("""
+        DELETE FROM project_management.story_dependencies
+        WHERE story_id IN (
+            SELECT us.id FROM project_management.user_stories us
+            JOIN project_management.epics e ON us.epic_id = e.id
+            WHERE e.project_id = :pid
+        )
+    """), {"pid": project_id})
+    await db.execute(text("""
+        DELETE FROM project_management.tasks
+        WHERE user_story_id IN (
+            SELECT us.id FROM project_management.user_stories us
+            JOIN project_management.epics e ON us.epic_id = e.id
+            WHERE e.project_id = :pid
+        )
+    """), {"pid": project_id})
+    await db.execute(text("""
+        DELETE FROM project_management.user_stories
+        WHERE epic_id IN (SELECT id FROM project_management.epics WHERE project_id = :pid)
+    """), {"pid": project_id})
+    await db.execute(text("DELETE FROM project_management.epics         WHERE project_id = :pid"), {"pid": project_id})
+    await db.execute(text("DELETE FROM project_management.sprints        WHERE project_id = :pid"), {"pid": project_id})
+    await db.execute(text("DELETE FROM project_management.pipeline_state WHERE project_id = :pid"), {"pid": project_id})
+    await db.execute(text("DELETE FROM project_management.project_documents WHERE project_id = :pid"), {"pid": project_id})
+    await db.execute(text("DELETE FROM crm.assignments                   WHERE project_id = :pid"), {"pid": project_id})
+    await db.execute(text("DELETE FROM crm.projects                      WHERE id = :pid"),         {"pid": project_id})
+    await db.commit()
+
+    return {"project_id": project_id, "deleted": True}
 
 
 # ──────────────────────────────────────────────────────────────

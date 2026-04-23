@@ -183,6 +183,29 @@ function InteractiveHint({ hint, onSend }) {
     onSend(text);
   };
 
+  /* ── Sélection de channel Slack ─────────────────────── */
+  if (hint.type === "channel_select") {
+    return (
+      <div className="mt-3 p-4 bg-gradient-to-br from-slate-50 to-cyan-50/30 border border-slate-200 rounded-2xl space-y-3 fade-in-up shadow-sm">
+        <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          <span className="text-base">#</span>
+          Choisir un canal Slack
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {(hint.channels || []).map((ch) => (
+            <button
+              key={ch.id}
+              onClick={() => send(`#${ch.name}`)}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-sm text-slate-700 hover:border-cyan hover:text-cyan hover:bg-cyan/5 active:scale-95 transition-all shadow-sm font-medium"
+            >
+              <span className="text-slate-400">#</span>{ch.name}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   const addEmail = () => setEmails((prev) => [...prev, ""]);
   const removeEmail = (i) =>
     setEmails((prev) => prev.filter((_, idx) => idx !== i));

@@ -124,6 +124,33 @@ def _is_context_error(error: Exception) -> bool:
 
 
 # ══════════════════════════════════════════════════════
+# Extraction du texte depuis une réponse LangChain
+# ══════════════════════════════════════════════════════
+
+def _extract_text(response) -> str:
+    """
+    Extrait le texte d'une réponse LangChain.
+
+    response.content peut être :
+      - str  : cas normal → retourné tel quel
+      - list : blocs de contenu [{"type":"text","text":"..."}]
+               → concatène les blocs "text"
+      - ""   : réponse vide ("No message content") → retourne ""
+    """
+    content = response.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "".join(parts)
+    return ""
+
+
+# ══════════════════════════════════════════════════════
 # Mode 1 : invoke_with_fallback (Node 1 + Node 3)
 # ══════════════════════════════════════════════════════
 
@@ -153,7 +180,7 @@ async def invoke_with_fallback(
             )
             response = await llm.ainvoke(messages)
             print(f"✅ [NVIDIA] Succès")
-            return response.content
+            return _extract_text(response)
         except Exception as e:
             if _is_context_error(e):
                 # Même avec 128k, si le contexte est dépassé → message direct
@@ -181,7 +208,7 @@ async def invoke_with_fallback(
             response = await llm.ainvoke(messages)
             if i > 0:
                 print(f"✅ [Groq] Clé #{i+1} a pris le relais avec succès")
-            return response.content
+            return _extract_text(response)
 
         except Exception as e:
             last_error = e
