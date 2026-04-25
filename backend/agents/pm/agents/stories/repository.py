@@ -99,6 +99,81 @@ async def save_stories(project_id: int, stories: list[dict]) -> list[UserStory]:
         return orm_stories
 
 
+async def get_stories_by_ids(story_ids: list[int]) -> list[dict]:
+    """
+    Retourne les stories ciblées par leurs IDs DB, enrichies du titre de l'epic.
+    Utilisé pour la régénération partielle après rejet ciblé.
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(UserStory, Epic.title.label("epic_title"))
+            .join(Epic, UserStory.epic_id == Epic.id)
+            .where(UserStory.id.in_(story_ids))
+        )
+        rows = result.all()
+        stories = []
+        for story, epic_title in rows:
+            ac = []
+            if story.acceptance_criteria:
+                try:
+                    ac = json.loads(story.acceptance_criteria)
+                except Exception:
+                    ac = [story.acceptance_criteria]
+            stories.append({
+                "db_id":               story.id,
+                "epic_title":          epic_title,
+                "epic_id":             story.epic_id,
+                "title":               story.title,
+                "description":         story.description or "",
+                "story_points":        story.story_points,
+                "acceptance_criteria": ac,
+                "splitting_strategy":  story.splitting_strategy or "by_feature",
+            })
+        return stories
+
+
+async def get_all_stories_as_dicts(project_id: int) -> list[dict]:
+    """
+    Retourne toutes les stories du projet en format dict compatible state LangGraph.
+    epic_id = index de l'epic dans la liste triée par id (pas le db_id de l'epic).
+    """
+    async with AsyncSessionLocal() as session:
+        epics_result = await session.execute(
+            select(Epic)
+            .where(Epic.project_id == project_id)
+            .order_by(Epic.id)
+        )
+        db_epics    = epics_result.scalars().all()
+        db_id_to_idx = {e.id: i for i, e in enumerate(db_epics)}
+
+        stories_result = await session.execute(
+            select(UserStory)
+            .join(Epic, UserStory.epic_id == Epic.id)
+            .where(Epic.project_id == project_id)
+            .order_by(UserStory.epic_id, UserStory.id)
+        )
+        stories = stories_result.scalars().all()
+
+        result = []
+        for s in stories:
+            ac = []
+            if s.acceptance_criteria:
+                try:
+                    ac = json.loads(s.acceptance_criteria)
+                except Exception:
+                    ac = [s.acceptance_criteria]
+            result.append({
+                "db_id":               s.id,
+                "epic_id":             db_id_to_idx.get(s.epic_id, 0),
+                "title":               s.title,
+                "description":         s.description or "",
+                "story_points":        s.story_points,
+                "acceptance_criteria": ac,
+                "splitting_strategy":  s.splitting_strategy or "by_feature",
+            })
+        return result
+
+
 async def get_stories(project_id: int) -> list[UserStory]:
     """Retourne toutes les stories du projet, triées par epic_id puis id."""
     async with AsyncSessionLocal() as session:

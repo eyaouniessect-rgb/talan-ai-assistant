@@ -13,13 +13,43 @@ from app.core.groq_client import invoke_with_fallback
 
 _RETRY_DELAYS = [3, 7]   # secondes avant 1er et 2e retry
 
+
+def _to_str_list(lst: list) -> list[str]:
+    """Normalise une liste LLM en liste de strings (le LLM peut retourner des dicts)."""
+    result = []
+    for item in lst:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Essaie les clés courantes avant de fallback sur str()
+            text = (
+                item.get("description") or item.get("gap") or item.get("issue")
+                or item.get("text") or item.get("message") or str(item)
+            )
+            result.append(str(text))
+        else:
+            result.append(str(item))
+    return result
+
 _MODEL = "openai/gpt-oss-120b"
 
 _SYSTEM = """Tu es un expert Agile (Product Owner senior) qui audite la qualité des User Stories.
 Tu vérifies 3 dimensions :
   1. COMPLÉTUDE    : les stories couvrent-elles les fonctionnalités majeures de l'epic ?
   2. SCOPE CREEP   : aucune story ne doit aller au-delà du périmètre de l'epic.
-  3. QUALITÉ INVEST: chaque story doit être Indépendante, Négociable, Valeur, Estimable, Small, Testable.
+  3. QUALITÉ INVEST: les critères INVEST s'appliquent selon la stratégie de découpage (voir règles ci-dessous).
+
+INVEST ADAPTÉ PAR STRATÉGIE DE DÉCOUPAGE :
+  by_feature       → INVEST complet (Indépendante, Négociable, Valuable, Estimable, Small, Testable)
+  by_user_role     → INVEST complet + "Valuable" prioritaire : chaque story doit apporter
+                     une valeur métier explicite au rôle ciblé
+  by_workflow_step → Indépendance IGNORÉE : le couplage séquentiel est inhérent à cette
+                     stratégie (l'étape 2 dépend de l'étape 1 par conception).
+                     Priorité sur Small et Testable.
+  by_component     → "Valuable" ASSOUPLI : un composant technique n'est pas toujours
+                     directement valorisable pour l'utilisateur final.
+                     Priorité sur Testable (couverture unitaire attendue).
+
 Réponds UNIQUEMENT avec du JSON valide, sans markdown."""
 
 
@@ -34,12 +64,40 @@ async def run_review_coverage(epic: dict, epic_idx: int, stories: list[dict]) ->
         for i, s in enumerate(stories)
     ])
 
+    strategy = epic.get("splitting_strategy", "by_feature")
+
+    # Message contextuel selon la stratégie — rappel de l'exception INVEST
+    _STRATEGY_HINTS = {
+        "by_feature": (
+            "Stratégie : by_feature — INVEST complet. "
+            "Vérifie tous les critères sans exception."
+        ),
+        "by_user_role": (
+            "Stratégie : by_user_role — INVEST complet. "
+            "Insiste sur 'Valuable' : chaque story doit mentionner explicitement "
+            "la valeur apportée au rôle ciblé."
+        ),
+        "by_workflow_step": (
+            "Stratégie : by_workflow_step — NE PÉNALISE PAS les dépendances séquentielles "
+            "entre stories (ex : 'l'étape 2 dépend de l'étape 1'). "
+            "Ce couplage est voulu. Concentre l'audit sur Small et Testable."
+        ),
+        "by_component": (
+            "Stratégie : by_component — ASSOUPLIS le critère 'Valuable' pour les stories "
+            "purement techniques (un composant infrastructure n'a pas toujours de valeur "
+            "utilisateur directe). Concentre l'audit sur Testable."
+        ),
+    }
+    strategy_hint = _STRATEGY_HINTS.get(strategy, _STRATEGY_HINTS["by_feature"])
+
     prompt = f"""Audite ces User Stories par rapport à l'epic.
 
 EPIC #{epic_idx} :
   Titre       : {epic['title']}
   Description : {epic.get('description', '')}
-  Stratégie   : {epic.get('splitting_strategy', 'by_feature')}
+  Stratégie   : {strategy}
+
+{strategy_hint}
 
 STORIES GÉNÉRÉES ({len(stories)}) :
 {stories_text}
@@ -49,11 +107,12 @@ VÉRIFIE CES 3 POINTS :
 ══════════════════════════════════════
 1. GAPS (complétude) : fonctionnalités majeures de l'epic non couvertes par les stories
 2. SCOPE CREEP : stories qui sortent du périmètre de l'epic (trop larges, touchent un autre epic)
-3. QUALITÉ : stories mal formulées, trop grandes (> 8 pts justifié), ou non testables
+3. QUALITÉ INVEST : applique les critères INVEST adaptés à la stratégie indiquée ci-dessus
 
-Règles :
+Règles générales :
 - Sois strict sur le scope creep : une story doit rester dans les limites de cet epic
 - Ignore les détails techniques mineurs comme gaps
+- Respecte l'adaptation INVEST selon la stratégie (ne pénalise pas ce qui est normal pour la stratégie)
 - Si tout est satisfaisant → coverage_ok=true et listes vides
 
 Retourne UNIQUEMENT ce JSON :
@@ -86,9 +145,9 @@ Retourne UNIQUEMENT ce JSON :
             clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
             data  = json.loads(clean)
 
-            scope_issues   = list(data.get("scope_creep_issues", []))
-            quality_issues = list(data.get("quality_issues", []))
-            gaps           = list(data.get("gaps", []))
+            scope_issues   = _to_str_list(data.get("scope_creep_issues", []))
+            quality_issues = _to_str_list(data.get("quality_issues", []))
+            gaps           = _to_str_list(data.get("gaps", []))
 
             if scope_issues:
                 print(f"[review]   ⚠ Scope creep détecté pour epic {epic_idx} : {scope_issues}")

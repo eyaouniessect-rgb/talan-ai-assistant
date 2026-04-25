@@ -18,6 +18,20 @@ export const validatePhase = (projectId, body) =>
 export const getJiraConfig = () =>
   api.get('/pipeline/config').then(r => r.data)
 
+// ── Epics CRUD ───────────────────────────────────────────────
+
+export const getProjectEpics = (projectId) =>
+  api.get(`/pipeline/${projectId}/epics`).then(r => r.data)
+
+export const addEpic = (projectId, body) =>
+  api.post(`/pipeline/${projectId}/epics`, body).then(r => r.data)
+
+export const updateEpic = (epicId, body) =>
+  api.put(`/pipeline/epics/${epicId}`, body).then(r => r.data)
+
+export const deleteEpic = (epicId) =>
+  api.delete(`/pipeline/epics/${epicId}`).then(r => r.data)
+
 // ── Stories CRUD ──────────────────────────────────────────────
 
 export const getProjectStories = (projectId) =>
@@ -67,3 +81,13 @@ export const applyRefinementRound = (projectId, storyChoices, continueRefinement
 
 export const resyncJira = (projectId, phase) =>
   api.post(`/pipeline/${projectId}/jira-resync`, { phase }).then(r => r.data)
+
+// ── Stories CRUD (manuel) ─────────────────────────────────────
+
+export const addStory = (projectId, body) =>
+  api.post(`/pipeline/${projectId}/stories`, body).then(r => r.data)
+
+// ── Export PDF ────────────────────────────────────────────────
+
+export const exportBacklogPdf = (projectId) =>
+  api.get(`/report/${projectId}/export/backlog`, { responseType: 'blob' }).then(r => r.data)

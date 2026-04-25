@@ -8,6 +8,7 @@ import {
   Rocket,
   Tag,
   RefreshCw,
+  FileDown,
 } from "lucide-react";
 import clsx from "clsx";
 import {
@@ -18,6 +19,7 @@ import {
   restartMissingStories,
   restartRefinement,
   applyRefinementRound,
+  exportBacklogPdf,
 } from "../../api/pipeline";
 import { getDocument } from "../../api/projects";
 import { PHASES, PHASE_KEY_MAP } from "./constants/phases";
@@ -45,6 +47,24 @@ export default function PipelineDetail() {
   const [processingState, setProcessingState] = useState(null); // { phase, approved }
   const [resyncLoading, setResyncLoading] = useState(false);
   const [resyncResult, setResyncResult] = useState(null); // { ok, message }
+  const [exportLoading, setExportLoading] = useState(false);
+
+  const handleExportPdf = async () => {
+    setExportLoading(true);
+    try {
+      const blob = await exportBacklogPdf(id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `backlog_${id}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // silent — server error handled gracefully
+    } finally {
+      setExportLoading(false);
+    }
+  };
 
   const fetchData = useCallback(
     async (silent = false) => {
@@ -297,11 +317,28 @@ export default function PipelineDetail() {
             <Loader size={12} className="animate-spin" /> En cours...
           </span>
         )}
-        {globalStatus === "completed" && (
-          <span className="text-xs bg-green-50 text-green-600 border border-green-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
-            <CheckCircle size={12} /> Terminé
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {globalStatus === "completed" && (
+            <span className="text-xs bg-green-50 text-green-600 border border-green-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
+              <CheckCircle size={12} /> Terminé
+            </span>
+          )}
+          {phaseMap["stories"] && (
+            <button
+              onClick={handleExportPdf}
+              disabled={exportLoading}
+              title="Exporter le backlog complet en PDF"
+              className="flex items-center gap-1.5 text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 px-3 py-1.5 rounded-full font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {exportLoading ? (
+                <Loader size={12} className="animate-spin" />
+              ) : (
+                <FileDown size={12} />
+              )}
+              {exportLoading ? "Export..." : "Export PDF"}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -445,6 +482,8 @@ export default function PipelineDetail() {
                 <PhaseResult
                   phaseId={activePhase}
                   aiOutput={activePhaseDb?.ai_output}
+                  projectId={id}
+                  onRefresh={() => fetchData(true)}
                   onContinue={
                     activePhase === "stories"    ? handleContinueStories   :
                     activePhase === "refinement" ? handleRestartRefinement :
@@ -498,10 +537,17 @@ export default function PipelineDetail() {
             />
           ) : isPendingHuman ? (
             <ValidationCard
-              onValidate={async (approved, feedback) => {
+              phase={activePhase}
+              aiOutput={activePhaseDb?.ai_output}
+              onValidate={async (approved, feedback, targetedStoryIds, targetedEpicIds) => {
                 setProcessingState({ phase: activePhase, approved });
                 try {
-                  await validatePhase(id, { approved, feedback });
+                  await validatePhase(id, {
+                    approved,
+                    feedback,
+                    targeted_story_ids: targetedStoryIds?.length ? targetedStoryIds : null,
+                    targeted_epic_ids:  targetedEpicIds?.length  ? targetedEpicIds  : null,
+                  });
                   await fetchData();
                 } finally {
                   setProcessingState(null);

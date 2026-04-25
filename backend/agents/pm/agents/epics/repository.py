@@ -51,6 +51,54 @@ async def save_epics(project_id: int, epics: list[dict]) -> list[Epic]:
         return orm_epics
 
 
+async def update_epic(epic_id: int, updates: dict) -> bool:
+    """Met à jour title, description et/ou splitting_strategy d'un epic."""
+    from sqlalchemy import update as sa_update
+    async with AsyncSessionLocal() as session:
+        values: dict = {}
+        if "title" in updates and updates["title"]:
+            values["title"] = updates["title"]
+        if "description" in updates:
+            values["description"] = updates["description"]
+        if "splitting_strategy" in updates and updates["splitting_strategy"]:
+            values["splitting_strategy"] = updates["splitting_strategy"]
+        if not values:
+            return False
+        result = await session.execute(
+            sa_update(Epic).where(Epic.id == epic_id).values(**values)
+        )
+        await session.commit()
+        return result.rowcount > 0
+
+
+async def delete_epic(epic_id: int) -> bool:
+    """Supprime un epic (et ses stories en cascade). Retourne True si trouvé."""
+    from sqlalchemy import delete as sa_delete
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            sa_delete(Epic).where(Epic.id == epic_id)
+        )
+        await session.commit()
+        return result.rowcount > 0
+
+
+async def add_epic(project_id: int, epic_data: dict) -> Epic:
+    """Insère un nouvel epic pour ce projet. Retourne l'ORM créé (avec id)."""
+    async with AsyncSessionLocal() as session:
+        orm_e = Epic(
+            project_id         = project_id,
+            title              = epic_data["title"],
+            description        = epic_data.get("description", ""),
+            splitting_strategy = epic_data.get("splitting_strategy", "by_feature"),
+            status             = EpicStatusEnum.DRAFT,
+            ai_metadata        = {"source": "manual"},
+        )
+        session.add(orm_e)
+        await session.commit()
+        await session.refresh(orm_e)
+        return orm_e
+
+
 async def update_epic_jira_key(epic_db_id: int, jira_key: str) -> None:
     """Met à jour jira_epic_key d'un epic après synchronisation Jira."""
     from sqlalchemy import update as sa_update

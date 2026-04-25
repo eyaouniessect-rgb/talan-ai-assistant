@@ -63,14 +63,20 @@ def _collect_stories_from_store(nb_epics: int) -> list[dict]:
     return all_stories
 
 
+def _gaps_display(gaps: list, n: int = 3) -> str:
+    """Formate une liste de gaps (strings ou dicts) pour l'affichage."""
+    strs = [g if isinstance(g, str) else str(g) for g in gaps]
+    return ", ".join(strs[:n]) + ("..." if len(strs) > n else "")
+
+
 async def _process_epic(epic_idx: int, epic: dict, emit) -> None:
     """
-    Pipeline par epic : generate_all → review → [retry si gaps].
+    Pipeline par epic : generate_all -> review -> [retry si gaps].
     2 appels LLM au lieu de 4.
     """
     epic_title = epic.get("title", f"Epic {epic_idx + 1}")
 
-    # ── 1. GÉNÉRATION COMPLÈTE (title + description + SP + AC) ─
+    # 1. GENERATION COMPLETE (title + description + SP + AC)
     await emit({
         "type":       "epic_start",
         "epic_idx":   epic_idx,
@@ -87,13 +93,13 @@ async def _process_epic(epic_idx: int, epic: dict, emit) -> None:
             human_feedback       = _current_human_feedback,
         )
     except Exception as e:
-        print(f"[orchestrator] ❌ generate failed epic {epic_idx} : {e}")
-        await emit({"type": "error", "epic_idx": epic_idx, "message": f"Génération échouée : {e}"})
+        print(f"[orchestrator] generate failed epic {epic_idx} : {e}")
+        await emit({"type": "error", "epic_idx": epic_idx, "message": f"Generation echouee : {e}"})
         return
 
     _epic_store[epic_idx] = stories
 
-    # ── 2. REVUE DE COUVERTURE ─────────────────────────────────
+    # 2. REVUE DE COUVERTURE
     await emit({
         "type":     "tool_start",
         "epic_idx": epic_idx,
@@ -103,34 +109,28 @@ async def _process_epic(epic_idx: int, epic: dict, emit) -> None:
     try:
         review = await run_review_coverage(epic, epic_idx, stories)
     except Exception as e:
-        print(f"[orchestrator] ⚠ review failed epic {epic_idx} : {e} → coverage_ok=True fail-safe")
+        print(f"[orchestrator] review failed epic {epic_idx} : {e} -> coverage_ok=True fail-safe")
         review = {"coverage_ok": True, "gaps": [], "scope_creep_issues": [], "quality_issues": [], "suggestions": []}
     _review_store[epic_idx] = review
 
-    # ── 3. RETRY UNIQUE SI GAPS ────────────────────────────────
+    # 3. RETRY UNIQUE SI GAPS
     if not review.get("coverage_ok", True) and review.get("gaps"):
-        gaps = review["gaps"]
+        # Normalise en strings pour eviter le crash si le LLM retourne des dicts
+        gaps      = [g if isinstance(g, str) else str(g) for g in review["gaps"]]
+        gaps_disp = _gaps_display(gaps)
         await emit({
-            "type":     "gap_detected",
-            "epic_idx": epic_idx,
+            "type":       "gap_detected",
+            "epic_idx":   epic_idx,
             "epic_title": epic_title,
-            "gaps":     gaps,
-            "thinking": (
-                f"⚠️ {len(gaps)} fonctionnalité(s) non couverte(s) "
-                f"dans « {epic_title} » : "
-                f"{', '.join(gaps[:3])}{'…' if len(gaps) > 3 else ''}. "
-                f"Régénération ciblée en cours."
-            ),
+            "gaps":       gaps,
+            "thinking":   f"Gaps detectes dans {epic_title!r} : {gaps_disp}. Regeneration ciblee.",
         })
         await emit({
             "type":             "retry_start",
             "epic_idx":         epic_idx,
             "epic_title":       epic_title,
             "missing_features": gaps,
-            "thinking": (
-                f"🔄 Régénération ciblée pour « {epic_title} » — "
-                f"couverture des manques : {', '.join(gaps[:3])}{'…' if len(gaps) > 3 else ''}"
-            ),
+            "thinking":         f"Regeneration ciblee pour {epic_title!r} — manques : {gaps_disp}",
         })
 
         try:
@@ -143,7 +143,7 @@ async def _process_epic(epic_idx: int, epic: dict, emit) -> None:
             )
             _epic_store[epic_idx] = stories
         except Exception as e:
-            print(f"[orchestrator] ⚠ retry generate failed : {e} — on garde le premier jet")
+            print(f"[orchestrator] retry generate failed : {e} — on garde le premier jet")
     else:
         await emit({"type": "coverage_ok", "epic_idx": epic_idx, "epic_title": epic_title})
 
@@ -181,7 +181,7 @@ async def run_stories_react_agent(
         if queue:
             await queue.put(evt)
 
-    print(f"\n[orchestrator] ▶ {len(epics)} epic(s) | parallélisme={MAX_CONCURRENT_EPICS} | project_id={project_id}")
+    print(f"\n[orchestrator] {len(epics)} epic(s) | parallelisme={MAX_CONCURRENT_EPICS} | project_id={project_id}")
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_EPICS)
 
@@ -190,13 +190,13 @@ async def run_stories_react_agent(
             try:
                 await _process_epic(epic_idx, epic, emit)
             except Exception as e:
-                print(f"[orchestrator] ❌ epic {epic_idx} exception inattendue : {e}")
+                print(f"[orchestrator] epic {epic_idx} exception inattendue : {e}")
                 await emit({"type": "error", "epic_idx": epic_idx, "message": str(e)})
 
     await asyncio.gather(*[_safe_process(i, e) for i, e in enumerate(epics)])
 
     all_stories = _collect_stories_from_store(len(epics))
-    print(f"[orchestrator] ✓ {len(all_stories)} stories générées sur {len(epics)} epics")
+    print(f"[orchestrator] {len(all_stories)} stories generees sur {len(epics)} epics")
 
     if queue:
         await queue.put({

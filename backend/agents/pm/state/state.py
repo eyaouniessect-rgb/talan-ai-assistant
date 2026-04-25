@@ -235,6 +235,11 @@ class PMPipelineState(TypedDict):
 
     human_feedback: Optional[str]
 
+    # IDs DB des stories/epics ciblés par le rejet (partial regen)
+    # None ou [] → feedback global (régénération complète)
+    targeted_story_ids: Optional[list]
+    targeted_epic_ids:  Optional[list]
+
 
     # ╔══════════════════════════════════════════════════════╗
     # ║  JIRA SYNC                                          ║
