@@ -100,13 +100,37 @@ async def _sync_epics(state: PMPipelineState) -> dict:
         print("[JIRA SYNC] SKIP — state['epics'] est vide")
         return {}
 
-    # Récupérer les DB IDs des epics pour mettre à jour jira_epic_key après sync
-    db_epics = await get_epics(project_id) if project_id else []
-    db_epic_ids = [e.id for e in db_epics]  # ordre par id = ordre de création
+    db_epics      = await get_epics(project_id) if project_id else []
+    db_id_by_pos  = [e.id for e in db_epics]
+    db_jira_by_id = {e.id: e.jira_epic_key for e in db_epics if e.jira_epic_key}
 
-    epic_map = {}
+    # Construire l'index des épics déjà synchronisés (depuis le state)
+    existing_map_raw = state.get("jira_epic_map") or {}
+    already_synced_idx: dict[int, str] = {}
+    for k, v in existing_map_raw.items():
+        try:
+            already_synced_idx[int(k)] = v
+        except (ValueError, TypeError):
+            pass
+
+    epic_map = dict(already_synced_idx)
+    skipped  = 0
     errors   = 0
+
     for i, epic in enumerate(epics):
+        # Dédup : déjà dans le state map ?
+        existing_key = already_synced_idx.get(i)
+        # Dédup : déjà en DB avec un jira_epic_key ?
+        if not existing_key:
+            db_id_for_check = epic.get("db_id") or (db_id_by_pos[i] if i < len(db_id_by_pos) else None)
+            if db_id_for_check:
+                existing_key = db_jira_by_id.get(int(db_id_for_check))
+        if existing_key:
+            epic_map[i] = existing_key
+            skipped += 1
+            print(f"[JIRA SYNC]   [SKIP] Epic {i+1}/{len(epics)} déjà dans Jira → {existing_key}")
+            continue
+
         try:
             key = actions.create_epic(
                 title       = epic["title"],
@@ -116,16 +140,51 @@ async def _sync_epics(state: PMPipelineState) -> dict:
             epic_map[i] = key
             print(f"[JIRA SYNC]   [OK] Epic {i+1}/{len(epics)} '{epic['title'][:50]}' → {key}")
 
-            # Mise à jour DB : jira_epic_key
-            if i < len(db_epic_ids):
-                await update_epic_jira_key(db_epic_ids[i], key)
-                print(f"[JIRA SYNC]   DB mis à jour : epic id={db_epic_ids[i]} → jira_epic_key={key}")
+            # Mise à jour DB : utilise db_id direct si disponible
+            db_id = epic.get("db_id")
+            if db_id:
+                await update_epic_jira_key(int(db_id), key)
+                print(f"[JIRA SYNC]   DB: epic db_id={db_id} → jira_epic_key={key}")
+            elif i < len(db_id_by_pos):
+                await update_epic_jira_key(db_id_by_pos[i], key)
+                print(f"[JIRA SYNC]   DB: epic pos_id={db_id_by_pos[i]} → jira_epic_key={key} (fallback positionnel)")
 
         except Exception as e:
             errors += 1
             print(f"[JIRA SYNC]   [ERREUR] Epic {i+1} '{epic.get('title','')}' : {e}")
 
-    print(f"\n[JIRA SYNC] Epics : {len(epic_map)} crees, {errors} erreurs")
+    # ── Second passage : epics DB sans jira_epic_key non couverts par le state ──
+    # Cas : epics ajoutés manuellement, absents du checkpoint LangGraph
+    state_db_ids: set[int] = set()
+    for i, epic in enumerate(epics):
+        db_id = epic.get("db_id") or (db_id_by_pos[i] if i < len(db_id_by_pos) else None)
+        if db_id:
+            state_db_ids.add(int(db_id))
+
+    for e in db_epics:
+        if e.id in state_db_ids:
+            continue  # déjà traité dans le premier passage
+        idx = db_id_by_pos.index(e.id) if e.id in db_id_by_pos else (max(epic_map.keys(), default=-1) + 1)
+        if e.jira_epic_key:
+            epic_map[idx] = e.jira_epic_key
+            skipped += 1
+            print(f"[JIRA SYNC]   [SKIP] Epic manuel '{e.title[:50]}' déjà dans Jira → {e.jira_epic_key}")
+            continue
+        try:
+            key = actions.create_epic(
+                title       = e.title,
+                description = e.description or "",
+                project_key = jira_project_key,
+            )
+            epic_map[idx] = key
+            await update_epic_jira_key(e.id, key)
+            print(f"[JIRA SYNC]   [OK] Epic manuel idx={idx} '{e.title[:50]}' → {key}")
+        except Exception as e_err:
+            errors += 1
+            print(f"[JIRA SYNC]   [ERREUR] Epic manuel '{e.title}' : {e_err}")
+
+    newly_created = len(epic_map) - len(already_synced_idx)
+    print(f"\n[JIRA SYNC] Epics : {newly_created} nouveaux créés, {skipped} ignorés (déjà sync), {errors} erreurs")
     print(f"[JIRA SYNC] jira_epic_map = {epic_map}")
     return {"jira_epic_map": epic_map}
 

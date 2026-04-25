@@ -19,6 +19,7 @@ from langgraph.types import interrupt
 from agents.pm.state import PMPipelineState
 from agents.pm.db import upsert_pipeline_state, phase_str_to_enum
 from app.database.models.pm.enums import PipelineStatusEnum
+from agents.pm.agents.epics.repository import get_epics
 
 
 async def node_validate(state: PMPipelineState) -> dict:
@@ -30,7 +31,7 @@ async def node_validate(state: PMPipelineState) -> dict:
     project_id = state.get("project_id")
 
     # ── 1. Extraire le résultat IA de la phase courante ───────
-    ai_output = _get_phase_output(state, phase)
+    ai_output = await _get_phase_output(state, phase)
 
     # ── 2. Persister en base AVANT de suspendre ───────────────
     if project_id:
@@ -74,7 +75,7 @@ async def node_validate(state: PMPipelineState) -> dict:
 # EXTRACTION DU RÉSULTAT IA PAR PHASE
 # ──────────────────────────────────────────────────────────────
 
-def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
+async def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
     """
     Extrait le résultat de la phase courante depuis le state LangGraph.
     Retourne un dict sérialisable (stocké en JSONB dans pm.pipeline_state).
@@ -123,8 +124,23 @@ def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
             "awaiting_round_review": True,   # toujours True à la sortie du nœud
         }
 
+    # Phase 2 — epics : enrichir avec db_id depuis la DB
+    if phase == "epics":
+        epics_state = state.get("epics", [])
+        project_id  = state.get("project_id")
+        if project_id and epics_state:
+            try:
+                db_epics = await get_epics(project_id)
+                enriched = []
+                for i, e in enumerate(epics_state):
+                    db_id = db_epics[i].id if i < len(db_epics) else None
+                    enriched.append({**e, "db_id": db_id})
+                return {"epics": enriched}
+            except Exception:
+                pass
+        return {"epics": epics_state}
+
     phase_field_map = {
-        "epics":           "epics",
         "story_deps":      "story_dependencies",
         "prioritization":  "priorities",
         "tasks":           "tasks",

@@ -42,6 +42,7 @@ from app.database.models.crm.project import Project
 from app.database.models.pm.pipeline_state import PipelineState
 from app.database.models.pm.project_document import ProjectDocument
 from app.database.models.pm.enums import PipelineStatusEnum, PipelinePhaseEnum, ProjectGlobalStatus
+from app.database.models.pm.epic import Epic
 
 from agents.pm.graph import get_pm_graph
 from agents.pm.db import (
@@ -53,6 +54,15 @@ from agents.pm.agents.stories.repository import (
     get_stories,
     update_story,
     delete_story,
+    get_all_stories_as_dicts,
+)
+from app.database.connection import AsyncSessionLocal
+from app.database.models.pm.user_story import UserStory
+from agents.pm.agents.epics.repository import (
+    get_epics,
+    update_epic,
+    delete_epic,
+    add_epic,
 )
 from agents.pm.state import PMPipelineState
 
@@ -174,7 +184,9 @@ class StartPipelineRequest(BaseModel):
 class ValidateRequest(BaseModel):
     """Corps de la requête POST /pipeline/{project_id}/validate."""
     approved: bool
-    feedback: Optional[str] = None  # obligatoire si approved=False
+    feedback: Optional[str] = None            # obligatoire si approved=False
+    targeted_story_ids: Optional[list[int]] = None  # IDs DB stories à corriger (None = tout)
+    targeted_epic_ids:  Optional[list[int]] = None  # IDs DB epics  à corriger (None = tout)
 
 
 class UpdateStoryRequest(BaseModel):
@@ -183,6 +195,15 @@ class UpdateStoryRequest(BaseModel):
     description:         Optional[str]       = None
     story_points:        Optional[int]       = None
     acceptance_criteria: Optional[list[str]] = None
+
+
+class StoryCreateRequest(BaseModel):
+    """Corps de la requête POST /pipeline/{project_id}/stories."""
+    epic_idx:            int                  # index 0-based de l'epic dans le projet
+    title:               str
+    description:         str                  = ""
+    story_points:        int                  = 3
+    acceptance_criteria: Optional[list[str]]  = None
 
 
 class ResyncJiraRequest(BaseModel):
@@ -429,8 +450,10 @@ async def validate_phase(
     await pm_graph.aupdate_state(
         config,
         {
-            "validation_status": validation_status,
-            "human_feedback":    body.feedback if not body.approved else None,
+            "validation_status":  validation_status,
+            "human_feedback":     body.feedback if not body.approved else None,
+            "targeted_story_ids": body.targeted_story_ids if not body.approved else None,
+            "targeted_epic_ids":  body.targeted_epic_ids  if not body.approved else None,
         },
         as_node="node_validate",
     )
@@ -927,6 +950,30 @@ async def jira_resync_phase(
         "jira_synced_phases": synced,
     }
 
+    # ── 4b. Pour les phases epics/stories : charger depuis la DB ─
+    # Les objets ajoutés manuellement sont en DB mais PAS dans le checkpoint
+    # LangGraph. On remplace avec les données fraîches DB.
+    if phase == "stories":
+        db_stories_fresh = await get_all_stories_as_dicts(project_id)
+        if db_stories_fresh:
+            state_for_sync = {**state_for_sync, "stories": db_stories_fresh}
+            print(f"[JIRA RESYNC] stories override: {len(db_stories_fresh)} stories depuis DB (vs {len(current_state.get('stories') or [])} dans checkpoint)")
+
+    elif phase == "epics":
+        db_epics_fresh = await get_epics(project_id)
+        epics_formatted = [
+            {
+                "db_id":              e.id,
+                "title":              e.title,
+                "description":        e.description or "",
+                "splitting_strategy": e.splitting_strategy or "by_feature",
+            }
+            for e in db_epics_fresh
+        ]
+        if epics_formatted:
+            state_for_sync = {**state_for_sync, "epics": epics_formatted}
+            print(f"[JIRA RESYNC] epics override: {len(epics_formatted)} epics depuis DB (vs {len(current_state.get('epics') or [])} dans checkpoint)")
+
     # ── 5. Appeler directement le nœud jira_sync ─────────────
     from agents.pm.graph.node_jira_sync import node_jira_sync
     try:
@@ -1141,13 +1188,25 @@ async def list_stories(
 async def update_story_endpoint(
     story_id:     int,
     body:         UpdateStoryRequest,
+    db:           AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_pm),
 ):
-    """Modifie les champs éditables d'une user story."""
+    """Modifie les champs éditables d'une user story et synchronise ai_output."""
     updates = body.model_dump(exclude_none=True)
     found   = await update_story(story_id, updates)
     if not found:
         raise HTTPException(404, f"Story {story_id} introuvable.")
+
+    # Récupère project_id pour sync ai_output
+    result = await db.execute(
+        select(UserStory, Epic.project_id)
+        .join(Epic, UserStory.epic_id == Epic.id)
+        .where(UserStory.id == story_id)
+    )
+    row = result.first()
+    if row:
+        await _sync_stories_to_ai_output(row[1])
+
     return {"story_id": story_id, "updated": True}
 
 
@@ -1158,13 +1217,241 @@ async def update_story_endpoint(
 @router.delete("/stories/{story_id}")
 async def delete_story_endpoint(
     story_id:     int,
+    db:           AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_pm),
 ):
-    """Supprime définitivement une user story."""
+    """Supprime définitivement une user story et synchronise ai_output."""
+    # Récupère project_id AVANT suppression
+    result = await db.execute(
+        select(UserStory, Epic.project_id)
+        .join(Epic, UserStory.epic_id == Epic.id)
+        .where(UserStory.id == story_id)
+    )
+    row = result.first()
+    if not row:
+        raise HTTPException(404, f"Story {story_id} introuvable.")
+    project_id = row[1]
+
     found = await delete_story(story_id)
     if not found:
         raise HTTPException(404, f"Story {story_id} introuvable.")
+
+    await _sync_stories_to_ai_output(project_id)
     return {"story_id": story_id, "deleted": True}
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/stories — Ajouter une story manuellement
+# ──────────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/stories")
+async def create_story_endpoint(
+    project_id:   int,
+    body:         StoryCreateRequest,
+    current_user: dict = Depends(require_pm),
+):
+    """Crée manuellement une user story dans un epic donné (par son index 0-based)."""
+    import json as _json
+    from app.database.models.pm.enums import StoryStatusEnum
+
+    async with AsyncSessionLocal() as session:
+        # Récupère l'epic cible par index 0-based
+        epics_result = await session.execute(
+            select(Epic)
+            .where(Epic.project_id == project_id)
+            .order_by(Epic.id)
+        )
+        db_epics = epics_result.scalars().all()
+        if body.epic_idx < 0 or body.epic_idx >= len(db_epics):
+            raise HTTPException(400, f"epic_idx {body.epic_idx} invalide pour ce projet.")
+        target_epic = db_epics[body.epic_idx]
+
+        ac = body.acceptance_criteria or []
+        new_story = UserStory(
+            epic_id             = target_epic.id,
+            title               = body.title,
+            description         = body.description,
+            story_points        = body.story_points,
+            splitting_strategy  = target_epic.splitting_strategy or "by_feature",
+            acceptance_criteria = _json.dumps(ac, ensure_ascii=False),
+            status              = StoryStatusEnum.DRAFT,
+            ai_metadata         = {"source": "manual"},
+        )
+        session.add(new_story)
+        await session.commit()
+        await session.refresh(new_story)
+        new_id = new_story.id
+
+    await _sync_stories_to_ai_output(project_id)
+
+    return {
+        "db_id":               new_id,
+        "epic_idx":            body.epic_idx,
+        "title":               body.title,
+        "description":         body.description,
+        "story_points":        body.story_points,
+        "acceptance_criteria": ac,
+        "splitting_strategy":  target_epic.splitting_strategy or "by_feature",
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# EPICS CRUD
+# ══════════════════════════════════════════════════════════════
+
+class EpicUpdateRequest(BaseModel):
+    title:              Optional[str] = None
+    description:        Optional[str] = None
+    splitting_strategy: Optional[str] = None
+
+class EpicCreateRequest(BaseModel):
+    title:              str
+    description:        str = ""
+    splitting_strategy: str = "by_feature"
+
+
+async def _sync_stories_to_ai_output(project_id: int) -> None:
+    """
+    Relit les stories DB et met à jour ai_output de la phase stories dans pipeline_state.
+    Préserve les champs _review (calculés par LLM, absents de la table user_stories).
+    Appelé après chaque CRUD sur les stories pour que le dashboard reste cohérent.
+    """
+    db_stories = await get_all_stories_as_dicts(project_id)
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PipelineState)
+            .where(PipelineState.project_id == project_id)
+            .where(PipelineState.phase == PipelinePhaseEnum.PHASE_3_STORIES)
+            .order_by(PipelineState.id.desc())
+            .limit(1)
+        )
+        ps = result.scalar_one_or_none()
+        if not ps:
+            return
+
+        # Préserve _review depuis l'ancien snapshot (absent de la DB)
+        review_map: dict[int, dict] = {}
+        for s in (ps.ai_output or {}).get("stories", []):
+            if s.get("db_id") and s.get("_review"):
+                review_map[int(s["db_id"])] = s["_review"]
+
+        for s in db_stories:
+            db_id = s.get("db_id")
+            if db_id and db_id in review_map:
+                s["_review"] = review_map[db_id]
+
+        from sqlalchemy.orm.attributes import flag_modified
+        current = dict(ps.ai_output or {})
+        current["stories"] = db_stories
+        ps.ai_output = current
+        flag_modified(ps, "ai_output")
+        await session.commit()
+
+
+async def _sync_epics_to_ai_output(project_id: int, db: AsyncSession) -> None:
+    """Relit les epics DB et met à jour ai_output de la phase epics en pipeline_state."""
+    db_epics = await get_epics(project_id)
+    epics_list = [
+        {
+            "db_id":              e.id,
+            "title":              e.title,
+            "description":        e.description or "",
+            "splitting_strategy": e.splitting_strategy or "by_feature",
+        }
+        for e in db_epics
+    ]
+    result = await db.execute(
+        select(PipelineState)
+        .where(PipelineState.project_id == project_id)
+        .where(PipelineState.phase == PipelinePhaseEnum.PHASE_2_EPICS)
+        .order_by(PipelineState.id.desc())
+        .limit(1)
+    )
+    ps = result.scalar_one_or_none()
+    if ps:
+        current = dict(ps.ai_output or {})
+        current["epics"] = epics_list
+        ps.ai_output = current
+        await db.commit()
+
+
+@router.get("/{project_id}/epics")
+async def get_project_epics(
+    project_id:   int,
+    current_user: dict = Depends(require_pm),
+):
+    """Retourne les epics du projet avec leurs db_id."""
+    db_epics = await get_epics(project_id)
+    return [
+        {
+            "db_id":              e.id,
+            "title":              e.title,
+            "description":        e.description or "",
+            "splitting_strategy": e.splitting_strategy or "by_feature",
+        }
+        for e in db_epics
+    ]
+
+
+@router.put("/epics/{epic_id}")
+async def update_epic_endpoint(
+    epic_id:      int,
+    body:         EpicUpdateRequest,
+    db:           AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_pm),
+):
+    """Modifie le titre, la description ou la stratégie d'un epic."""
+    found = await update_epic(epic_id, body.model_dump(exclude_none=True))
+    if not found:
+        raise HTTPException(404, f"Epic {epic_id} introuvable.")
+
+    # Récupérer project_id depuis la DB pour sync ai_output
+    result = await db.execute(select(Epic).where(Epic.id == epic_id))
+    epic = result.scalar_one_or_none()
+    if epic:
+        await _sync_epics_to_ai_output(epic.project_id, db)
+
+    return {"epic_id": epic_id, "updated": True}
+
+
+@router.delete("/epics/{epic_id}")
+async def delete_epic_endpoint(
+    epic_id:      int,
+    db:           AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_pm),
+):
+    """Supprime un epic (et ses stories en cascade)."""
+    result = await db.execute(select(Epic).where(Epic.id == epic_id))
+    epic = result.scalar_one_or_none()
+    if not epic:
+        raise HTTPException(404, f"Epic {epic_id} introuvable.")
+    project_id = epic.project_id
+
+    found = await delete_epic(epic_id)
+    if not found:
+        raise HTTPException(404, f"Epic {epic_id} introuvable.")
+
+    await _sync_epics_to_ai_output(project_id, db)
+    return {"epic_id": epic_id, "deleted": True}
+
+
+@router.post("/{project_id}/epics")
+async def add_epic_endpoint(
+    project_id:   int,
+    body:         EpicCreateRequest,
+    db:           AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_pm),
+):
+    """Ajoute un nouvel epic au projet."""
+    orm_e = await add_epic(project_id, body.model_dump())
+    await _sync_epics_to_ai_output(project_id, db)
+    return {
+        "epic_id":           orm_e.id,
+        "title":             orm_e.title,
+        "description":       orm_e.description,
+        "splitting_strategy": orm_e.splitting_strategy,
+    }
 
 
 # ──────────────────────────────────────────────────────────────

@@ -2,9 +2,9 @@ import { useState, useEffect } from "react";
 import { CheckCircle, FileText, Eye, ArrowRight, ShieldAlert, ShieldCheck,
          AlertTriangle, Component, AlertCircle, ShieldOff,
          ChevronDown, ChevronRight, Pencil, Trash2, X, Save, PlayCircle,
-         Users, Wrench, Layers } from "lucide-react";
+         Users, Wrench, Layers, Plus } from "lucide-react";
 import clsx from "clsx";
-import { updateStory, deleteStory, getProjectStories } from "../../../api/pipeline";
+import { updateStory, deleteStory, getProjectStories, getProjectEpics, addEpic, updateEpic, deleteEpic, addStory } from "../../../api/pipeline";
 
 // ── Rendu du rapport de sécurité ──────────────────────────────
 const SEVERITY_STYLE = {
@@ -200,9 +200,12 @@ function EditModal({ story, onClose, onSaved }) {
 
           {/* Story points */}
           <div>
-            <label className="text-xs font-medium text-slate-500 mb-1 block">Story Points</label>
-            <div className="flex gap-2">
-              {[1, 2, 3, 5, 8].map(v => (
+            <label className="text-xs font-medium text-slate-500 mb-1 block">
+              Story Points
+              <span className="font-normal text-slate-400 ml-1">(Fibonacci)</span>
+            </label>
+            <div className="flex gap-2 flex-wrap">
+              {[1, 2, 3, 5, 8, 13].map(v => (
                 <button
                   key={v}
                   onClick={() => setPts(v)}
@@ -262,6 +265,146 @@ function EditModal({ story, onClose, onSaved }) {
             className="flex items-center gap-1.5 bg-navy text-white text-xs font-medium px-4 py-1.5 rounded-lg disabled:opacity-50"
           >
             <Save size={12} /> {saving ? "Sauvegarde…" : "Sauvegarder"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Modal d'ajout d'une story ──────────────────────────────────
+function AddStoryModal({ projectId, epicIdx, epicTitle, onClose, onAdded }) {
+  const [title,   setTitle]   = useState("");
+  const [desc,    setDesc]    = useState("");
+  const [pts,     setPts]     = useState(3);
+  const [ac,      setAC]      = useState([""]);
+  const [saving,  setSaving]  = useState(false);
+  const [err,     setErr]     = useState(null);
+
+  const handleSave = async () => {
+    if (!title.trim()) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const created = await addStory(projectId, {
+        epic_idx:            epicIdx,
+        title:               title.trim(),
+        description:         desc.trim(),
+        story_points:        pts,
+        acceptance_criteria: ac.filter(c => c.trim()),
+      });
+      onAdded({ ...created, epic_id: epicIdx });
+    } catch (e) {
+      setErr(e?.response?.data?.detail ?? "Erreur lors de la création.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const updateAC  = (i, v) => setAC(prev => prev.map((c, j) => j === i ? v : c));
+  const removeAC  = (i)    => setAC(prev => prev.filter((_, j) => j !== i));
+  const addAC     = ()     => ac.length < 5 && setAC(prev => [...prev, ""]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+          <div>
+            <span className="text-sm font-semibold text-navy">Ajouter une story</span>
+            <p className="text-xs text-slate-400 mt-0.5">{epicTitle}</p>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X size={16} /></button>
+        </div>
+
+        <div className="px-5 py-4 space-y-4">
+          {/* Titre */}
+          <div>
+            <label className="text-xs font-semibold text-slate-600 mb-1 block">Titre *</label>
+            <textarea
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+              placeholder="En tant que ..., je veux ... afin de ..."
+              rows={2}
+              className="input w-full resize-none text-sm"
+            />
+          </div>
+
+          {/* Description */}
+          <div>
+            <label className="text-xs font-semibold text-slate-600 mb-1 block">Description</label>
+            <textarea
+              value={desc}
+              onChange={e => setDesc(e.target.value)}
+              rows={3}
+              className="input w-full resize-none text-sm"
+            />
+          </div>
+
+          {/* Story points */}
+          <div>
+            <label className="text-xs font-semibold text-slate-600 mb-1 block">
+              Story Points
+              <span className="font-normal text-slate-400 ml-1">(Fibonacci : 1 2 3 5 8 13)</span>
+            </label>
+            <div className="flex gap-2 flex-wrap">
+              {[1, 2, 3, 5, 8, 13].map(n => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setPts(n)}
+                  className={clsx(
+                    "w-9 h-9 rounded-lg text-sm font-semibold border transition-colors",
+                    pts === n
+                      ? "bg-navy text-white border-navy"
+                      : "border-slate-200 text-slate-600 hover:border-navy"
+                  )}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Critères d'acceptation */}
+          <div>
+            <label className="text-xs font-semibold text-slate-600 mb-1 block">
+              Critères d'acceptation
+            </label>
+            <div className="space-y-2">
+              {ac.map((c, i) => (
+                <div key={i} className="flex gap-2 items-start">
+                  <input
+                    value={c}
+                    onChange={e => updateAC(i, e.target.value)}
+                    placeholder={`Critère ${i + 1}`}
+                    className="input flex-1 text-sm"
+                  />
+                  <button onClick={() => removeAC(i)} className="p-1.5 text-slate-400 hover:text-red-500 mt-0.5">
+                    <X size={13} />
+                  </button>
+                </div>
+              ))}
+              {ac.length < 5 && (
+                <button onClick={addAC} className="text-xs text-navy hover:underline flex items-center gap-1">
+                  <Plus size={11} /> Ajouter un critère
+                </button>
+              )}
+            </div>
+          </div>
+
+          {err && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{err}</p>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-slate-200">
+          <button onClick={onClose} className="text-xs text-slate-500 hover:text-slate-700 px-3 py-1.5">
+            Annuler
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !title.trim()}
+            className="flex items-center gap-1.5 bg-navy text-white text-xs font-medium px-4 py-1.5 rounded-lg disabled:opacity-50"
+          >
+            <Plus size={12} /> {saving ? "Création…" : "Créer la story"}
           </button>
         </div>
       </div>
@@ -402,40 +545,96 @@ function StoryCard({ story: initialStory, onDeleted }) {
 
 // ── Bandeau de review par epic ─────────────────────────────────
 function EpicReviewBanner({ review }) {
+  const [open, setOpen] = useState(false);
   if (!review) return null;
-  const { coverage_ok, scope_creep_issues = [], quality_issues = [] } = review;
-  const hasIssues = scope_creep_issues.length > 0 || quality_issues.length > 0;
+  const { coverage_ok, gaps = [], scope_creep_issues = [], quality_issues = [], suggestions = [] } = review;
+  const hasIssues = gaps.length > 0 || scope_creep_issues.length > 0 || quality_issues.length > 0;
   if (coverage_ok && !hasIssues) return null;
 
   return (
-    <div className="px-4 py-2 bg-amber-50 border-b border-amber-100 space-y-1">
-      {!coverage_ok && (
-        <div className="flex items-center gap-1.5 text-xs text-amber-700">
-          <AlertTriangle size={11} className="shrink-0" />
-          <span className="font-medium">Couverture incomplète détectée</span>
+    <div className="border-b border-amber-100">
+      {/* Header cliquable */}
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center gap-2 px-4 py-2 bg-amber-50 hover:bg-amber-100 transition-colors text-left"
+      >
+        <AlertTriangle size={11} className="shrink-0 text-amber-600" />
+        <span className="text-xs font-medium text-amber-700 flex-1">
+          Couverture incomplète — {gaps.length} gap{gaps.length > 1 ? "s" : ""}
+          {scope_creep_issues.length > 0 && ` · ${scope_creep_issues.length} scope creep`}
+          {quality_issues.length > 0 && ` · ${quality_issues.length} qualité`}
+        </span>
+        <span className="text-xs text-amber-500 shrink-0">{open ? "Masquer" : "Détails"}</span>
+      </button>
+
+      {/* Détails dépliables */}
+      {open && (
+        <div className="px-4 py-3 bg-amber-50 space-y-2">
+          {gaps.length > 0 && (
+            <div>
+              <p className="text-xs font-semibold text-amber-700 mb-1">Fonctionnalités manquantes :</p>
+              <ul className="space-y-1">
+                {gaps.map((gap, i) => (
+                  <li key={`g-${i}`} className="flex items-start gap-1.5 text-xs text-amber-800">
+                    <span className="text-amber-500 shrink-0 mt-0.5">•</span>
+                    <span>{gap}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {scope_creep_issues.length > 0 && (
+            <div>
+              <p className="text-xs font-semibold text-orange-700 mb-1">Scope creep détecté :</p>
+              <ul className="space-y-1">
+                {scope_creep_issues.map((issue, i) => (
+                  <li key={`sc-${i}`} className="flex items-start gap-1.5 text-xs text-orange-700">
+                    <AlertTriangle size={10} className="shrink-0 mt-0.5" />
+                    <span>{issue}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {quality_issues.length > 0 && (
+            <div>
+              <p className="text-xs font-semibold text-blue-700 mb-1">Problèmes qualité :</p>
+              <ul className="space-y-1">
+                {quality_issues.map((issue, i) => (
+                  <li key={`qi-${i}`} className="flex items-start gap-1.5 text-xs text-blue-700">
+                    <AlertCircle size={10} className="shrink-0 mt-0.5" />
+                    <span>{issue}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {suggestions.length > 0 && (
+            <div>
+              <p className="text-xs font-semibold text-slate-600 mb-1">Suggestions :</p>
+              <ul className="space-y-1">
+                {suggestions.map((s, i) => (
+                  <li key={`sg-${i}`} className="flex items-start gap-1.5 text-xs text-slate-600">
+                    <span className="text-slate-400 shrink-0 mt-0.5">›</span>
+                    <span>{s}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
-      {scope_creep_issues.map((issue, i) => (
-        <div key={`sc-${i}`} className="flex items-start gap-1.5 text-xs text-orange-700">
-          <AlertTriangle size={11} className="shrink-0 mt-0.5" />
-          <span><span className="font-medium">Scope creep :</span> {issue}</span>
-        </div>
-      ))}
-      {quality_issues.map((issue, i) => (
-        <div key={`qi-${i}`} className="flex items-start gap-1.5 text-xs text-blue-700">
-          <AlertCircle size={11} className="shrink-0 mt-0.5" />
-          <span><span className="font-medium">Qualité :</span> {issue}</span>
-        </div>
-      ))}
     </div>
   );
 }
 
 // ── Composant principal StoriesSection ────────────────────────
-function StoriesSection({ aiOutput, onContinue }) {
+function StoriesSection({ aiOutput, onContinue, projectId }) {
   const [storiesState, setStoriesState] = useState(aiOutput.stories ?? []);
   const [closedEpics,  setClosedEpics]  = useState(new Set());
   const [continuing,   setContinuing]   = useState(false);
+  // { epicIdx: int, epicTitle: string } | null
+  const [addingTo,     setAddingTo]     = useState(null);
   const epics = aiOutput.epics ?? [];
 
   useEffect(() => {
@@ -444,6 +643,11 @@ function StoriesSection({ aiOutput, onContinue }) {
 
   const handleDeleted = (dbId) =>
     setStoriesState(prev => prev.filter(s => s.db_id !== dbId));
+
+  const handleStoryAdded = (newStory) => {
+    setStoriesState(prev => [...prev, newStory]);
+    setAddingTo(null);
+  };
 
   const toggleEpic = (idx) =>
     setClosedEpics(prev => {
@@ -477,6 +681,17 @@ function StoriesSection({ aiOutput, onContinue }) {
 
   return (
     <div className="space-y-4">
+      {/* Modal ajout story */}
+      {addingTo && (
+        <AddStoryModal
+          projectId={projectId}
+          epicIdx={addingTo.epicIdx}
+          epicTitle={addingTo.epicTitle}
+          onClose={() => setAddingTo(null)}
+          onAdded={handleStoryAdded}
+        />
+      )}
+
       {/* Bannière génération incomplète */}
       {missingEpics.length > 0 && onContinue && (
         <div className="flex items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-700">
@@ -540,6 +755,15 @@ function StoriesSection({ aiOutput, onContinue }) {
               <span className="text-xs text-slate-400 shrink-0 ml-1">
                 {epicStories.length} stories · {epicPts} pts
               </span>
+            </button>
+
+            {/* Bouton + ajouter une story */}
+            <button
+              type="button"
+              onClick={() => setAddingTo({ epicIdx: parseInt(epicIdx), epicTitle: epicInfo?.title ?? `Epic ${parseInt(epicIdx) + 1}` })}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs text-navy hover:bg-navy/5 border-b border-slate-200 w-full transition-colors"
+            >
+              <Plus size={11} /> Ajouter une story
             </button>
 
             {/* Contenu dépliable */}
@@ -1130,7 +1354,318 @@ function RefinementSection({ aiOutput, onContinue }) {
 }
 
 
-export default function PhaseResult({ phaseId, aiOutput, onContinue, onApplyRound }) {
+// ── Modal de confirmation suppression ─────────────────────────
+function ConfirmDeleteModal({ epicTitle, onConfirm, onCancel, loading }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center gap-3 px-5 py-4 border-b border-slate-100">
+          <div className="w-9 h-9 rounded-full bg-red-100 flex items-center justify-center shrink-0">
+            <Trash2 size={16} className="text-red-500" />
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-slate-800">Supprimer l'epic</p>
+            <p className="text-xs text-slate-400">Cette action est irréversible</p>
+          </div>
+          <button onClick={onCancel} className="ml-auto text-slate-300 hover:text-slate-500">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="px-5 py-4">
+          <p className="text-sm text-slate-600">
+            Vous allez supprimer l'epic{" "}
+            <span className="font-semibold text-slate-800">"{epicTitle}"</span>{" "}
+            ainsi que toutes ses user stories associées.
+          </p>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-2 px-5 py-3 bg-slate-50 border-t border-slate-100">
+          <button
+            onClick={onCancel}
+            disabled={loading}
+            className="text-xs text-slate-500 hover:text-slate-700 px-3 py-1.5 rounded-lg hover:bg-slate-100 transition-colors"
+          >
+            Annuler
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={loading}
+            className="flex items-center gap-1.5 text-xs font-semibold bg-red-500 hover:bg-red-600 text-white px-4 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+          >
+            <Trash2 size={12} />
+            {loading ? "Suppression…" : "Supprimer"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Stratégies disponibles ─────────────────────────────────────
+const STRATEGIES = [
+  { value: "by_feature",       label: "By feature" },
+  { value: "by_user_role",     label: "By user role" },
+  { value: "by_workflow_step", label: "By workflow step" },
+  { value: "by_component",     label: "By component" },
+];
+
+// ── Section epics éditable ─────────────────────────────────────
+function EpicsSection({ aiOutput, projectId, onRefresh }) {
+  const [epics, setEpics]         = useState([]);
+  const [loadingEpics, setLoadingEpics] = useState(true);
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm]   = useState({});
+  const [saving, setSaving]       = useState(false);
+  const [deleting, setDeleting]   = useState(null);
+  const [confirmDeleteIdx, setConfirmDeleteIdx] = useState(null);
+  const [showAdd, setShowAdd]     = useState(false);
+  const [addForm, setAddForm]     = useState({ title: "", description: "", splitting_strategy: "by_feature" });
+  const [adding, setAdding]       = useState(false);
+  const [error, setError]         = useState(null);
+
+  // Charge les epics avec db_id depuis l'API
+  const loadEpics = async () => {
+    if (!projectId) return;
+    try {
+      const data = await getProjectEpics(projectId);
+      setEpics(data);
+    } catch {
+      // fallback sur aiOutput si l'API échoue
+      setEpics(aiOutput?.epics ?? []);
+    } finally {
+      setLoadingEpics(false);
+    }
+  };
+
+  useEffect(() => { loadEpics(); }, [projectId]);
+
+  // ── Helpers ────────────────────────────────────────────────
+  // Les dicts epics n'ont pas de db_id — on le récupère via l'index
+  // en relisant la liste depuis la DB après chaque opération (onRefresh)
+  // Pour matcher index → db_id on a besoin de l'ordre DB = ordre state
+  // On stocke db_id dans epics si présent (enrichissement possible plus tard)
+
+  const startEdit = (i) => {
+    setEditingId(i);
+    setEditForm({
+      title:              epics[i].title ?? "",
+      description:        epics[i].description ?? "",
+      splitting_strategy: epics[i].splitting_strategy ?? "by_feature",
+    });
+    setError(null);
+  };
+
+  const cancelEdit = () => { setEditingId(null); setError(null); };
+
+  const saveEdit = async (i) => {
+    const epic = epics[i];
+    if (!epic.db_id) { setError("ID epic manquant — rechargez la page."); return; }
+    setSaving(true);
+    try {
+      await updateEpic(epic.db_id, editForm);
+      const updated = epics.map((e, idx) => idx === i ? { ...e, ...editForm } : e);
+      setEpics(updated);
+      setEditingId(null);
+      onRefresh?.();
+    } catch { setError("Erreur lors de la modification."); }
+    finally { setSaving(false); }
+  };
+
+  const handleDelete = async (i) => {
+    const epic = epics[i];
+    if (!epic.db_id) { setError("ID epic manquant — rechargez la page."); return; }
+    setConfirmDeleteIdx(i);
+  };
+
+  const confirmDelete = async () => {
+    const i    = confirmDeleteIdx;
+    const epic = epics[i];
+    setDeleting(i);
+    try {
+      await deleteEpic(epic.db_id);
+      setEpics(epics.filter((_, idx) => idx !== i));
+      setConfirmDeleteIdx(null);
+      onRefresh?.();
+    } catch { setError("Erreur lors de la suppression."); }
+    finally { setDeleting(null); }
+  };
+
+  const handleAdd = async () => {
+    if (!addForm.title.trim()) { setError("Le titre est obligatoire."); return; }
+    setAdding(true);
+    try {
+      const created = await addEpic(projectId, addForm);
+      setEpics([...epics, {
+        db_id:              created.epic_id,
+        title:              created.title,
+        description:        created.description,
+        splitting_strategy: created.splitting_strategy,
+      }]);
+      setAddForm({ title: "", description: "", splitting_strategy: "by_feature" });
+      setShowAdd(false);
+      onRefresh?.();
+    } catch { setError("Erreur lors de l'ajout."); }
+    finally { setAdding(false); }
+  };
+
+  return (
+    <div className="space-y-2">
+      {/* Modal suppression */}
+      {confirmDeleteIdx !== null && (
+        <ConfirmDeleteModal
+          epicTitle={epics[confirmDeleteIdx]?.title ?? ""}
+          loading={deleting === confirmDeleteIdx}
+          onConfirm={confirmDelete}
+          onCancel={() => setConfirmDeleteIdx(null)}
+        />
+      )}
+
+      {error && (
+        <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
+          <AlertCircle size={13} /> {error}
+          <button onClick={() => setError(null)} className="ml-auto"><X size={12} /></button>
+        </div>
+      )}
+
+      {epics.map((epic, i) => (
+        <div key={epic.db_id ?? i} className="rounded-xl border border-slate-200 overflow-hidden">
+          {editingId === i ? (
+            /* ── Mode édition ──────────────────────────────── */
+            <div className="p-3 bg-slate-50 space-y-2">
+              <input
+                className="w-full text-sm font-medium border border-slate-300 rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan"
+                value={editForm.title}
+                onChange={e => setEditForm(f => ({ ...f, title: e.target.value }))}
+                placeholder="Titre de l'epic"
+              />
+              <textarea
+                className="w-full text-xs border border-slate-300 rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan resize-none"
+                rows={3}
+                value={editForm.description}
+                onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                placeholder="Description"
+              />
+              <select
+                className="text-xs border border-slate-300 rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan bg-white"
+                value={editForm.splitting_strategy}
+                onChange={e => setEditForm(f => ({ ...f, splitting_strategy: e.target.value }))}
+              >
+                {STRATEGIES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+              </select>
+              <div className="flex gap-2 pt-1">
+                <button
+                  onClick={() => saveEdit(i)}
+                  disabled={saving}
+                  className="flex items-center gap-1 text-xs bg-navy text-white rounded-lg px-3 py-1.5 hover:bg-navy/90 disabled:opacity-50"
+                >
+                  <Save size={12} /> {saving ? "Sauvegarde…" : "Enregistrer"}
+                </button>
+                <button
+                  onClick={cancelEdit}
+                  className="text-xs text-slate-500 hover:text-slate-700 px-2"
+                >
+                  Annuler
+                </button>
+              </div>
+            </div>
+          ) : (
+            /* ── Mode lecture ──────────────────────────────── */
+            <div className="flex items-start gap-3 p-3 bg-slate-50 group">
+              <div className="w-6 h-6 bg-navy text-white rounded-lg flex items-center justify-center text-xs font-bold shrink-0">
+                {i + 1}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium text-navy">{epic.title}</div>
+                {epic.description && (
+                  <div className="text-xs text-slate-500 mt-0.5">{epic.description}</div>
+                )}
+                {epic.splitting_strategy && (
+                  <div className="text-xs text-slate-400 mt-1">
+                    Stratégie : <span className="text-cyan font-medium">{epic.splitting_strategy.replace(/_/g, " ")}</span>
+                  </div>
+                )}
+              </div>
+              {/* Actions — visibles au hover */}
+              <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                <button
+                  onClick={() => startEdit(i)}
+                  title="Modifier"
+                  className="p-1 text-slate-400 hover:text-navy hover:bg-slate-100 rounded-lg"
+                >
+                  <Pencil size={14} />
+                </button>
+                <button
+                  onClick={() => handleDelete(i)}
+                  disabled={deleting === i}
+                  title="Supprimer"
+                  className="p-1 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg disabled:opacity-50"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {/* ── Formulaire ajout ─────────────────────────────── */}
+      {showAdd ? (
+        <div className="rounded-xl border border-dashed border-cyan bg-cyan/5 p-3 space-y-2">
+          <p className="text-xs font-medium text-cyan">Nouvel epic</p>
+          <input
+            className="w-full text-sm border border-slate-300 rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan"
+            placeholder="Titre *"
+            value={addForm.title}
+            onChange={e => setAddForm(f => ({ ...f, title: e.target.value }))}
+          />
+          <textarea
+            className="w-full text-xs border border-slate-300 rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan resize-none"
+            rows={2}
+            placeholder="Description (optionnel)"
+            value={addForm.description}
+            onChange={e => setAddForm(f => ({ ...f, description: e.target.value }))}
+          />
+          <select
+            className="text-xs border border-slate-300 rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan bg-white"
+            value={addForm.splitting_strategy}
+            onChange={e => setAddForm(f => ({ ...f, splitting_strategy: e.target.value }))}
+          >
+            {STRATEGIES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+          </select>
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={handleAdd}
+              disabled={adding}
+              className="flex items-center gap-1 text-xs bg-cyan text-white rounded-lg px-3 py-1.5 hover:bg-cyan/90 disabled:opacity-50"
+            >
+              <Save size={12} /> {adding ? "Ajout…" : "Ajouter"}
+            </button>
+            <button
+              onClick={() => { setShowAdd(false); setError(null); }}
+              className="text-xs text-slate-500 hover:text-slate-700 px-2"
+            >
+              Annuler
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => { setShowAdd(true); setError(null); }}
+          className="w-full flex items-center justify-center gap-2 text-xs text-slate-400 hover:text-cyan border border-dashed border-slate-200 hover:border-cyan rounded-xl py-2.5 transition-colors"
+        >
+          <span className="text-lg leading-none">+</span> Ajouter un epic
+        </button>
+      )}
+    </div>
+  );
+}
+
+
+export default function PhaseResult({ phaseId, aiOutput, onContinue, onApplyRound, projectId, onRefresh }) {
   if (!aiOutput && phaseId !== "extract")
     return <p className="text-slate-400 text-sm italic">Aucun résultat disponible pour cette phase.</p>;
   if (!aiOutput) aiOutput = {};
@@ -1323,32 +1858,11 @@ export default function PhaseResult({ phaseId, aiOutput, onContinue, onApplyRoun
   }
 
   if (phaseId === "epics") {
-    const epics = aiOutput.epics ?? [];
-    if (!epics.length) return <p className="text-slate-400 text-sm italic">Aucun epic généré.</p>;
-    return (
-      <div className="space-y-2">
-        {epics.map((epic, i) => (
-          <div key={i} className="flex items-start gap-3 p-3 bg-slate-50 rounded-xl">
-            <div className="w-6 h-6 bg-navy text-white rounded-lg flex items-center justify-center text-xs font-bold shrink-0">
-              {i + 1}
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium text-navy">{epic.title}</div>
-              {epic.description && <div className="text-xs text-slate-500 mt-0.5">{epic.description}</div>}
-              {epic.splitting_strategy && (
-                <div className="text-xs text-slate-400 mt-1">
-                  Stratégie : <span className="text-cyan font-medium">{epic.splitting_strategy.replace(/_/g, " ")}</span>
-                </div>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
-    );
+    return <EpicsSection aiOutput={aiOutput} projectId={projectId} onRefresh={onRefresh} />;
   }
 
   if (phaseId === "stories") {
-    return <StoriesSection aiOutput={aiOutput} onContinue={onContinue} />;
+    return <StoriesSection aiOutput={aiOutput} onContinue={onContinue} projectId={projectId} />;
   }
 
   if (phaseId === "refinement") {
