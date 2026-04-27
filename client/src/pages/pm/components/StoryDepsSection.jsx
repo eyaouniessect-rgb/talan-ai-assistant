@@ -11,6 +11,7 @@ import autoTable from "jspdf-autotable";
 import {
   List, Network, Lock, ArrowRight, GitBranch,
   Maximize2, X, Star, RotateCcw, Download, Image,
+  Pencil, Check, Plus, AlertTriangle,
 } from "lucide-react";
 import clsx from "clsx";
 import { getProjectStories, getProjectEpics } from "../../../api/pipeline";
@@ -127,18 +128,22 @@ const LANE_PALETTE = [
 // ══════════════════════════════════════════════════════════════
 // Rang topologique — BFS depuis les racines (in-degree 0)
 // Rang = longueur du plus long chemin depuis une racine
+// IMPORTANT : on ignore les arcs dont les endpoints ne sont pas
+// dans storyIds (sinon un filtre par epic peut bloquer la BFS).
 // ══════════════════════════════════════════════════════════════
 function computeRanks(reducedDeps, storyIds) {
+  const idSet = new Set(storyIds);
   const adj = {};
   const inDeg = {};
   for (const id of storyIds) inDeg[id] = 0;
   for (const d of reducedDeps) {
     const u = String(d.from_story_id), v = String(d.to_story_id);
+    if (!idSet.has(u) || !idSet.has(v)) continue;  // ignore arcs avec endpoints externes
     (adj[u] ??= []).push(v);
     inDeg[v] = (inDeg[v] || 0) + 1;
   }
   const rank = {};
-  const queue = storyIds.filter(id => !inDeg[id]);
+  const queue = storyIds.filter(id => inDeg[id] === 0);
   for (const id of queue) rank[id] = 0;
   let qi = 0;
   while (qi < queue.length) {
@@ -148,6 +153,27 @@ function computeRanks(reducedDeps, storyIds) {
       if (--inDeg[v] === 0) queue.push(v);
     }
   }
+  // Fallback : stories non atteintes par la BFS (cycles résiduels)
+  // → rang basé sur le max des prédécesseurs déjà rangés + 1
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (const id of storyIds) {
+      if (rank[id] != null) continue;
+      // chercher des prédécesseurs déjà rangés
+      const preds = [];
+      for (const d of reducedDeps) {
+        const u = String(d.from_story_id), v = String(d.to_story_id);
+        if (v === id && idSet.has(u) && rank[u] != null) preds.push(rank[u]);
+      }
+      if (preds.length) {
+        rank[id] = Math.max(...preds) + 1;
+        progressed = true;
+      }
+    }
+  }
+  // Stories toujours sans rang (cycles complets) → rang 0
+  for (const id of storyIds) if (rank[id] == null) rank[id] = 0;
   return rank;
 }
 
@@ -618,13 +644,82 @@ function GraphView({
 // ══════════════════════════════════════════════════════════════
 // Table view — Activity / Predecessors (modèle PMBOK)
 // ══════════════════════════════════════════════════════════════
-function TableView({ stories, deps, epicColorMap, epicIdxMap }) {
-  // predMap[storyId] = liste de dépendances entrantes (prédécesseurs)
+// Détecte si l'ajout d'un arc fromId → toId créerait un cycle dans `deps`.
+function wouldCreateCycle(deps, fromId, toId) {
+  if (fromId === toId) return true;
+  const adj = {};
+  for (const d of deps) (adj[d.from_story_id] ??= new Set()).add(d.to_story_id);
+  // Cycle si toId peut atteindre fromId via le graphe existant
+  const visited = new Set();
+  const dfs = (n) => {
+    if (n === fromId) return true;
+    if (visited.has(n)) return false;
+    visited.add(n);
+    for (const next of (adj[n] ?? [])) if (dfs(next)) return true;
+    return false;
+  };
+  return dfs(toId);
+}
+
+function TableView({
+  stories, allStories, deps, allDeps, aiDeps, isModified,
+  onUpdateDeps, epicColorMap, epicIdxMap,
+}) {
+  const [editing, setEditing] = useState(false);
+  // Copie de travail des dépendances pendant l'édition
+  const [draft, setDraft] = useState(allDeps);
+  const [error, setError] = useState(null);
+
+  // Resync quand les déps externes changent (et qu'on n'est pas en train d'éditer)
+  useEffect(() => { if (!editing) setDraft(allDeps); }, [allDeps, editing]);
+
+  // Le tableau affiche `draft` en mode édition, sinon les déps filtrées
+  const displayDeps = editing ? draft : deps;
+
   const predMap = useMemo(() => {
     const m = {};
-    for (const d of deps) (m[d.to_story_id] ??= []).push(d);
+    for (const d of displayDeps) (m[d.to_story_id] ??= []).push(d);
     return m;
-  }, [deps]);
+  }, [displayDeps]);
+
+  const startEditing = () => { setDraft(allDeps); setEditing(true); setError(null); };
+  const cancel       = () => { setDraft(allDeps); setEditing(false); setError(null); };
+  const validate     = () => { onUpdateDeps(draft); setEditing(false); setError(null); };
+  const resetToAI    = () => { setDraft(aiDeps); setError(null); };
+
+  const removePred = (storyId, fromStoryId) => {
+    setDraft(prev => prev.filter(d =>
+      !(d.to_story_id === storyId && d.from_story_id === fromStoryId)
+    ));
+    setError(null);
+  };
+
+  const addPred = (storyId, fromStoryId) => {
+    if (!fromStoryId) return;
+    fromStoryId = Number(fromStoryId);
+    // Doublon ?
+    if (draft.some(d => d.to_story_id === storyId && d.from_story_id === fromStoryId)) {
+      setError(`#${fromStoryId} est déjà prédécesseur de #${storyId}`);
+      return;
+    }
+    // Cycle ?
+    if (wouldCreateCycle(draft, fromStoryId, storyId)) {
+      setError(`Impossible : #${fromStoryId} → #${storyId} créerait un cycle`);
+      return;
+    }
+    const story     = allStories.find(s => s.db_id === storyId);
+    const fromStory = allStories.find(s => s.db_id === fromStoryId);
+    setDraft(prev => [...prev, {
+      from_story_id:   fromStoryId,
+      to_story_id:     storyId,
+      relation_type:   "FS",
+      dependency_type: "functional",
+      reason:          "Ajouté manuellement par l'utilisateur",
+      level: story?.epic_id === fromStory?.epic_id ? "intra_epic" : "inter_epic",
+      _user_added:     true,
+    }]);
+    setError(null);
+  };
 
   const exportPDF = () => {
     const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
@@ -632,96 +727,174 @@ function TableView({ stories, deps, epicColorMap, epicIdxMap }) {
     doc.text("Tableau des dépendances — Stories", 14, 14);
     doc.setFontSize(8);
     doc.setTextColor(120);
-    doc.text(`Exporté le ${new Date().toLocaleDateString("fr-FR")} · ${stories.length} stories · ${deps.length} dépendances`, 14, 20);
-
+    doc.text(`Exporté le ${new Date().toLocaleDateString("fr-FR")} · ${stories.length} stories · ${displayDeps.length} dépendances`, 14, 20);
     autoTable(doc, {
       startY: 26,
-      head: [["ID", "Story", "Epic", "Prédécesseurs", "Types de relation"]],
+      head: [["ID", "Story", "Epic", "Prédécesseurs", "Types"]],
       body: stories.map(s => {
         const preds = predMap[s.db_id] ?? [];
         const epicIdx = epicIdxMap[s.epic_id] ?? 0;
-        const predsText = preds.length === 0
-          ? "— (peut démarrer)"
-          : preds.map(p => `#${p.from_story_id} ${p.relation_type}`).join(", ");
-        const typesText = preds.length === 0 ? "" : [...new Set(preds.map(p => p.dependency_type))].join(", ");
-        return [`#${s.db_id}`, s.title, `E${epicIdx + 1}`, predsText, typesText];
+        return [
+          `#${s.db_id}`, s.title, `E${epicIdx + 1}`,
+          preds.length === 0 ? "— (peut démarrer)" : preds.map(p => `#${p.from_story_id} ${p.relation_type}`).join(", "),
+          preds.length === 0 ? "" : [...new Set(preds.map(p => p.dependency_type))].join(", "),
+        ];
       }),
       styles: { fontSize: 8, cellPadding: 3 },
       headStyles: { fillColor: [30, 41, 59], textColor: 255, fontStyle: "bold" },
       alternateRowStyles: { fillColor: [248, 250, 252] },
-      columnStyles: {
-        0: { cellWidth: 14 },
-        1: { cellWidth: 90 },
-        2: { cellWidth: 14 },
-        3: { cellWidth: 90 },
-        4: { cellWidth: 28 },
-      },
+      columnStyles: { 0: { cellWidth: 14 }, 1: { cellWidth: 90 }, 2: { cellWidth: 14 }, 3: { cellWidth: 90 }, 4: { cellWidth: 28 } },
     });
-
     doc.save("dependances-stories.pdf");
   };
 
   return (
     <div className="space-y-2">
-    <div className="flex justify-end">
-      <button
-        onClick={exportPDF}
-        className="flex items-center gap-1.5 bg-navy text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-navy/90 transition-colors shadow-sm"
-      >
-        <Download size={13} /> Exporter en PDF
-      </button>
-    </div>
-    <div className="rounded-xl border border-slate-200 overflow-hidden bg-white">
-      <table className="w-full text-sm">
-        <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
-          <tr>
-            <th className="text-left px-3 py-2 font-semibold w-16">ID</th>
-            <th className="text-left px-3 py-2 font-semibold">Story</th>
-            <th className="text-left px-3 py-2 font-semibold w-24">Epic</th>
-            <th className="text-left px-3 py-2 font-semibold">Prédécesseurs</th>
-          </tr>
-        </thead>
-        <tbody>
-          {stories.map(s => {
-            const preds = predMap[s.db_id] ?? [];
-            const epicColor = epicColorMap[s.epic_id] ?? EPIC_COLORS[0];
-            const epicIdx   = epicIdxMap[s.epic_id] ?? 0;
-            return (
-              <tr key={s.db_id} className="border-t border-slate-100 hover:bg-slate-50/60">
-                <td className="px-3 py-2 font-mono text-xs text-slate-500">#{s.db_id}</td>
-                <td className="px-3 py-2 text-slate-800">{s.title}</td>
-                <td className="px-3 py-2">
-                  <span className={clsx("text-[11px] px-1.5 py-0.5 rounded-full font-medium", epicColor.bg, epicColor.text)}>
-                    E{epicIdx + 1}
-                  </span>
-                </td>
-                <td className="px-3 py-2">
-                  {preds.length === 0 ? (
-                    <span className="text-slate-400 italic text-xs">— (peut démarrer)</span>
-                  ) : (
-                    <div className="flex flex-wrap gap-1">
+      {/* Barre d'actions */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {isModified && !editing && (
+          <span className="text-[11px] px-2 py-1 rounded-full bg-amber-100 text-amber-700 font-medium flex items-center gap-1">
+            <AlertTriangle size={11} /> Dépendances modifiées manuellement
+          </span>
+        )}
+        {editing && (
+          <span className="text-[11px] px-2 py-1 rounded-full bg-blue-100 text-blue-700 font-medium">
+            Mode édition · les modifications n'affectent le graphe qu'après validation
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-1.5">
+          {!editing ? (
+            <>
+              <button
+                onClick={startEditing}
+                className="flex items-center gap-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5 rounded-lg shadow-sm"
+              >
+                <Pencil size={13} /> Modifier
+              </button>
+              <button
+                onClick={exportPDF}
+                className="flex items-center gap-1.5 bg-navy text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-navy/90 shadow-sm"
+              >
+                <Download size={13} /> PDF
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={resetToAI}
+                title="Restaurer les dépendances générées par l'agent"
+                className="flex items-center gap-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-600 text-xs font-medium px-3 py-1.5 rounded-lg shadow-sm"
+              >
+                <RotateCcw size={13} /> Restaurer IA
+              </button>
+              <button
+                onClick={cancel}
+                className="flex items-center gap-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5 rounded-lg shadow-sm"
+              >
+                <X size={13} /> Annuler
+              </button>
+              <button
+                onClick={validate}
+                className="flex items-center gap-1.5 bg-emerald-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg hover:bg-emerald-700 shadow-sm"
+              >
+                <Check size={13} /> Valider
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 flex items-center gap-2">
+          <AlertTriangle size={13} /> {error}
+        </div>
+      )}
+
+      <div className={clsx(
+        "rounded-xl border overflow-hidden bg-white transition-colors",
+        editing ? "border-blue-300 ring-2 ring-blue-100" : "border-slate-200",
+      )}>
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
+            <tr>
+              <th className="text-left px-3 py-2 font-semibold w-16">ID</th>
+              <th className="text-left px-3 py-2 font-semibold">Story</th>
+              <th className="text-left px-3 py-2 font-semibold w-24">Epic</th>
+              <th className="text-left px-3 py-2 font-semibold">Prédécesseurs</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stories.map(s => {
+              const preds = predMap[s.db_id] ?? [];
+              const epicColor = epicColorMap[s.epic_id] ?? EPIC_COLORS[0];
+              const epicIdx   = epicIdxMap[s.epic_id] ?? 0;
+              const predIds   = new Set(preds.map(p => p.from_story_id));
+              const candidates = allStories.filter(x =>
+                x.db_id !== s.db_id && !predIds.has(x.db_id)
+              );
+              return (
+                <tr key={s.db_id} className="border-t border-slate-100 hover:bg-slate-50/60 align-top">
+                  <td className="px-3 py-2 font-mono text-xs text-slate-500">#{s.db_id}</td>
+                  <td className="px-3 py-2 text-slate-800">{s.title}</td>
+                  <td className="px-3 py-2">
+                    <span className={clsx("text-[11px] px-1.5 py-0.5 rounded-full font-medium", epicColor.bg, epicColor.text)}>
+                      E{epicIdx + 1}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="flex flex-wrap gap-1 items-center">
+                      {preds.length === 0 && !editing && (
+                        <span className="text-slate-400 italic text-xs">— (peut démarrer)</span>
+                      )}
                       {preds.map((p, i) => {
-                        const fromStory = stories.find(x => x.db_id === p.from_story_id);
+                        const fromStory = allStories.find(x => x.db_id === p.from_story_id);
                         const style = DEP_TYPE_STYLE[p.dependency_type] ?? DEP_TYPE_STYLE.functional;
                         return (
                           <span
                             key={i}
-                            title={`${fromStory?.title ?? ""} — ${REL_TYPE_LABEL[p.relation_type] ?? p.relation_type} (${style.label})`}
-                            className={clsx("text-[11px] px-1.5 py-0.5 rounded-md border font-mono", style.color)}
+                            title={`${fromStory?.title ?? ""} — ${REL_TYPE_LABEL[p.relation_type] ?? p.relation_type} (${style.label})${p._user_added ? " · ajouté manuellement" : ""}`}
+                            className={clsx(
+                              "text-[11px] px-1.5 py-0.5 rounded-md border font-mono inline-flex items-center gap-1",
+                              style.color,
+                              p._user_added && "ring-1 ring-amber-400",
+                            )}
                           >
-                            #{p.from_story_id}<span className="ml-1 font-sans font-semibold">{p.relation_type}</span>
+                            #{p.from_story_id}
+                            <span className="font-sans font-semibold">{p.relation_type}</span>
+                            {editing && (
+                              <button
+                                onClick={() => removePred(s.db_id, p.from_story_id)}
+                                className="hover:bg-rose-100 rounded-full p-0.5 -mr-1"
+                                title="Retirer ce prédécesseur"
+                              >
+                                <X size={10} />
+                              </button>
+                            )}
                           </span>
                         );
                       })}
+                      {editing && (
+                        <select
+                          value=""
+                          onChange={e => addPred(s.db_id, e.target.value)}
+                          className="text-[11px] border border-slate-300 rounded-md px-1.5 py-0.5 bg-white text-slate-600 max-w-[180px]"
+                        >
+                          <option value="">+ Ajouter prédécesseur…</option>
+                          {candidates.map(c => (
+                            <option key={c.db_id} value={c.db_id}>
+                              #{c.db_id} {c.title.slice(0, 40)}{c.title.length > 40 ? "…" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                     </div>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -740,7 +913,15 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
   const [depth,         setDepth]         = useState(2);
   const [isFullscreen,  setIsFullscreen]  = useState(false);
 
-  const deps = Array.isArray(aiOutput) ? aiOutput : (aiOutput?.story_dependencies ?? []);
+  // Déps initiales venant de l'agent
+  const aiDeps = useMemo(
+    () => Array.isArray(aiOutput) ? aiOutput : (aiOutput?.story_dependencies ?? []),
+    [aiOutput],
+  );
+  // Déps "vivantes" — éditables par l'utilisateur (Human-in-the-Loop)
+  const [deps, setDeps] = useState(aiDeps);
+  useEffect(() => { setDeps(aiDeps); }, [aiDeps]);
+  const isModified = deps !== aiDeps;
 
   useEffect(() => {
     if (!projectId) return;
@@ -990,7 +1171,12 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
       ) : view === "table" ? (
         <TableView
           stories={visibleStories}
+          allStories={stories}
           deps={filtered}
+          allDeps={deps}
+          aiDeps={aiDeps}
+          isModified={isModified}
+          onUpdateDeps={setDeps}
           epicColorMap={epicColorMap}
           epicIdxMap={epicIdxMap}
         />
