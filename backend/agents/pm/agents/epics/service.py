@@ -93,10 +93,10 @@ async def _call_llm(prompt: str, max_tokens: int = 2048) -> list[dict]:
 async def generate_epics(
     cdc_text:       str,
     human_feedback: str | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], list[str]]:
     """
     1ère génération : aucun epic existant → LLM analyse le CDC et crée de zéro.
-    human_feedback inutilisé ici (ce chemin ne s'exécute qu'au premier lancement).
+    Retourne (epics, business_actors).
     """
     user_prompt = build_epics_prompt(cdc_text, human_feedback)
     raw_content = await invoke_with_fallback(
@@ -122,9 +122,17 @@ async def generate_epics(
     if not validated:
         raise ValueError("[epics] Aucun epic valide apres normalisation.")
 
-    # Supprimer db_id (pas encore en base)
-    return [{"title": e["title"], "description": e["description"],
-             "splitting_strategy": e["splitting_strategy"]} for e in validated]
+    # Extraire les acteurs métier (filtre les non-strings et valeurs vides)
+    raw_actors = data.get("business_actors", [])
+    business_actors = [
+        str(a).strip() for a in raw_actors
+        if isinstance(a, str) and str(a).strip()
+    ]
+    print(f"[epics] {len(business_actors)} acteurs metier identifies : {business_actors}")
+
+    epics_clean = [{"title": e["title"], "description": e["description"],
+                    "splitting_strategy": e["splitting_strategy"]} for e in validated]
+    return epics_clean, business_actors
 
 
 async def improve_all_epics(

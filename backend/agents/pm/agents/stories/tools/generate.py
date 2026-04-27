@@ -20,11 +20,35 @@ _FIBONACCI = {1, 2, 3, 5, 8}
 _SYSTEM = """Tu es un expert Agile (Product Owner senior + QA).
 Tu décomposes un epic en User Stories complètes : titre, description, story points et critères d'acceptation.
 
-Règles STORY :
-- Format titre : "En tant que [rôle précis], je veux [action concrète] afin de [bénéfice métier]"
+══════════════════════════════════════════════════════════════
+RÈGLES ACTEURS MÉTIER — CRITIQUE
+══════════════════════════════════════════════════════════════
+Chaque story DOIT être écrite du point de vue d'un acteur HUMAIN du domaine métier.
+
+L'acteur DOIT être un rôle humain réel du domaine métier du projet (déduit du CDC).
+→ Utilise les acteurs fournis dans le prompt (section ACTEURS MÉTIER DU PROJET).
+
+ACTEURS INTERDITS (génèrent un rejet automatique) :
+  ✗ "système"          ✗ "application"     ✗ "API"
+  ✗ "backend"          ✗ "frontend"        ✗ "base de données"
+  ✗ "serveur"          ✗ "microservice"    ✗ "admin technique"
+  ✗ "algorithme"       ✗ "module"          ✗ "composant"
+
+FEW-SHOTS (format attendu, acteurs à adapter au domaine du projet) :
+  ✓ "En tant que [rôle principal du domaine], je veux [action] afin de [bénéfice]"
+  ✓ "En tant que [rôle secondaire du domaine], je veux [action] afin de [bénéfice]"
+  ✗ "En tant que système, je veux [action]…"       ← INTERDIT
+  ✗ "En tant qu'application, je veux [action]…"   ← INTERDIT
+
+Si plusieurs rôles bénéficient d'une même fonctionnalité → crée une story par rôle.
+
+══════════════════════════════════════════════════════════════
+RÈGLES STORY
+══════════════════════════════════════════════════════════════
+- Format titre OBLIGATOIRE : "En tant que [rôle métier humain], je veux [action concrète] afin de [bénéfice métier]"
 - Coupe verticale obligatoire (UI + backend + DB si applicable)
 - Indépendance INVEST : chaque story livrable seule
-- 2 à 8 stories selon la complexité de l'epic
+- Autant de stories que nécessaire selon la complexité de l'epic
 
 Règles STORY POINTS (suite Fibonacci uniquement) :
 - 1 = trivial (affichage simple, lecture seule)
@@ -38,6 +62,7 @@ Règles CRITÈRES D'ACCEPTATION (Gherkin) :
 - Format : "Étant donné [contexte], quand [action], alors [résultat mesurable]"
 - 2 à 3 critères par story (jamais plus de 3)
 - Obligatoire : au moins 1 critère nominal ET 1 critère négatif (erreur, donnée invalide)
+- Les critères doivent mentionner l'acteur métier concerné (pas "le système fait")
 
 Réponds UNIQUEMENT avec du JSON valide, sans markdown, sans texte avant ou après."""
 
@@ -48,6 +73,7 @@ def _build_prompt(
     architecture_details: dict | None,
     missing_features: list[str] | None,
     human_feedback: str | None,
+    business_actors: list[str] | None = None,
 ) -> str:
     strategy = epic.get("splitting_strategy", "by_feature")
 
@@ -81,8 +107,25 @@ def _build_prompt(
                 lines.append(f"  • Agent: {aname}{role_str}")
             arch_section = "\n".join(lines) + "\n"
 
+    actors_list = business_actors or []
+    if actors_list:
+        actors_str = "\n".join(f"  • {a}" for a in actors_list)
+        actors_section = (
+            f"\n══════════════════════════════════════════════════════════════\n"
+            f"ACTEURS MÉTIER DU PROJET (identifiés par l'analyse du CDC)\n"
+            f"══════════════════════════════════════════════════════════════\n"
+            f"{actors_str}\n"
+            f"⚠ Chaque story DOIT utiliser l'un de ces acteurs (ou un sous-rôle précis de l'un d'eux).\n"
+            f"   N'utilise JAMAIS 'système', 'application', 'API' ou 'backend' comme acteur.\n"
+        )
+    else:
+        actors_section = (
+            "\n⚠ RAPPEL : chaque story doit avoir un acteur humain du domaine métier "
+            "(jamais 'système', 'application', 'API').\n"
+        )
+
     return f"""Décompose cet epic en User Stories Agile COMPLÈTES (titre + description + story_points + acceptance_criteria).
-{feedback_section}{missing_section}
+{feedback_section}{missing_section}{actors_section}
 ══════════════════════════════════════════════════════════════
 EPIC #{epic_idx} (stratégie : {strategy})
 ══════════════════════════════════════════════════════════════
@@ -95,11 +138,11 @@ FORMAT JSON ATTENDU (sans markdown)
 {{
   "stories": [
     {{
-      "title": "En tant que [rôle précis], je veux [action concrète] afin de [bénéfice métier]",
-      "description": "Contexte fonctionnel détaillé (composants impliqués, flux attendu).",
+      "title": "En tant que [rôle métier humain], je veux [action concrète] afin de [bénéfice métier]",
+      "description": "Contexte fonctionnel du point de vue de l'utilisateur (flux attendu, cas d'usage).",
       "story_points": 3,
       "acceptance_criteria": [
-        "Étant donné [contexte nominal], quand [action principale], alors [résultat attendu]",
+        "Étant donné [contexte nominal], quand [action de l'acteur], alors [résultat visible pour l'acteur]",
         "Étant donné [donnée invalide], quand [action invalide], alors [message d'erreur explicite]"
       ],
       "splitting_strategy": "{strategy}"
@@ -114,12 +157,13 @@ async def run_generate_for_epic(
     architecture_details: dict | None = None,
     missing_features: list[str] | None = None,
     human_feedback: str | None = None,
+    business_actors: list[str] | None = None,
 ) -> list[dict]:
     """
     Génère les User Stories complètes (titre + description + SP + AC) pour un seul epic.
     1 seul appel LLM — remplace les anciens appels séparés generate + estimate + criteria.
     """
-    prompt = _build_prompt(epic, epic_idx, architecture_details, missing_features, human_feedback)
+    prompt = _build_prompt(epic, epic_idx, architecture_details, missing_features, human_feedback, business_actors)
 
     last_error: Exception | None = None
     attempts = 1 + len(_RETRY_DELAYS)
@@ -128,13 +172,14 @@ async def run_generate_for_epic(
     for attempt in range(attempts):
         try:
             raw = await invoke_with_fallback(
-                model      = _MODEL,
-                messages   = [
+                model          = _MODEL,
+                messages       = [
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user",   "content": prompt},
                 ],
-                max_tokens  = 4096,
-                temperature = 0,
+                max_tokens     = 4096,
+                temperature    = 0,
+                nvidia_retries = 2,   # réessaie avec temp variée si NVIDIA retourne vide
             )
 
             if not raw or not raw.strip():

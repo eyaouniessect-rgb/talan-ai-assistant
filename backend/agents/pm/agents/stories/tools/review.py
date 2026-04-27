@@ -34,10 +34,14 @@ def _to_str_list(lst: list) -> list[str]:
 _MODEL = "openai/gpt-oss-120b"
 
 _SYSTEM = """Tu es un expert Agile (Product Owner senior) qui audite la qualité des User Stories.
-Tu vérifies 3 dimensions :
+Tu vérifies 4 dimensions :
   1. COMPLÉTUDE    : les stories couvrent-elles les fonctionnalités majeures de l'epic ?
   2. SCOPE CREEP   : aucune story ne doit aller au-delà du périmètre de l'epic.
   3. QUALITÉ INVEST: les critères INVEST s'appliquent selon la stratégie de découpage (voir règles ci-dessous).
+  4. PERSPECTIVE ACTEUR : chaque story doit être rédigée du point de vue d'un acteur HUMAIN du domaine métier.
+     Les acteurs INTERDITS sont : "système", "application", "API", "backend", "frontend", "base de données",
+     "serveur", "module", "algorithme", "composant", "admin technique".
+     Une story avec un acteur interdit est un gap de qualité CRITIQUE à signaler dans quality_issues.
 
 INVEST ADAPTÉ PAR STRATÉGIE DE DÉCOUPAGE :
   by_feature       → INVEST complet (Indépendante, Négociable, Valuable, Estimable, Small, Testable)
@@ -103,16 +107,19 @@ STORIES GÉNÉRÉES ({len(stories)}) :
 {stories_text}
 
 ══════════════════════════════════════
-VÉRIFIE CES 3 POINTS :
+VÉRIFIE CES 4 POINTS :
 ══════════════════════════════════════
 1. GAPS (complétude) : fonctionnalités majeures de l'epic non couvertes par les stories
 2. SCOPE CREEP : stories qui sortent du périmètre de l'epic (trop larges, touchent un autre epic)
 3. QUALITÉ INVEST : applique les critères INVEST adaptés à la stratégie indiquée ci-dessus
+4. PERSPECTIVE ACTEUR : signale dans quality_issues chaque story dont l'acteur n'est pas un rôle humain métier
+   (ex: "En tant que système…", "En tant qu'application…" → quality_issue critique)
 
 Règles générales :
 - Sois strict sur le scope creep : une story doit rester dans les limites de cet epic
 - Ignore les détails techniques mineurs comme gaps
 - Respecte l'adaptation INVEST selon la stratégie (ne pénalise pas ce qui est normal pour la stratégie)
+- Une story avec un acteur interdit (système, application, API…) est TOUJOURS un quality_issue
 - Si tout est satisfaisant → coverage_ok=true et listes vides
 
 Retourne UNIQUEMENT ce JSON :
@@ -130,13 +137,14 @@ Retourne UNIQUEMENT ce JSON :
     for attempt in range(attempts):
         try:
             raw = await invoke_with_fallback(
-                model      = _MODEL,
-                messages   = [
+                model          = _MODEL,
+                messages       = [
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user",   "content": prompt},
                 ],
-                max_tokens  = 768,
-                temperature = 0,
+                max_tokens     = 768,
+                temperature    = 0,
+                nvidia_retries = 2,   # 2 tentatives par clé (temp 0 puis 0.05)
             )
 
             if not raw or not raw.strip():

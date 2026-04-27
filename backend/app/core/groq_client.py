@@ -2,6 +2,7 @@
 # ═══════════════════════════════════════════════════════════
 # Gestion des providers LLM avec fallback :
 #   1. NVIDIA NIM (openai/gpt-oss-120b — 128k context)  ← primaire
+#      Plusieurs clés supportées : NVIDIA_API_KEY, NVIDIA_API_KEY2, ...
 #   2. Groq (openai/gpt-oss-120b — 8k TPM)              ← fallback (9 clés)
 #
 # Deux modes d'utilisation :
@@ -28,6 +29,22 @@ GROQ_BASE_URL   = "https://api.groq.com/openai/v1"
 def _load_nvidia_key() -> str | None:
     load_dotenv()
     return os.getenv("NVIDIA_API_KEY") or None
+
+
+def _load_nvidia_keys() -> list[str]:
+    """Charge toutes les clés NVIDIA disponibles (NVIDIA_API_KEY, NVIDIA_API_KEY2, ...)."""
+    load_dotenv()
+    keys = []
+    key1 = os.getenv("NVIDIA_API_KEY")
+    if key1:
+        keys.append(key1)
+    for i in range(2, 10):
+        key = os.getenv(f"NVIDIA_API_KEY{i}")
+        if key:
+            keys.append(key)
+    if keys:
+        logger.info(f"NVIDIA : {len(keys)} clé(s) disponible(s)")
+    return keys
 
 
 def _load_keys(agent_offset: int = 0) -> list[str]:
@@ -160,37 +177,101 @@ async def invoke_with_fallback(
     max_tokens: int = 512,
     temperature: float = 0,
     agent_offset: int = 0,
+    skip_nvidia: bool = False,
+    nvidia_retries: int = 1,
+    skip_groq: bool = False,
+    nvidia_key_index: int = 0,
+    nvidia_max_keys: int | None = None,
+    nvidia_timeout: int = 90,
 ) -> str:
     """
     Appelle le modèle avec fallback :
-      1. NVIDIA NIM (128k context) — si NVIDIA_API_KEY présente
-      2. Groq keys (9 clés en rotation) — si NVIDIA échoue ou absent
+      1. NVIDIA NIM (128k context) — clés en rotation
+         nvidia_key_index : index de départ (0=clé principale, 1=NVIDIA_API_KEY2, etc.)
+         nvidia_max_keys  : nombre max de clés à essayer (None = toutes)
+                            Mettre 1 pour empêcher la rotation (utile en parallèle pour
+                            ne pas saturer plusieurs clés simultanément).
+         nvidia_retries   : tentatives par clé avec température variée
+         nvidia_timeout   : timeout par tentative (secondes)
+      2. Groq keys (9 clés en rotation) — si toutes les clés NVIDIA échouent
+         Sauf si skip_groq=True (ex: prompt trop grand pour Groq)
     """
-    # ── Tentative NVIDIA ───────────────────────────────
-    nvidia_key = _load_nvidia_key()
-    if nvidia_key:
-        try:
-            print(f"🟢 [NVIDIA] Tentative avec {model} (128k context)")
-            llm = ChatOpenAI(
-                base_url=NVIDIA_BASE_URL,
-                api_key=nvidia_key,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            response = await llm.ainvoke(messages)
-            print(f"✅ [NVIDIA] Succès")
-            return _extract_text(response)
-        except Exception as e:
-            if _is_context_error(e):
-                # Même avec 128k, si le contexte est dépassé → message direct
-                logger.warning(f"NVIDIA : contexte trop long : {str(e)[:120]}")
-                raise RuntimeError(FRIENDLY_CONTEXT_MSG) from e
-            # Toute autre erreur NVIDIA → fallback Groq
-            print(f"⚠️ [NVIDIA] Échec ({type(e).__name__}: {str(e)[:80]}) → fallback Groq")
-            logger.warning(f"NVIDIA échec → fallback Groq : {str(e)[:120]}")
+    NVIDIA_TIMEOUT_SEC = nvidia_timeout
+
+    nvidia_keys = _load_nvidia_keys()
+    if nvidia_keys and not skip_nvidia:
+        all_nvidia_failed = False
+        # Rotation des clés NVIDIA en démarrant depuis nvidia_key_index
+        ordered_keys = nvidia_keys[nvidia_key_index:] + nvidia_keys[:nvidia_key_index]
+        if nvidia_max_keys is not None:
+            ordered_keys = ordered_keys[:max(1, nvidia_max_keys)]
+
+        for key_idx, nvidia_key in enumerate(ordered_keys):
+            key_label = f"clé #{(nvidia_key_index + key_idx) % len(nvidia_keys) + 1}/{len(nvidia_keys)}"
+            nvidia_failed = False
+
+            for attempt in range(nvidia_retries):
+                temp = temperature + (0.05 * attempt if attempt > 0 else 0)
+                try:
+                    tag = f"#{attempt+1}/{nvidia_retries}" if nvidia_retries > 1 else ""
+                    print(f"🟢 [NVIDIA] {key_label} Tentative {tag} avec {model} (128k context, temp={temp:.2f}, timeout={NVIDIA_TIMEOUT_SEC}s)")
+                    llm = ChatOpenAI(
+                        base_url=NVIDIA_BASE_URL,
+                        api_key=nvidia_key,
+                        model=model,
+                        temperature=temp,
+                        max_tokens=max_tokens,
+                        timeout=NVIDIA_TIMEOUT_SEC,
+                    )
+                    response = await asyncio.wait_for(
+                        llm.ainvoke(messages),
+                        timeout=NVIDIA_TIMEOUT_SEC + 10,
+                    )
+                    text = _extract_text(response)
+                    if not text or not text.strip():
+                        print(f"⚠️ [NVIDIA] {key_label} Réponse vide (tentative {attempt+1}/{nvidia_retries}) — content={repr(response.content)[:80]}")
+                        if attempt < nvidia_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
+                        nvidia_failed = True
+                        break
+                    print(f"✅ [NVIDIA] {key_label} Succès ({len(text)} chars)")
+                    return text
+                except asyncio.TimeoutError:
+                    print(f"⏱️ [NVIDIA] {key_label} Timeout après {NVIDIA_TIMEOUT_SEC}s (tentative {attempt+1}/{nvidia_retries})")
+                    if attempt < nvidia_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    nvidia_failed = True
+                    break
+                except Exception as e:
+                    if _is_context_error(e):
+                        logger.warning(f"NVIDIA : contexte trop long : {str(e)[:120]}")
+                        raise RuntimeError(FRIENDLY_CONTEXT_MSG) from e
+                    if attempt < nvidia_retries - 1:
+                        print(f"⚠️ [NVIDIA] {key_label} Erreur tentative {attempt+1}/{nvidia_retries} ({type(e).__name__}) → retry")
+                        await asyncio.sleep(2)
+                        continue
+                    nvidia_failed = True
+                    print(f"⚠️ [NVIDIA] {key_label} Échec après {nvidia_retries} tentative(s) ({type(e).__name__}: {str(e)[:80]})")
+                    logger.warning(f"NVIDIA {key_label} échec final : {str(e)[:120]}")
+                    break
+
+            if nvidia_failed and key_idx < len(ordered_keys) - 1:
+                print(f"🔄 [NVIDIA] {key_label} épuisée → rotation vers clé suivante")
+                await asyncio.sleep(1)
+                continue
+            if nvidia_failed:
+                all_nvidia_failed = True
+
+        if all_nvidia_failed and skip_groq:
+            print(f"❌ [NVIDIA] Toutes les clés échouées + skip_groq=True → retour vide")
+            raise ValueError("NVIDIA failed and Groq is skipped (large prompt)")
 
     # ── Fallback Groq (9 clés en rotation) ────────────
+    if skip_groq:
+        raise RuntimeError("NVIDIA failed and Groq fallback is disabled (skip_groq=True)")
+
     keys = _load_keys(agent_offset)
     last_error = None
 

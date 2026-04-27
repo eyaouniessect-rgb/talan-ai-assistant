@@ -1,12 +1,11 @@
 # agents/pm/graph/graph.py
 # ═══════════════════════════════════════════════════════════════
-# Graph LangGraph du pipeline PM — 12 phases
+# Graph LangGraph du pipeline PM — 11 phases
 #
 # Flux complet :
 #   extraction (pas de validation)
 #       → epics → validate → jira_sync
 #       → stories → validate → jira_sync
-#       → refinement → validate → jira_sync
 #       → story_deps → validate → jira_sync
 #       → prioritization → validate → jira_sync
 #       → tasks → validate → jira_sync
@@ -34,7 +33,6 @@ from agents.pm.graph.node_validate import node_validate
 from agents.pm.agents.extraction.agent  import node_extraction
 from agents.pm.agents.epics.agent       import node_epics
 from agents.pm.agents.stories.agent     import node_stories
-from agents.pm.agents.refinement.agent  import node_refinement
 from agents.pm.agents.dependencies.story_deps import node_story_deps
 from agents.pm.agents.dependencies.task_deps  import node_task_deps
 from agents.pm.agents.prioritization.agent    import node_prioritization
@@ -65,7 +63,7 @@ pm_graph = None
 # ──────────────────────────────────────────────────────────────
 
 _PHASE_ORDER = [
-    "extract", "epics", "stories", "refinement",
+    "extract", "epics", "stories",
     "story_deps", "prioritization", "tasks", "task_deps",
     "cpm", "sprints", "staffing", "monitoring",
 ]
@@ -74,7 +72,6 @@ _PHASE_TO_NODE: dict[str, str] = {
     "extract":        "node_extraction",
     "epics":          "node_epics",
     "stories":        "node_stories",
-    "refinement":     "node_refinement",
     "story_deps":     "node_story_deps",
     "prioritization": "node_prioritization",
     "tasks":          "node_tasks",
@@ -129,7 +126,6 @@ def build_pm_graph(checkpointer=None):
     graph.add_node("node_extraction",    node_extraction)
     graph.add_node("node_epics",         node_epics)
     graph.add_node("node_stories",       node_stories)
-    graph.add_node("node_refinement",    node_refinement)
     graph.add_node("node_story_deps",    node_story_deps)
     graph.add_node("node_prioritization",node_prioritization)
     graph.add_node("node_tasks",         node_tasks)
@@ -147,7 +143,7 @@ def build_pm_graph(checkpointer=None):
     # ── Phases 1→11 : chaque phase → node_validate ────────────
     for phase_node in [
         "node_extraction",
-        "node_epics", "node_stories", "node_refinement",
+        "node_epics", "node_stories",
         "node_story_deps", "node_prioritization", "node_tasks",
         "node_task_deps", "node_cpm", "node_sprints", "node_staffing",
     ]:
@@ -162,7 +158,7 @@ def build_pm_graph(checkpointer=None):
             "node_extraction":     "node_extraction",   # rejet extraction
             "node_epics":          "node_epics",
             "node_stories":        "node_stories",
-            "node_refinement":     "node_refinement",
+
             "node_story_deps":     "node_story_deps",
             "node_prioritization": "node_prioritization",
             "node_tasks":          "node_tasks",
@@ -180,7 +176,7 @@ def build_pm_graph(checkpointer=None):
         {
             "node_epics":          "node_epics",        # après validation extraction
             "node_stories":        "node_stories",
-            "node_refinement":     "node_refinement",
+
             "node_story_deps":     "node_story_deps",
             "node_prioritization": "node_prioritization",
             "node_tasks":          "node_tasks",

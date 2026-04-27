@@ -88,6 +88,11 @@ class PMPipelineState(TypedDict):
     #                               — "by_workflow_step" | "by_component"
     # }
 
+    # Acteurs métier humains identifiés par le LLM lors de la phase 2 (epics)
+    # Exemples : ["recruteur", "candidat", "manager RH", "administrateur"]
+    # Transmis à la phase 3 pour forcer des stories orientées rôle métier
+    business_actors: Optional[list]
+
 
     # ╔══════════════════════════════════════════════════════╗
     # ║  PHASE 3 — User Stories                             ║
@@ -109,35 +114,7 @@ class PMPipelineState(TypedDict):
 
 
     # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 4 — Raffinement PO ↔ Tech Lead               ║
-    # ║  Produit par : agents/refinement/                   ║
-    # ║  Pattern multi-agent : débat en N rounds (max 3)    ║
-    # ╚══════════════════════════════════════════════════════╝
-
-    refinement_rounds: list[dict]
-    # Structure d'un round :
-    # {
-    #   "round":         int,
-    #   "po_comment":    str,
-    #   "tech_comment":  str,
-    #   "stories_patch": list[dict]  — enrichis avec old_value + db_id
-    # }
-
-    refined_stories: list[dict]
-    # Stories après le dernier round appliqué par le PM
-
-    # Stories AVANT le round courant — utilisées pour le revert story-par-story
-    stories_before_round: Optional[list]
-
-    # Numéro du round qui vient de terminer (1-based)
-    current_round: Optional[int]
-
-    # True si le consensus PO↔TL a été atteint lors du dernier round
-    refinement_consensus: Optional[bool]
-
-
-    # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 5 — Dépendances entre User Stories           ║
+    # ║  PHASE 4 — Dépendances entre User Stories           ║
     # ╚══════════════════════════════════════════════════════╝
 
     story_dependencies: list[dict]
@@ -219,7 +196,7 @@ class PMPipelineState(TypedDict):
     # ╚══════════════════════════════════════════════════════╝
 
     # Nom de la phase en cours
-    # "extract"|"epics"|"stories"|"refinement"|"story_deps"|
+    # "extract"|"epics"|"stories"|"story_deps"|
     # "prioritization"|"tasks"|"task_deps"|"cpm"|"sprints"|"staffing"|"monitoring"
     current_phase: str
 

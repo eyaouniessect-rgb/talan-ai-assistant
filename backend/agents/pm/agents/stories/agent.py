@@ -30,6 +30,7 @@ async def node_stories(state: PMPipelineState) -> dict:
     targeted_story_ids    = state.get("targeted_story_ids") or []
     architecture_detected = state.get("architecture_detected", False)
     architecture_details  = state.get("architecture_details") if architecture_detected else None
+    business_actors       = state.get("business_actors") or []
 
     print(
         f"[stories] Phase 3 | projet={project_id} | {len(epics)} epics"
@@ -54,7 +55,8 @@ async def node_stories(state: PMPipelineState) -> dict:
     # CAS 1 & 2 : generation complete (premiere fois ou rejet global)
     try:
         stories = await generate_stories(
-            epics, human_feedback, architecture_details, project_id=project_id
+            epics, human_feedback, architecture_details,
+            project_id=project_id, business_actors=business_actors,
         )
     except Exception as e:
         error_msg = str(e)[:300]

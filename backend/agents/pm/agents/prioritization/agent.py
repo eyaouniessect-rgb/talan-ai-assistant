@@ -17,8 +17,7 @@ async def node_prioritization(state: PMPipelineState) -> dict:
     Structure : [{"story_id": int, "moscow": str, "value_score": float, "final_rank": int}]
     """
     project_id     = state.get("project_id")
-    refined_stories = state.get("refined_stories", [])
-    stories        = refined_stories or state.get("stories", [])
+    stories        = state.get("stories", [])
     human_feedback = state.get("human_feedback")
 
     print(f"[prioritization] Phase 6 | projet={project_id} | {len(stories)} stories (stub)")

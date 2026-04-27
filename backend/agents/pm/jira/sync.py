@@ -34,7 +34,7 @@ from agents.pm.state import PMPipelineState
 _PHASE_SYNC_MAP = {
     "epics":           "create_epics",
     "stories":         "create_stories",
-    "refinement":      "update_stories",
+
     "story_deps":      "create_story_links",
     "prioritization":  "update_priority",
     "tasks":           "create_subtasks",

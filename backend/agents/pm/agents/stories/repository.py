@@ -79,7 +79,7 @@ async def save_stories(project_id: int, stories: list[dict]) -> list[UserStory]:
                 story_points        = s.get("story_points"),
                 splitting_strategy  = s.get("splitting_strategy", "by_feature"),
                 acceptance_criteria = ac_text,
-                status              = StoryStatusEnum.DRAFT,
+                status              = StoryStatusEnum.GENERATED,
                 ai_metadata         = {"source": "llm_generated", "llm_epic_idx": epic_idx},
             )
             orm_stories.append(orm_s)

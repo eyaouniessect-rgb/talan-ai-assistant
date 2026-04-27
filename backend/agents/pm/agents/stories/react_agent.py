@@ -22,12 +22,13 @@ from agents.pm.agents.stories.tools.generate import run_generate_for_epic
 from agents.pm.agents.stories.tools.review   import run_review_coverage
 
 # Max epics traités en parallèle — évite le rate limiting API (réponses vides)
-# 3 = bon compromis : 3× plus rapide que séquentiel, sans saturer l'API
-MAX_CONCURRENT_EPICS = 3
+# 2 = bon compromis : moins de contention NVIDIA que 3, moins de réponses vides en parallèle
+MAX_CONCURRENT_EPICS = 2
 
 _current_epics:                list[dict]  = []
 _current_architecture_details: dict | None = None
 _current_human_feedback:       str | None  = None
+_current_business_actors:      list[str]   = []
 
 _epic_store:   dict[int, list[dict]] = {}
 _review_store: dict[int, dict]       = {}
@@ -91,6 +92,7 @@ async def _process_epic(epic_idx: int, epic: dict, emit) -> None:
             architecture_details = _current_architecture_details,
             missing_features     = None,
             human_feedback       = _current_human_feedback,
+            business_actors      = _current_business_actors,
         )
     except Exception as e:
         print(f"[orchestrator] generate failed epic {epic_idx} : {e}")
@@ -140,6 +142,7 @@ async def _process_epic(epic_idx: int, epic: dict, emit) -> None:
                 architecture_details = _current_architecture_details,
                 missing_features     = gaps,
                 human_feedback       = _current_human_feedback,
+                business_actors      = _current_business_actors,
             )
             _epic_store[epic_idx] = stories
         except Exception as e:
@@ -159,6 +162,7 @@ async def run_stories_react_agent(
     human_feedback: str | None = None,
     architecture_details: dict | None = None,
     project_id: int | None = None,
+    business_actors: list[str] | None = None,
 ) -> list[dict]:
     """
     Génère les User Stories de manière déterministe.
@@ -168,10 +172,11 @@ async def run_stories_react_agent(
 
     Temps total ≈ max(temps d'un epic) — indépendant du nombre d'epics.
     """
-    global _current_epics, _current_architecture_details, _current_human_feedback
+    global _current_epics, _current_architecture_details, _current_human_feedback, _current_business_actors
     _current_epics                = epics
     _current_architecture_details = architecture_details
     _current_human_feedback       = human_feedback
+    _current_business_actors      = business_actors or []
     _epic_store.clear()
     _review_store.clear()
 

@@ -140,7 +140,7 @@ async def list_pipeline_projects(
                 break
 
         # Statut global du projet (calculé depuis les phases pipeline)
-        if phases_done == 12:
+        if phases_done == 11:
             global_status = ProjectGlobalStatus.PIPELINE_DONE
         elif any(p.status == PipelineStatusEnum.PENDING_VALIDATION for p in phases):
             global_status = ProjectGlobalStatus.PENDING_HUMAN
@@ -159,7 +159,7 @@ async def list_pipeline_projects(
             "project_name":   project.name,
             "client_name":    project.client.name if project.client else "—",
             "phases_done":    phases_done,
-            "phases_total":   12,
+            "phases_total":   11,
             "current_phase":  current_phase,
             "current_status": current_status,
             "global_status":  global_status,
@@ -290,8 +290,6 @@ async def start_pipeline(
         # Phases — vides au départ
         "epics":               [],
         "stories":             [],
-        "refinement_rounds":   [],
-        "refined_stories":     [],
         "story_dependencies":  [],
         "priorities":          [],
         "tasks":               [],
@@ -426,6 +424,20 @@ async def validate_phase(
     )).scalar_one_or_none()
 
     if not pending:
+        # Diagnostic : chercher si une phase tourne encore (pending_ai)
+        running = (await db.execute(
+            select(PipelineState).where(
+                PipelineState.project_id == project_id,
+                PipelineState.status     == PipelineStatusEnum.PENDING_AI,
+            )
+        )).scalar_one_or_none()
+
+        if running:
+            raise HTTPException(
+                409,
+                f"La phase '{running.phase.value}' est encore en cours de traitement (pending_ai). "
+                "Attendez qu'elle termine, ou utilisez POST /pipeline/{project_id}/resume si elle est bloquée."
+            )
         raise HTTPException(404, "Aucune phase en attente de validation pour ce projet.")
 
     # Mise à jour en base
@@ -471,7 +483,7 @@ async def validate_phase(
 
     proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
     if proj:
-        if validated_count == 12:
+        if validated_count == 11:
             proj.status = ProjectGlobalStatus.PIPELINE_DONE.value
         elif has_pending:
             proj.status = ProjectGlobalStatus.PENDING_HUMAN.value
@@ -656,232 +668,6 @@ async def restart_missing_stories(
         "message": f"Génération lancée pour {len(missing_epics)} epic(s) manquant(s).",
         "missing": missing_indices,
     }
-
-
-# ──────────────────────────────────────────────────────────────
-# POST /pipeline/{project_id}/refinement/restart — Relancer le raffinement
-# ──────────────────────────────────────────────────────────────
-
-async def _background_run_one_round(
-    project_id:           int,
-    stories:              list,
-    epics:                list,
-    round_number:         int,
-    architecture_details: dict | None,
-    previous_rounds:      list,
-) -> None:
-    """
-    Background task : exécute UN seul round de raffinement et suspend
-    en PENDING_VALIDATION avec awaiting_round_review=True.
-    Le PM valide story par story avant le round suivant.
-    """
-    from agents.pm.agents.refinement.service import run_one_round
-
-    try:
-        stories_before_round = list(stories)
-
-        updated_stories, round_data = await run_one_round(
-            stories              = stories,
-            epics                = epics,
-            round_number         = round_number,
-            architecture_details = architecture_details,
-            previous_rounds      = previous_rounds,
-        )
-
-        all_rounds = previous_rounds + [round_data]
-
-        await upsert_pipeline_state(
-            project_id = project_id,
-            phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
-            status     = PipelineStatusEnum.PENDING_VALIDATION,
-            ai_output  = {
-                "refined_stories":      updated_stories,
-                "stories_before_round": stories_before_round,
-                "current_round":        round_number,
-                "refinement_rounds":    all_rounds,
-                "epics":                epics,
-                "consensus":            round_data.get("consensus", False),
-                "awaiting_round_review": True,
-            },
-        )
-        print(f"[round/{round_number}] ✓ projet={project_id} | en attente validation PM")
-    except Exception as e:
-        print(f"[round/{round_number}] ✗ projet={project_id}: {type(e).__name__}: {e}")
-        await upsert_pipeline_state(
-            project_id = project_id,
-            phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
-            status     = PipelineStatusEnum.PENDING_VALIDATION,
-            ai_output  = None,
-        )
-
-
-@router.post("/{project_id}/refinement/restart")
-async def restart_refinement(
-    project_id:       int,
-    background_tasks: BackgroundTasks,
-    current_user:     dict         = Depends(require_pm),
-    db:               AsyncSession = Depends(get_db),
-):
-    """Relance le raffinement PO↔TL en arrière-plan à partir des stories existantes."""
-    pm_graph = get_pm_graph()
-    if pm_graph is None:
-        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
-
-    config   = {"configurable": {"thread_id": f"pm_{project_id}"}}
-    snapshot = await pm_graph.aget_state(config)
-    if not snapshot or not snapshot.values:
-        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
-
-    state: dict = dict(snapshot.values)
-
-    stories              = state.get("stories") or state.get("refined_stories") or []
-    epics                = state.get("epics", [])
-    human_feedback       = state.get("human_feedback")
-    architecture_details = state.get("architecture_details") if state.get("architecture_detected") else None
-
-    if not stories:
-        raise HTTPException(400, "Aucune story disponible pour relancer le raffinement.")
-
-    await upsert_pipeline_state(
-        project_id = project_id,
-        phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
-        status     = PipelineStatusEnum.PENDING_AI,
-        ai_output  = None,
-    )
-
-    background_tasks.add_task(
-        _background_run_one_round,
-        project_id           = project_id,
-        stories              = stories,
-        epics                = epics,
-        round_number         = 1,
-        architecture_details = architecture_details,
-        previous_rounds      = [],
-    )
-
-    return {"status": "started", "message": "Round 1 du raffinement lancé."}
-
-
-# ──────────────────────────────────────────────────────────────
-# POST /pipeline/{project_id}/refinement/round/apply — Décision PM par story
-# ──────────────────────────────────────────────────────────────
-
-class RoundApplyRequest(BaseModel):
-    story_choices:        dict   # { "db_id_str": "new" | "old" }
-    continue_refinement:  bool = True
-
-
-@router.post("/{project_id}/refinement/round/apply")
-async def apply_refinement_round(
-    project_id:       int,
-    body:             RoundApplyRequest,
-    background_tasks: BackgroundTasks,
-    current_user:     dict         = Depends(require_pm),
-    db:               AsyncSession = Depends(get_db),
-):
-    """
-    Le PM a choisi pour chaque story : garder la version raffinée ("new")
-    ou revenir à la version précédente ("old").
-    Ensuite : lancer le round suivant ou finaliser le raffinement.
-    """
-    phases = await get_all_pipeline_states(project_id)
-    ref_phase = next(
-        (p for p in phases if p.phase.value == PipelinePhaseEnum.PHASE_4_REFINEMENT.value),
-        None,
-    )
-    if not ref_phase or not ref_phase.ai_output:
-        raise HTTPException(404, "Aucun état de raffinement trouvé.")
-
-    ao = ref_phase.ai_output
-    refined_stories     = ao.get("refined_stories", [])
-    stories_before      = ao.get("stories_before_round", [])
-    epics               = ao.get("epics", [])
-    current_round       = ao.get("current_round", 1)
-    all_rounds          = ao.get("refinement_rounds", [])
-    consensus           = ao.get("consensus", False)
-
-    # ── 1. Appliquer les choix du PM (new / old) story par story ─
-    before_by_id = {str(s["db_id"]): s for s in stories_before if s.get("db_id")}
-    merged: list[dict] = []
-    for s in refined_stories:
-        db_id_str = str(s.get("db_id", ""))
-        choice = body.story_choices.get(db_id_str, "new")
-        if choice == "old" and db_id_str in before_by_id:
-            merged.append(dict(before_by_id[db_id_str]))
-        else:
-            merged.append(dict(s))
-
-    # ── 2. Sauvegarder en base ────────────────────────────────────
-    from agents.pm.agents.refinement.repository import save_refined_stories
-    await save_refined_stories(project_id, merged)
-
-    # ── 3. Récupérer le graph + config ───────────────────────────
-    pm_graph = get_pm_graph()
-    config   = {"configurable": {"thread_id": f"pm_{project_id}"}}
-
-    # ── 4. Mettre à jour le state LangGraph avec les stories choisies ─
-    # Indispensable : les phases suivantes (5, 6…) lisent refined_stories
-    # depuis le checkpoint LangGraph, pas depuis pipeline_state.
-    if pm_graph:
-        await pm_graph.aupdate_state(
-            config,
-            {
-                "refined_stories":      merged,
-                "stories_before_round": None,
-            },
-        )
-
-    # ── 5. Continuer ou finaliser ─────────────────────────────────
-    next_round = current_round + 1
-
-    if body.continue_refinement and not consensus and next_round <= MAX_ROUNDS:
-        architecture_details = None
-        if pm_graph:
-            snapshot = await pm_graph.aget_state(config)
-            if snapshot and snapshot.values:
-                s = dict(snapshot.values)
-                if s.get("architecture_detected"):
-                    architecture_details = s.get("architecture_details")
-
-        await upsert_pipeline_state(
-            project_id = project_id,
-            phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
-            status     = PipelineStatusEnum.PENDING_AI,
-            ai_output  = None,
-        )
-
-        background_tasks.add_task(
-            _background_run_one_round,
-            project_id           = project_id,
-            stories              = merged,
-            epics                = epics,
-            round_number         = next_round,
-            architecture_details = architecture_details,
-            previous_rounds      = all_rounds,
-        )
-        return {"status": "started", "message": f"Round {next_round} lancé en arrière-plan."}
-
-    # ── 6. Finaliser : reprendre l'interrupt LangGraph ────────────
-    # Le graph était suspendu dans node_validate après node_refinement.
-    # On le reprend avec approved=True pour passer à la Phase 5.
-    await upsert_pipeline_state(
-        project_id = project_id,
-        phase      = PipelinePhaseEnum.PHASE_4_REFINEMENT,
-        status     = PipelineStatusEnum.PENDING_VALIDATION,
-        ai_output  = {
-            "refined_stories":       merged,
-            "stories_before_round":  None,
-            "current_round":         current_round,
-            "refinement_rounds":     all_rounds,
-            "epics":                 epics,
-            "consensus":             consensus,
-            "awaiting_round_review": False,
-        },
-    )
-    return {"status": "finalized", "message": "Raffinement finalisé. Vous pouvez valider la phase."}
-
-
-MAX_ROUNDS = 3
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1274,7 +1060,7 @@ async def create_story_endpoint(
             story_points        = body.story_points,
             splitting_strategy  = target_epic.splitting_strategy or "by_feature",
             acceptance_criteria = _json.dumps(ac, ensure_ascii=False),
-            status              = StoryStatusEnum.DRAFT,
+            status              = StoryStatusEnum.GENERATED,
             ai_metadata         = {"source": "manual"},
         )
         session.add(new_story)

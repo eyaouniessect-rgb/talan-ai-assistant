@@ -3,9 +3,9 @@
 #
 # Table : user_stories
 # Une user story = une fonctionnalité du point de vue utilisateur.
-# Générée en Phase 3, raffinée en Phase 4 (PO + Tech Lead).
+# Générée en Phase 3 (IA) ou ajoutée manuellement.
 # priority rempli en Phase 6 (MoSCoW : must_have | should_have | could_have | wont_have).
-# jira_issue_key rempli après validation + sync Jira (Phase 4).
+# jira_issue_key rempli après validation + sync Jira.
 
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
 from sqlalchemy import Enum as SAEnum
@@ -34,7 +34,7 @@ class UserStory(Base):
         SAEnum(StoryStatusEnum, name="storystatusenum",
                schema="project_management", native_enum=False),
         nullable=False,
-        default=StoryStatusEnum.DRAFT,
+        default=StoryStatusEnum.GENERATED,
     )
 
     acceptance_criteria = Column(Text, nullable=True)

@@ -68,14 +68,6 @@ export const getArchivedProjects = () =>
 export const restartMissingStories = (projectId) =>
   api.post(`/pipeline/${projectId}/stories/restart`).then(r => r.data)
 
-export const restartRefinement = (projectId) =>
-  api.post(`/pipeline/${projectId}/refinement/restart`).then(r => r.data)
-
-export const applyRefinementRound = (projectId, storyChoices, continueRefinement) =>
-  api.post(`/pipeline/${projectId}/refinement/round/apply`, {
-    story_choices:       storyChoices,
-    continue_refinement: continueRefinement,
-  }).then(r => r.data)
 
 // ── Jira re-sync ──────────────────────────────────────────────
 
