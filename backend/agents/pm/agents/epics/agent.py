@@ -57,7 +57,7 @@ async def node_epics(state: PMPipelineState) -> dict:
 
     # CAS 1 : premiere generation depuis le CDC
     try:
-        epics = await generate_epics(cdc_text, human_feedback)
+        epics, business_actors = await generate_epics(cdc_text, human_feedback)
     except Exception as e:
         error_msg = str(e)
         print(f"[epics] ERREUR : {type(e).__name__}: {error_msg[:200]}")
@@ -73,7 +73,7 @@ async def node_epics(state: PMPipelineState) -> dict:
         await save_epics(project_id, epics)
         print(f"[epics] {len(epics)} epics persistes en base")
 
-    return _done(epics)
+    return {**_done(epics), "business_actors": business_actors}
 
 
 # ──────────────────────────────────────────────────────────────

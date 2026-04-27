@@ -32,7 +32,7 @@ class Epic(Base):
         SAEnum(EpicStatusEnum, name="epicstatusenum",
                schema="project_management", native_enum=False),
         nullable=False,
-        default=EpicStatusEnum.DRAFT,
+        default=EpicStatusEnum.GENERATED,
     )
 
     # Clé Jira créée après validation PM et sync (ex: "PROJ-E1")

@@ -21,10 +21,13 @@ Tu aides un Project Manager à décomposer un projet en epics LangGraph pour un 
 
 Règles absolues :
 - Réponds UNIQUEMENT avec du JSON valide, sans texte avant ni après.
-- Génère entre 3 et 8 epics maximum selon la taille du projet.
+- Génère autant d'epics que nécessaire selon la taille et la complexité du projet.
 - Chaque epic doit être autonome et livrable indépendamment.
 - La splitting_strategy doit refléter la meilleure façon de découper CET epic en stories.
-- Les descriptions doivent être en français et orientées valeur métier."""
+- Les descriptions doivent être en français et orientées valeur métier.
+- Identifie les acteurs HUMAINS du domaine métier tels qu'ils apparaissent dans le CDC.
+  Ces acteurs seront utilisés pour rédiger les User Stories en phase suivante.
+  N'invente pas des acteurs génériques — déduis-les du contenu du CDC."""
 
 
 def build_epics_prompt(cdc_text: str, human_feedback: str | None = None) -> str:
@@ -54,6 +57,11 @@ Pour chaque epic, détermine la splitting_strategy la plus appropriée :
 
 Retourne UNIQUEMENT ce JSON (sans markdown, sans explication) :
 {{
+  "business_actors": [
+    "<rôle humain déduit du CDC>",
+    "<rôle humain déduit du CDC>",
+    "..."
+  ],
   "epics": [
     {{
       "title": "Titre court et explicite de l'epic",
@@ -62,6 +70,11 @@ Retourne UNIQUEMENT ce JSON (sans markdown, sans explication) :
     }}
   ]
 }}
+
+Règles pour "business_actors" :
+- Déduis les acteurs UNIQUEMENT depuis le contenu du CDC (pas d'invention)
+- Rôles humains réels uniquement (jamais "système", "API", "backend", "base de données", "application")
+- Entre 2 et 8 acteurs selon la richesse du CDC
 
 CDC à analyser :
 {cdc_text}"""

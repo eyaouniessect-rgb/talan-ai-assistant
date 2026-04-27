@@ -112,18 +112,6 @@ async def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
             "epics":   state.get("epics",   []),
         }
 
-    # Phase 4 — refinement : résultat Round 1 + données pour la revue story-par-story
-    if phase == "refinement":
-        return {
-            "refined_stories":       state.get("refined_stories",      []),
-            "stories_before_round":  state.get("stories_before_round", []),
-            "refinement_rounds":     state.get("refinement_rounds",    []),
-            "current_round":         state.get("current_round",        1),
-            "consensus":             state.get("refinement_consensus", False),
-            "epics":                 state.get("epics",                []),
-            "awaiting_round_review": True,   # toujours True à la sortie du nœud
-        }
-
     # Phase 2 — epics : enrichir avec db_id depuis la DB
     if phase == "epics":
         epics_state = state.get("epics", [])

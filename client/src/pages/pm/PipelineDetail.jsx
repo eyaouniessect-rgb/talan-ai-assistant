@@ -17,8 +17,6 @@ import {
   startPipeline,
   resyncJira,
   restartMissingStories,
-  restartRefinement,
-  applyRefinementRound,
   exportBacklogPdf,
 } from "../../api/pipeline";
 import { getDocument } from "../../api/projects";
@@ -205,27 +203,6 @@ export default function PipelineDetail() {
     pollRef.current = setInterval(() => fetchData(true), 4000);
   };
 
-  const handleRestartRefinement = async () => {
-    try {
-      await restartRefinement(id);
-    } catch {
-      // ignore — la phase est déjà repassée en pending_ai côté backend
-    }
-    await fetchData(true);
-    pollRef.current = setInterval(() => fetchData(true), 4000);
-  };
-
-  const handleApplyRefinementRound = async (storyChoices, continueRefinement) => {
-    try {
-      await applyRefinementRound(id, storyChoices, continueRefinement);
-    } catch {
-      // ignore
-    }
-    await fetchData(true);
-    if (continueRefinement) {
-      pollRef.current = setInterval(() => fetchData(true), 4000);
-    }
-  };
 
   const getPhaseStatus = (key) => {
     const phase = phaseMap[key];
@@ -293,7 +270,7 @@ export default function PipelineDetail() {
       </button>
 
       {/* En-tête */}
-      <div className="flex items-start justify-between mb-6">
+      <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="font-display font-bold text-navy text-2xl">
             {project?.project_name}
@@ -307,17 +284,17 @@ export default function PipelineDetail() {
             </span>
           )}
         </div>
-        {globalStatus === "pending_human" && (
-          <span className="text-xs bg-amber-50 text-amber-600 border border-amber-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
-            <AlertCircle size={12} /> Validation requise
-          </span>
-        )}
-        {globalStatus === "running" && (
-          <span className="text-xs bg-blue-50 text-blue-600 border border-blue-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
-            <Loader size={12} className="animate-spin" /> En cours...
-          </span>
-        )}
         <div className="flex items-center gap-2">
+          {globalStatus === "pending_human" && (
+            <span className="text-xs bg-amber-50 text-amber-600 border border-amber-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
+              <AlertCircle size={12} /> Validation requise
+            </span>
+          )}
+          {globalStatus === "running" && (
+            <span className="text-xs bg-blue-50 text-blue-600 border border-blue-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
+              <Loader size={12} className="animate-spin" /> En cours...
+            </span>
+          )}
           {globalStatus === "completed" && (
             <span className="text-xs bg-green-50 text-green-600 border border-green-200 px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
               <CheckCircle size={12} /> Terminé
@@ -485,12 +462,7 @@ export default function PipelineDetail() {
                   projectId={id}
                   onRefresh={() => fetchData(true)}
                   onContinue={
-                    activePhase === "stories"    ? handleContinueStories   :
-                    activePhase === "refinement" ? handleRestartRefinement :
-                    undefined
-                  }
-                  onApplyRound={
-                    activePhase === "refinement" ? handleApplyRefinementRound : undefined
+                    activePhase === "stories" ? handleContinueStories : undefined
                   }
                 />
               )}
@@ -549,6 +521,9 @@ export default function PipelineDetail() {
                     targeted_epic_ids:  targetedEpicIds?.length  ? targetedEpicIds  : null,
                   });
                   await fetchData();
+                } catch (err) {
+                  const msg = err?.response?.data?.detail || err?.message || "Erreur lors de la validation.";
+                  setError(msg);
                 } finally {
                   setProcessingState(null);
                 }

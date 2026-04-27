@@ -17,8 +17,7 @@ async def node_tasks(state: PMPipelineState) -> dict:
                   "duration_days": int, "task_type": str}]
     """
     project_id     = state.get("project_id")
-    refined_stories = state.get("refined_stories", [])
-    stories        = refined_stories or state.get("stories", [])
+    stories        = state.get("stories", [])
     human_feedback = state.get("human_feedback")
 
     print(f"[tasks] Phase 7 | projet={project_id} | {len(stories)} stories (stub)")

@@ -36,7 +36,7 @@ async def save_epics(project_id: int, epics: list[dict]) -> list[Epic]:
                 title              = epic["title"],
                 description        = epic["description"],
                 splitting_strategy = epic["splitting_strategy"],
-                status             = EpicStatusEnum.DRAFT,
+                status             = EpicStatusEnum.GENERATED,
                 ai_metadata        = {"source": "llm_generated"},
             )
             for epic in epics
@@ -90,7 +90,7 @@ async def add_epic(project_id: int, epic_data: dict) -> Epic:
             title              = epic_data["title"],
             description        = epic_data.get("description", ""),
             splitting_strategy = epic_data.get("splitting_strategy", "by_feature"),
-            status             = EpicStatusEnum.DRAFT,
+            status             = EpicStatusEnum.GENERATED,
             ai_metadata        = {"source": "manual"},
         )
         session.add(orm_e)
