@@ -79,6 +79,19 @@ export const resyncJira = (projectId, phase) =>
 export const addStory = (projectId, body) =>
   api.post(`/pipeline/${projectId}/stories`, body).then(r => r.data)
 
+// ── Relancer la priorisation ──────────────────────────────────
+
+export const rerunPrioritization = (projectId) =>
+  api.post(`/pipeline/${projectId}/prioritization/rerun`).then(r => r.data)
+
+// ── Story Dependencies ────────────────────────────────────────
+
+export const getStoryDependencies = (projectId) =>
+  api.get(`/pipeline/${projectId}/story-dependencies`).then(r => r.data)
+
+export const updateStoryDependencies = (projectId, dependencies) =>
+  api.put(`/pipeline/${projectId}/story-dependencies`, { dependencies }).then(r => r.data)
+
 // ── Export PDF ────────────────────────────────────────────────
 
 export const exportBacklogPdf = (projectId) =>

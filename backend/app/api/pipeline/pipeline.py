@@ -292,8 +292,6 @@ async def start_pipeline(
         "stories":             [],
         "story_dependencies":  [],
         "priorities":          [],
-        "tasks":               [],
-        "task_dependencies":   [],
         "cpm_result":          {},
         "critical_path":       [],
         "sprints":             [],
@@ -309,7 +307,6 @@ async def start_pipeline(
         "jira_project_key":    resolved_jira_key,
         "jira_epic_map":       {},
         "jira_story_map":      {},
-        "jira_task_map":       {},
         "jira_sprint_map":     {},
         "jira_synced_phases":  [],
         # Erreur
@@ -711,7 +708,7 @@ async def jira_resync_phase(
     if not phase:
         raise HTTPException(400, "Impossible de déterminer la phase. Fournissez 'phase' dans le corps.")
 
-    syncable = {"epics", "stories", "tasks", "sprints"}
+    syncable = {"epics", "stories", "story_deps", "cpm", "sprints"}
     if phase not in syncable:
         raise HTTPException(400, f"Phase '{phase}' non synchronisable. Phases supportées : {sorted(syncable)}.")
 
@@ -778,6 +775,67 @@ async def jira_resync_phase(
         "jira_key":     jira_key,
         "patch_keys":   list(patch.keys()) if patch else [],
         "message":      f"Re-sync Jira phase '{phase}' terminée." if patch else f"Aucun objet créé pour la phase '{phase}'.",
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/prioritization/rerun — Relance la priorisation
+# ──────────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/prioritization/rerun")
+async def rerun_prioritization(
+    project_id:   int,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Relance l'algorithme de priorisation sans toucher au reste du pipeline.
+    Utile après modification des story_points ou des dépendances.
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    state: dict = dict(snapshot.values)
+
+    # Remplacer stories par les données fraîches depuis la DB
+    db_stories = await get_all_stories_as_dicts(project_id)
+    if db_stories:
+        state = {**state, "stories": db_stories}
+
+    from agents.pm.agents.prioritization.algorithme import node_prioritization
+    try:
+        patch = await node_prioritization(state)
+    except Exception as e:
+        raise HTTPException(500, f"Erreur lors de la priorisation : {str(e)}")
+
+    # Mettre à jour le checkpoint LangGraph
+    await pm_graph.aupdate_state(config, patch, as_node="node_prioritization")
+
+    # Mettre à jour la DB pipeline_state
+    prio_phase = next(
+        (p for p in await get_all_pipeline_states(project_id)
+         if p.phase.value == PipelinePhaseEnum.PHASE_5_PRIORITIZATION.value),
+        None,
+    )
+    current_ai_output = (prio_phase.ai_output or {}) if prio_phase else {}
+    await upsert_pipeline_state(
+        project_id = project_id,
+        phase      = PipelinePhaseEnum.PHASE_5_PRIORITIZATION,
+        status     = PipelineStatusEnum.PENDING_VALIDATION,
+        ai_output  = {**current_ai_output, "priorities": patch.get("priorities", [])},
+    )
+
+    return {
+        "project_id": project_id,
+        "priorities": patch.get("priorities", []),
+        "message":    "Priorisation recalculée avec succès.",
     }
 
 
@@ -900,25 +958,8 @@ async def delete_project(
     # Suppression manuelle dans l'ordre des FK (pas de CASCADE en base avant migration)
     from sqlalchemy import text
     await db.execute(text("""
-        DELETE FROM project_management.task_dependencies
-        WHERE task_id IN (
-            SELECT t.id FROM project_management.tasks t
-            JOIN project_management.user_stories us ON t.user_story_id = us.id
-            JOIN project_management.epics e ON us.epic_id = e.id
-            WHERE e.project_id = :pid
-        )
-    """), {"pid": project_id})
-    await db.execute(text("""
         DELETE FROM project_management.story_dependencies
         WHERE story_id IN (
-            SELECT us.id FROM project_management.user_stories us
-            JOIN project_management.epics e ON us.epic_id = e.id
-            WHERE e.project_id = :pid
-        )
-    """), {"pid": project_id})
-    await db.execute(text("""
-        DELETE FROM project_management.tasks
-        WHERE user_story_id IN (
             SELECT us.id FROM project_management.user_stories us
             JOIN project_management.epics e ON us.epic_id = e.id
             WHERE e.project_id = :pid
@@ -1238,6 +1279,81 @@ async def add_epic_endpoint(
         "description":       orm_e.description,
         "splitting_strategy": orm_e.splitting_strategy,
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# GET  /pipeline/{project_id}/story-dependencies — Lire les dépendances
+# PUT  /pipeline/{project_id}/story-dependencies — Sauvegarder les dépendances éditées
+# ──────────────────────────────────────────────────────────────
+
+class StoryDependencyItem(BaseModel):
+    from_story_id:   int
+    to_story_id:     int
+    dependency_type: str = "functional"
+    relation_type:   str = "FS"
+    is_blocking:     bool = True
+    level:           str = "intra_epic"
+    reason:          str = ""
+
+class UpdateStoryDepsRequest(BaseModel):
+    dependencies: list[StoryDependencyItem]
+
+
+@router.get("/{project_id}/story-dependencies")
+async def list_story_dependencies(
+    project_id:   int,
+    current_user: dict = Depends(require_pm),
+):
+    """Retourne toutes les dépendances entre stories du projet."""
+    from agents.pm.agents.dependencies.repository import get_story_dependencies
+    deps = await get_story_dependencies(project_id)
+    return deps
+
+
+@router.put("/{project_id}/story-dependencies")
+async def update_story_dependencies(
+    project_id:   int,
+    body:         UpdateStoryDepsRequest,
+    current_user: dict = Depends(require_pm),
+):
+    """
+    Remplace toutes les dépendances du projet par celles envoyées.
+    Appelé quand l'utilisateur valide ses modifications manuelles dans le tableau.
+    Synchronise aussi pipeline_state.ai_output pour PHASE_4_STORY_DEPS.
+    """
+    from agents.pm.agents.dependencies.repository import save_story_dependencies
+    deps_list = [d.model_dump() for d in body.dependencies]
+    await save_story_dependencies(project_id, deps_list)
+    await _sync_story_deps_to_ai_output(project_id)
+    return {"saved": len(deps_list)}
+
+
+async def _sync_story_deps_to_ai_output(project_id: int) -> None:
+    """
+    Relit les dépendances DB et met à jour ai_output de la phase story_deps.
+    Garantit que le dashboard affiche les modifications manuelles après refresh.
+    """
+    from agents.pm.agents.dependencies.repository import get_story_dependencies
+    db_deps = await get_story_dependencies(project_id)
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PipelineState)
+            .where(PipelineState.project_id == project_id)
+            .where(PipelineState.phase == PipelinePhaseEnum.PHASE_4_STORY_DEPS)
+            .order_by(PipelineState.id.desc())
+            .limit(1)
+        )
+        ps = result.scalar_one_or_none()
+        if not ps:
+            return
+
+        from sqlalchemy.orm.attributes import flag_modified
+        current = dict(ps.ai_output or {})
+        current["story_dependencies"] = db_deps
+        ps.ai_output = current
+        flag_modified(ps, "ai_output")
+        await session.commit()
 
 
 # ──────────────────────────────────────────────────────────────

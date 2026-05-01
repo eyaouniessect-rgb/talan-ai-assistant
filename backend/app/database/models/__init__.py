@@ -15,5 +15,5 @@ from .crm import Client, Project, Assignment
 from .pm import (
     PipelineState,
     Epic, UserStory, StoryDependency,
-    Sprint, Task, TaskDependency,
+    Sprint,
 )

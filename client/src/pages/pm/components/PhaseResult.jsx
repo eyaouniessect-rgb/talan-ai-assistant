@@ -6,6 +6,8 @@ import { CheckCircle, FileText, Eye, ArrowRight, ShieldAlert, ShieldCheck,
 import clsx from "clsx";
 import { updateStory, deleteStory, getProjectStories, getProjectEpics, addEpic, updateEpic, deleteEpic, addStory } from "../../../api/pipeline";
 import StoryDepsSection from "./StoryDepsSection";
+import CpmSection from "./CpmSection";
+import PriorisationSection from "./PriorisationSection";
 
 // ── Rendu du rapport de sécurité ──────────────────────────────
 const SEVERITY_STYLE = {
@@ -660,7 +662,7 @@ function StoriesSection({ aiOutput, onContinue, projectId }) {
   if (!storiesState.length)
     return <p className="text-slate-400 text-sm italic">Aucune story générée.</p>;
 
-  // Regrouper par epic_id
+  // Regrouper par epic_id (= DB ID de l'epic)
   const grouped = storiesState.reduce((acc, s) => {
     const key = s.epic_id ?? 0;
     if (!acc[key]) acc[key] = [];
@@ -668,11 +670,17 @@ function StoriesSection({ aiOutput, onContinue, projectId }) {
     return acc;
   }, {});
 
+  // Map epic DB ID → index dans le tableau (pour numérotation et lookup)
+  const epicIdxByDbId = Object.fromEntries(
+    epics.map((e, i) => [e.db_id ?? e.id ?? i, i])
+  );
+
   const totalPts = storiesState.reduce((sum, s) => sum + (s.story_points ?? 0), 0);
   const totalAC  = storiesState.reduce((sum, s) => sum + parseAC(s.acceptance_criteria).length, 0);
 
   // Épics sans stories = génération interrompue
-  const missingEpics = epics.filter((_, i) => !grouped[i]);
+  // grouped est keyed par epic DB ID — comparer avec e.db_id, pas l'index du tableau
+  const missingEpics = epics.filter(e => !grouped[e.db_id ?? e.id]);
 
   const handleContinue = async () => {
     if (!onContinue) return;
@@ -726,27 +734,31 @@ function StoriesSection({ aiOutput, onContinue, projectId }) {
       </div>
 
       {/* Stories groupées par epic */}
-      {Object.entries(grouped).map(([epicIdx, epicStories]) => {
-        const epicInfo  = epics[parseInt(epicIdx)];
+      {Object.entries(grouped).map(([epicKey, epicStories]) => {
+        // epicKey = DB ID de l'epic (ex: "45") — utiliser epicIdxByDbId pour retrouver l'index
+        const epicDbId  = parseInt(epicKey);
+        const epicArrIdx = epicIdxByDbId[epicDbId] ?? epicDbId;
+        const epicNum   = epicArrIdx + 1;
+        const epicInfo  = epics[epicArrIdx];
         const epicPts   = epicStories.reduce((s, st) => s + (st.story_points ?? 0), 0);
         const review    = epicStories[0]?._review ?? null;
-        const isOpen    = !closedEpics.has(epicIdx);
+        const isOpen    = !closedEpics.has(epicKey);
         const Chevron   = isOpen ? ChevronDown : ChevronRight;
 
         return (
-          <div key={epicIdx} className="rounded-xl border border-slate-200 overflow-hidden">
+          <div key={epicKey} className="rounded-xl border border-slate-200 overflow-hidden">
             {/* Header epic — cliquable pour replier */}
             <button
               type="button"
-              onClick={() => toggleEpic(epicIdx)}
+              onClick={() => toggleEpic(epicKey)}
               className="w-full flex items-center gap-2 px-4 py-2.5 bg-navy/5 border-b border-slate-200 hover:bg-navy/10 transition-colors text-left"
             >
               <Chevron size={13} className="text-slate-400 shrink-0" />
               <div className="w-5 h-5 bg-navy text-white rounded flex items-center justify-center text-xs font-bold shrink-0">
-                {parseInt(epicIdx) + 1}
+                {epicNum}
               </div>
               <span className="text-xs font-semibold text-navy truncate flex-1">
-                {epicInfo?.title ?? `Epic ${parseInt(epicIdx) + 1}`}
+                {epicInfo?.title ?? `Epic ${epicNum}`}
               </span>
               {review?.coverage_ok === true && (
                 <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full shrink-0 flex items-center gap-1">
@@ -761,7 +773,7 @@ function StoriesSection({ aiOutput, onContinue, projectId }) {
             {/* Bouton + ajouter une story */}
             <button
               type="button"
-              onClick={() => setAddingTo({ epicIdx: parseInt(epicIdx), epicTitle: epicInfo?.title ?? `Epic ${parseInt(epicIdx) + 1}` })}
+              onClick={() => setAddingTo({ epicIdx: epicDbId, epicTitle: epicInfo?.title ?? `Epic ${epicNum}` })}
               className="flex items-center gap-1 px-3 py-1.5 text-xs text-navy hover:bg-navy/5 border-b border-slate-200 w-full transition-colors"
             >
               <Plus size={11} /> Ajouter une story
@@ -790,6 +802,43 @@ const STRATEGIES = [
   { value: "by_workflow_step", label: "By workflow step" },
   { value: "by_component",     label: "By component" },
 ];
+
+// ── Modal de confirmation de suppression d'epic ───────────────
+function ConfirmDeleteModal({ epicTitle, loading, onConfirm, onCancel }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm mx-4 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="rounded-full bg-red-100 p-2">
+            <Trash2 size={18} className="text-red-600" />
+          </div>
+          <h3 className="text-sm font-semibold text-slate-800">Supprimer l'epic ?</h3>
+        </div>
+        <p className="text-xs text-slate-600">
+          L'epic <span className="font-medium text-slate-800">"{epicTitle}"</span> et toutes
+          ses user stories associées seront définitivement supprimés.
+        </p>
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={onCancel}
+            disabled={loading}
+            className="px-4 py-1.5 text-xs rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+          >
+            Annuler
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={loading}
+            className="px-4 py-1.5 text-xs rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-60 flex items-center gap-1.5"
+          >
+            {loading && <span className="animate-spin inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full" />}
+            Supprimer
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ── Section epics éditable ─────────────────────────────────────
 function EpicsSection({ aiOutput, projectId, onRefresh }) {
@@ -1043,7 +1092,7 @@ function EpicsSection({ aiOutput, projectId, onRefresh }) {
 }
 
 
-export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, onRefresh }) {
+export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, onRefresh, criticalPath = [], onRerunPrioritization }) {
   if (!aiOutput && phaseId !== "extract")
     return <p className="text-slate-400 text-sm italic">Aucun résultat disponible pour cette phase.</p>;
   if (!aiOutput) aiOutput = {};
@@ -1248,36 +1297,11 @@ export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, 
   }
 
   if (phaseId === "cpm") {
-    const { project_duration, critical_tasks, max_slack, critical_path } = aiOutput;
-    return (
-      <div className="space-y-3">
-        <div className="grid grid-cols-3 gap-3">
-          {[
-            ["Durée projet",     project_duration != null ? `${project_duration}j` : "—", "text-navy"],
-            ["Tâches critiques", critical_tasks ?? "—",                                    "text-red-600"],
-            ["Marge max",        max_slack != null ? `${max_slack}j` : "—",               "text-green-600"],
-          ].map(([k, v, cls]) => (
-            <div key={k} className="bg-slate-50 rounded-xl p-3 text-center">
-              <div className={clsx("font-display font-bold text-xl", cls)}>{v}</div>
-              <div className="text-xs text-slate-400">{k}</div>
-            </div>
-          ))}
-        </div>
-        {critical_path?.length > 0 && (
-          <div>
-            <p className="text-xs font-medium text-slate-500 mb-2">Chemin critique :</p>
-            <div className="flex flex-wrap items-center gap-1.5">
-              {critical_path.map((t, i) => (
-                <span key={i} className="flex items-center gap-1">
-                  <span className="text-xs bg-red-50 text-red-700 px-2 py-0.5 rounded-full">{t}</span>
-                  {i < critical_path.length - 1 && <ArrowRight size={10} className="text-slate-300" />}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    );
+    return <CpmSection aiOutput={aiOutput} projectId={projectId} />;
+  }
+
+  if (phaseId === "prioritization") {
+    return <PriorisationSection aiOutput={aiOutput} projectId={projectId} criticalPath={criticalPath} onRerun={onRerunPrioritization} />;
   }
 
   return (

@@ -28,9 +28,7 @@ from app.database.connection import AsyncSessionLocal
 
 
 TABLES_PROJECTS = [
-    ("project_management", "task_dependencies"),
     ("project_management", "story_dependencies"),
-    ("project_management", "tasks"),
     ("project_management", "user_stories"),
     ("project_management", "sprints"),
     ("project_management", "epics"),

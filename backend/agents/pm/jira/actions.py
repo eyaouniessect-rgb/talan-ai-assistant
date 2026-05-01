@@ -3,11 +3,10 @@
 # Actions CRUD Jira — une fonction par type d'objet
 #
 # Mapping pipeline → Jira :
-#   Epic (phase 2)      → Issue type "Epic"
-#   Story (phase 3)     → Issue type "Story",  lié à son Epic
-#   Task (phase 7)      → Sub-task, liée à sa Story
-#   Sprint (phase 10)   → Sprint Jira + affectation des stories
-#   Staffing (phase 11) → assignee sur chaque issue
+#   Epic (phase 2)     → Issue type "Epic"
+#   Story (phase 3)    → Issue type "Story", lié à son Epic
+#   Sprint (phase 7)   → Sprint Jira + affectation des stories
+#   Staffing (phase 8) → assignee sur chaque issue
 # ═══════════════════════════════════════════════════════════════
 
 import os
@@ -94,8 +93,8 @@ def create_story(
         "issuetype":   {"name": "Story"},
     }
     if story_points:
-        # customfield_10016 = "Story Points" (Jira Cloud standard)
-        base_fields["customfield_10016"] = float(story_points)
+        sp_field = jira.get_story_points_field_id()
+        base_fields[sp_field] = float(story_points)
 
     # Séquence de tentatives pour le lien Epic
     attempts: list[dict] = []
@@ -126,38 +125,7 @@ def create_story(
 
 
 # ──────────────────────────────────────────────────────────────
-# PHASE 7 — Tasks (sub-tasks)
-# ──────────────────────────────────────────────────────────────
-
-def create_task(
-    title:        str,
-    description:  str,
-    project_key:  str,
-    parent_key:   str | None = None,
-) -> str:
-    """
-    Crée une tâche technique dans Jira dans le projet project_key.
-    Si parent_key fourni → Sub-task liée à la Story parente.
-    """
-    print(f"[Jira] create_task : {title[:60]} → projet {project_key}")
-    issue_type = "Subtask" if parent_key else "Task"
-    fields: dict = {
-        "project":     {"key": project_key},
-        "summary":     title,
-        "description": _text_doc(description),
-        "issuetype":   {"name": issue_type},
-    }
-    if parent_key:
-        fields["parent"] = {"key": parent_key}
-
-    result = jira.post("issue", {"fields": fields})
-    key = result["key"]
-    print(f"[Jira] Task creee : {key}")
-    return key
-
-
-# ──────────────────────────────────────────────────────────────
-# PHASE 10 — Sprints
+# PHASE 7 — Sprints
 # ──────────────────────────────────────────────────────────────
 
 def get_board_id(project_key: str) -> int | None:
@@ -238,8 +206,97 @@ def add_issues_to_sprint(sprint_id: int, issue_keys: list[str]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# PHASE 11 — Staffing (assignation)
+# PHASE 4 — Dépendances (Issue Links)
 # ──────────────────────────────────────────────────────────────
+
+# Mapping relation_type → nom du lien Jira
+# FS (Finish-to-Start) = la story "from" bloque la story "to"
+_RELATION_TO_LINK_TYPE: dict[str, str] = {
+    "FS": "Blocks",
+    "SS": "Relates",
+    "FF": "Relates",
+    "SF": "Relates",
+}
+
+def create_issue_link(
+    inward_key:  str,
+    outward_key: str,
+    relation_type: str = "FS",
+) -> None:
+    """
+    Crée un Issue Link Jira entre deux stories.
+    FS → inward_key "blocks" outward_key.
+    Autres types → "Relates to".
+    """
+    link_type = _RELATION_TO_LINK_TYPE.get(relation_type, "Relates")
+    print(f"[Jira] issue_link : {inward_key} --{link_type}--> {outward_key}")
+    try:
+        jira.post(
+            "issueLink",
+            {
+                "type":          {"name": link_type},
+                "inwardIssue":   {"key": inward_key},
+                "outwardIssue":  {"key": outward_key},
+            },
+        )
+    except Exception as e:
+        print(f"[Jira] create_issue_link erreur ({inward_key}→{outward_key}) : {e}")
+        raise
+
+
+# ──────────────────────────────────────────────────────────────
+# Mise à jour d'un champ sur une issue existante
+# ──────────────────────────────────────────────────────────────
+
+def update_story_points(issue_key: str, story_points: int) -> None:
+    """
+    Met à jour les story points sur une issue Jira déjà créée.
+    Envoie la valeur sur tous les champs story-points détectés en une seule requête PUT
+    (couvre customfield_10016 "Story point estimate" ET customfield_10028 "Story Points").
+    """
+    if not story_points:
+        return
+    sp_fields = jira.get_story_points_field_ids()
+    value = int(story_points)
+    fields_payload = {f: value for f in sp_fields}
+    print(f"[Jira] update_story_points {issue_key} → {fields_payload}")
+    try:
+        jira.put(f"issue/{issue_key}", {"fields": fields_payload})
+        print(f"[Jira] update_story_points OK ({issue_key})")
+    except Exception as e:
+        # Jira rejette parfois les champs inexistants dans le projet — retry champ par champ
+        print(f"[Jira] update_story_points bulk échoué ({e}), retry champ par champ")
+        last_err: Exception | None = None
+        for sp_field in sp_fields:
+            try:
+                jira.put(f"issue/{issue_key}", {"fields": {sp_field: value}})
+                print(f"[Jira] update_story_points OK ({issue_key} {sp_field}={value})")
+            except Exception as e2:
+                last_err = e2
+                print(f"[Jira] update_story_points SKIP {sp_field} : {e2}")
+        if last_err and len(sp_fields) == 1:
+            raise RuntimeError(f"update_story_points {issue_key} échoué : {last_err}")
+
+
+# ──────────────────────────────────────────────────────────────
+# PHASE 8 — Staffing (assignation)
+# ──────────────────────────────────────────────────────────────
+
+def add_label(issue_key: str, label: str) -> None:
+    """Ajoute un label sur une issue Jira sans écraser les labels existants."""
+    print(f"[Jira] add_label {issue_key} ← '{label}'")
+    try:
+        current = jira.get(f"issue/{issue_key}?fields=labels")
+        existing = [l["name"] for l in (current.get("fields", {}).get("labels") or [])]
+        if label in existing:
+            print(f"[Jira] add_label SKIP — label '{label}' déjà présent sur {issue_key}")
+            return
+        jira.put(f"issue/{issue_key}", {"fields": {"labels": existing + [label]}})
+        print(f"[Jira] add_label OK {issue_key} → {existing + [label]}")
+    except Exception as e:
+        print(f"[Jira] add_label erreur ({issue_key}) : {e}")
+        raise
+
 
 def assign_issue(issue_key: str, account_id: str) -> None:
     """Assigne une issue Jira à un utilisateur via son accountId."""

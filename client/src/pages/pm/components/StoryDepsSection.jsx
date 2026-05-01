@@ -14,7 +14,7 @@ import {
   Pencil, Check, Plus, AlertTriangle,
 } from "lucide-react";
 import clsx from "clsx";
-import { getProjectStories, getProjectEpics } from "../../../api/pipeline";
+import { getProjectStories, getProjectEpics, updateStoryDependencies, getStoryDependencies } from "../../../api/pipeline";
 
 // ── Couleurs par epic (palette fixe cyclique) ─────────────────
 const EPIC_COLORS = [
@@ -62,7 +62,7 @@ function StoryNode({ data }) {
           style={{ background: data.epicColor, borderColor: data.epicColor }}
         >
           <span className="text-[11px] font-mono font-bold text-white">
-            #{data.id}
+            #{data.userId}
           </span>
           <span className="text-[10px] font-semibold text-white/90 px-1.5 py-0.5 rounded bg-white/20">
             E{data.epicIdx + 1}
@@ -331,7 +331,7 @@ function transitiveReduction(deps) {
 }
 
 // ══════════════════════════════════════════════════════════════
-function buildGraph({ stories, deps, epicColorMap, epicIdxMap, focusedId, depth }) {
+function buildGraph({ stories, deps, epicColorMap, epicIdxMap, userIdMap, focusedId, depth }) {
   // 1. Réduction transitive
   const reducedDeps = transitiveReduction(deps);
 
@@ -360,8 +360,9 @@ function buildGraph({ stories, deps, epicColorMap, epicIdxMap, focusedId, depth 
       id:       String(s.db_id),
       type:     "story",
       position: { x: 0, y: 0 },
-      data: { id: s.db_id, title: s.title, epicColor: epicColor.nodeStroke,
-              epicBg: epicColor.node, epicIdx: epicIdxMap[s.epic_id] ?? 0,
+      data: { id: s.db_id, userId: userIdMap[s.db_id] ?? s.db_id, title: s.title,
+              epicColor: epicColor.nodeStroke, epicBg: epicColor.node,
+              epicIdx: epicIdxMap[s.epic_id] ?? 0,
               connectivity, isPivot, isFocus, dim },
     };
   });
@@ -458,14 +459,12 @@ function DepCard({ dep, storyMap, epicColorMap }) {
       </div>
       <div className="flex items-center gap-2 text-sm">
         <div className={clsx("flex-1 rounded-lg border px-2 py-1.5 text-xs", epicColor.bg, epicColor.border)}>
-          <span className="text-slate-400 text-[10px] block mb-0.5">#{dep.from_story_id}</span>
           <span className="font-medium text-slate-700 line-clamp-2">
             {fromStory?.title ?? `Story ${dep.from_story_id}`}
           </span>
         </div>
         <ArrowRight size={16} className="text-slate-400 shrink-0" />
         <div className="flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
-          <span className="text-slate-400 text-[10px] block mb-0.5">#{dep.to_story_id}</span>
           <span className="font-medium text-slate-700 line-clamp-2">
             {toStory?.title ?? `Story ${dep.to_story_id}`}
           </span>
@@ -482,7 +481,7 @@ function DepCard({ dep, storyMap, epicColorMap }) {
 // Graph view
 // ══════════════════════════════════════════════════════════════
 function GraphView({
-  stories, deps, epicColorMap, epicIdxMap,
+  stories, deps, epicColorMap, epicIdxMap, userIdMap,
   fullscreen = false, onToggleFullscreen,
   focusedId, setFocusedId, depth,
 }) {
@@ -493,7 +492,7 @@ function GraphView({
 
   useEffect(() => {
     const { nodes: n, edges: e } = buildGraph({
-      stories, deps, epicColorMap, epicIdxMap, focusedId, depth,
+      stories, deps, epicColorMap, epicIdxMap, userIdMap, focusedId, depth,
     });
     setNodes(n);
     setEdges(e);
@@ -592,7 +591,7 @@ function GraphView({
       {focusedId && (
         <div className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-white/95 border border-amber-300 rounded-lg shadow-sm px-2.5 py-1.5">
           <span className="text-xs text-slate-700">
-            <strong className="text-amber-700">Focus :</strong> story #{focusedId} · profondeur {depth}
+            <strong className="text-amber-700">Focus :</strong> story #{userIdMap[Number(focusedId)] ?? focusedId} · profondeur {depth}
           </span>
           <button
             onClick={() => setFocusedId(null)}
@@ -663,7 +662,7 @@ function wouldCreateCycle(deps, fromId, toId) {
 
 function TableView({
   stories, allStories, deps, allDeps, aiDeps, isModified,
-  onUpdateDeps, epicColorMap, epicIdxMap,
+  onUpdateDeps, epicColorMap, epicIdxMap, userIdMap,
 }) {
   const [editing, setEditing] = useState(false);
   // Copie de travail des dépendances pendant l'édition
@@ -699,12 +698,12 @@ function TableView({
     fromStoryId = Number(fromStoryId);
     // Doublon ?
     if (draft.some(d => d.to_story_id === storyId && d.from_story_id === fromStoryId)) {
-      setError(`#${fromStoryId} est déjà prédécesseur de #${storyId}`);
+      setError(`Story #${userIdMap[fromStoryId] ?? fromStoryId} est déjà prédécesseur de #${userIdMap[storyId] ?? storyId}`);
       return;
     }
     // Cycle ?
     if (wouldCreateCycle(draft, fromStoryId, storyId)) {
-      setError(`Impossible : #${fromStoryId} → #${storyId} créerait un cycle`);
+      setError(`Impossible : #${userIdMap[fromStoryId] ?? fromStoryId} → #${userIdMap[storyId] ?? storyId} créerait un cycle`);
       return;
     }
     const story     = allStories.find(s => s.db_id === storyId);
@@ -817,7 +816,7 @@ function TableView({
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
             <tr>
-              <th className="text-left px-3 py-2 font-semibold w-16">ID</th>
+              <th className="text-left px-3 py-2 font-semibold w-12">#</th>
               <th className="text-left px-3 py-2 font-semibold">Story</th>
               <th className="text-left px-3 py-2 font-semibold w-24">Epic</th>
               <th className="text-left px-3 py-2 font-semibold">Prédécesseurs</th>
@@ -834,7 +833,7 @@ function TableView({
               );
               return (
                 <tr key={s.db_id} className="border-t border-slate-100 hover:bg-slate-50/60 align-top">
-                  <td className="px-3 py-2 font-mono text-xs text-slate-500">#{s.db_id}</td>
+                  <td className="px-3 py-2 font-mono text-xs font-bold text-slate-500">#{userIdMap[s.db_id] ?? s.db_id}</td>
                   <td className="px-3 py-2 text-slate-800">{s.title}</td>
                   <td className="px-3 py-2">
                     <span className={clsx("text-[11px] px-1.5 py-0.5 rounded-full font-medium", epicColor.bg, epicColor.text)}>
@@ -859,7 +858,7 @@ function TableView({
                               p._user_added && "ring-1 ring-amber-400",
                             )}
                           >
-                            #{p.from_story_id}
+                            #{userIdMap[p.from_story_id] ?? p.from_story_id}
                             <span className="font-sans font-semibold">{p.relation_type}</span>
                             {editing && (
                               <button
@@ -882,7 +881,7 @@ function TableView({
                           <option value="">+ Ajouter prédécesseur…</option>
                           {candidates.map(c => (
                             <option key={c.db_id} value={c.db_id}>
-                              #{c.db_id} {c.title.slice(0, 40)}{c.title.length > 40 ? "…" : ""}
+                              #{userIdMap[c.db_id] ?? c.db_id} {c.title.slice(0, 40)}{c.title.length > 40 ? "…" : ""}
                             </option>
                           ))}
                         </select>
@@ -913,15 +912,54 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
   const [depth,         setDepth]         = useState(2);
   const [isFullscreen,  setIsFullscreen]  = useState(false);
 
-  // Déps initiales venant de l'agent
+  // Déps de référence venant de l'agent (utilisées pour le bouton "Restaurer IA")
   const aiDeps = useMemo(
     () => Array.isArray(aiOutput) ? aiOutput : (aiOutput?.story_dependencies ?? []),
     [aiOutput],
   );
-  // Déps "vivantes" — éditables par l'utilisateur (Human-in-the-Loop)
+  // Déps "vivantes" — chargées depuis la DB (table story_dependencies)
+  // pour refléter les modifications manuelles persistées
   const [deps, setDeps] = useState(aiDeps);
-  useEffect(() => { setDeps(aiDeps); }, [aiDeps]);
-  const isModified = deps !== aiDeps;
+  const [saveError, setSaveError] = useState(null);
+  const [dbModified, setDbModified] = useState(false);
+
+  // Recharger depuis la DB au mount/changement de projet
+  useEffect(() => {
+    if (!projectId) {
+      setDeps(aiDeps);
+      return;
+    }
+    let cancelled = false;
+    getStoryDependencies(projectId)
+      .then((dbDeps) => {
+        if (cancelled) return;
+        if (Array.isArray(dbDeps) && dbDeps.length > 0) {
+          setDeps(dbDeps);
+          // Si la DB diffère de l'output IA → modifications manuelles persistées
+          setDbModified(dbDeps.length !== aiDeps.length);
+        } else {
+          setDeps(aiDeps);
+          setDbModified(false);
+        }
+      })
+      .catch(() => setDeps(aiDeps));
+    return () => { cancelled = true; };
+  }, [projectId, aiDeps]);
+
+  const isModified = dbModified || deps !== aiDeps;
+
+  const handleUpdateDeps = async (newDeps) => {
+    setDeps(newDeps);
+    if (!projectId) return;
+    try {
+      setSaveError(null);
+      await updateStoryDependencies(projectId, newDeps);
+      setDbModified(true);
+    } catch (err) {
+      setSaveError("Erreur lors de la sauvegarde des dépendances.");
+      console.error("[StoryDepsSection] save error:", err);
+    }
+  };
 
   useEffect(() => {
     if (!projectId) return;
@@ -957,6 +995,10 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
   const epicIdxMap = useMemo(() => Object.fromEntries(
     epicList.map((e, i) => [e.key, i])
   ), [epicList]);
+
+  const userIdMap = useMemo(() => Object.fromEntries(
+    [...stories].sort((a, b) => a.db_id - b.db_id).map((s, i) => [s.db_id, i + 1])
+  ), [stories]);
 
   // Filtres combinés
   const filtered = useMemo(() => deps.filter(d => {
@@ -1162,6 +1204,7 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
             deps={filtered}
             epicColorMap={epicColorMap}
             epicIdxMap={epicIdxMap}
+            userIdMap={userIdMap}
             focusedId={focusedId}
             setFocusedId={setFocusedId}
             depth={depth}
@@ -1169,17 +1212,25 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
           />
         </>
       ) : view === "table" ? (
-        <TableView
-          stories={visibleStories}
-          allStories={stories}
-          deps={filtered}
-          allDeps={deps}
-          aiDeps={aiDeps}
-          isModified={isModified}
-          onUpdateDeps={setDeps}
-          epicColorMap={epicColorMap}
-          epicIdxMap={epicIdxMap}
-        />
+        <>
+          {saveError && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 flex items-center gap-2 mb-2">
+              <AlertTriangle size={13} /> {saveError}
+            </div>
+          )}
+          <TableView
+            stories={visibleStories}
+            allStories={stories}
+            deps={filtered}
+            allDeps={deps}
+            aiDeps={aiDeps}
+            isModified={isModified}
+            onUpdateDeps={handleUpdateDeps}
+            epicColorMap={epicColorMap}
+            epicIdxMap={epicIdxMap}
+            userIdMap={userIdMap}
+          />
+        </>
       ) : (
         <div className="space-y-2">
           {filtered.map((dep, i) => (
@@ -1215,6 +1266,7 @@ export default function StoryDepsSection({ aiOutput, projectId }) {
               deps={filtered}
               epicColorMap={epicColorMap}
               epicIdxMap={epicIdxMap}
+              userIdMap={userIdMap}
               focusedId={focusedId}
               setFocusedId={setFocusedId}
               depth={depth}

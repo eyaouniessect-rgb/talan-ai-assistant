@@ -23,7 +23,7 @@ from app.database.models import (
     # project_management
     PipelineState,
     Epic, UserStory, StoryDependency,
-    Sprint, Task, TaskDependency,
+    Sprint,
 )
 
 config = context.config

@@ -7,23 +7,60 @@ SYSTEM_PROMPT_PASS2 = """You detect inter-epic delivery-blocking dependencies be
 Output a JSON array. Be GENEROUS — it is better to emit too many than too few.
 
 ══════════════════════════════════════════════════
-RULE 1 — AUTH / ROLE ACCESS [MANDATORY — APPLY FIRST]
+RULE 1 — AUTH / ROLE ACCESS [MANDATORY — EXECUTE AS AN ALGORITHM]
 ══════════════════════════════════════════════════
-Find every story that describes a secured user action (access, upload, download, submit,
-view personal data, manage, configure, create, modify, delete anything that requires login).
-For EACH such story from epic X, find the auth or role story from a DIFFERENT epic Y
-that grants the required access. Emit Y→X as functional FS.
-AUTH CANNOT BE MOCKED — these dependencies are always blocking.
+Execute these steps IN ORDER before anything else:
 
-Scan the full story list systematically: for every action story, ask:
-"Does this action require the user to be authenticated or have a specific role?"
-If YES and the auth story is in a different epic → EMIT the dependency.
+STEP 1 — Build the AUTH MAP (distinguish two types)
+
+  TYPE A — CONNECTION stories (universal prerequisite for ALL actions of that role):
+    • login / se connecter / s'authentifier / sign in
+    • obtain JWT / session token / access token
+    Group by ACTOR ROLE. Record epic + story IDs.
+
+  TYPE B — ROLE MANAGEMENT stories (targeted prerequisite only):
+    • manage roles / assign permissions / gérer les rôles / révocation d'accès
+    These are prerequisites ONLY for stories that EXPLICITLY mention "rôle/role"
+    in their title or description. NOT a prerequisite for generic admin actions.
+
+  TYPE C — REGISTRATION stories (prerequisite of the connection story, not actions):
+    • register / s'inscrire / créer un compte
+    These precede the TYPE A connection story, not the action stories directly.
+
+  DECISION RULE:
+    → For admin actions (configure, supervise, parametrage, report, etc.)
+      → prerequisite = TYPE A (connection) only, never TYPE B (role management)
+      unless the story explicitly mentions "role" in its title/description.
+
+STEP 2 — Build the ACTOR→ACTION MAP
+  For every story that is NOT an auth story:
+    • Extract the ACTOR ROLE from the title (e.g. "En tant que Recruteur, je veux…"
+      → role = Recruteur).
+    • Ask: "Can this actor perform this action IN PRODUCTION without being
+      authenticated / without having logged in first?"
+    • If NO → this story REQUIRES AUTH for its role.
+
+STEP 3 — Emit ALL auth dependencies (EXHAUSTIVE, no exceptions)
+  For each (auth_story, action_story) pair where:
+    • auth_story.role == action_story.role  (same actor role)
+    • auth_story.epic  ≠ action_story.epic  (different epics — inter-epic rule)
+    • action_story requires auth (from Step 2)
+  → EMIT: auth_story_id → action_story_id, "functional", "FS"
+
+  ⚠️ DO NOT SKIP any action story because "it could work with a mock token".
+  ⚠️ DO NOT SKIP any action story because "auth is a cross-cutting concern".
+  ⚠️ The auth story is a HARD prerequisite for EVERY action story of its role.
+  ⚠️ If there is ONE auth story for role X, emit ONE dependency per action story of role X
+     in other epics. 10 action stories = 10 dependencies emitted. No cap, no selection.
+
+STEP 4 — Check WITHIN-EPIC auth stories
+  If auth story and action story are in the SAME epic, skip (handled by Pass 1).
 
 ══════════════════════════════════════════════════
 RULE 2 — SCHEMA / API CONTRACT
 ══════════════════════════════════════════════════
 Story B needs A's data schema or API contract (not runtime data) to write its code.
-→ technical FS. (Note: if B only needs runtime data it can mock, skip.)
+→ technical FS.
 
 ══════════════════════════════════════════════════
 RULE 3 — GOVERNANCE → EXECUTION
@@ -35,10 +72,21 @@ DIRECTION: prerequisite (A) is the BASE creator. What enriches or uses it (B) co
 TRANSITIVITY: if A→Y→X already in output, skip A→X.
 OPTIONAL CONFIG: if B works fine with default values without A, skip.
 
+BLOCKING TEST (apply for every candidate):
+  "Can the END USER use B in PRODUCTION without A being delivered?"
+  - YES → not blocking, skip.
+  - NO  → blocking, emit.
+NEVER use mockability as a reason to dismiss a dependency.
+
+PRIORITY RULE — dependency_type:
+  TEST 1: end user blocked if A missing? → "functional"
+  TEST 2 (only if TEST 1 = NO): dev blocked by missing API/schema, no UX impact?
+          → "technical"
+  IF BOTH TESTS = YES → choose "functional" (functional always wins).
+
 relation_type — choose carefully, do NOT default to FS:
 - FS: B cannot START until A is DONE. A produces a concrete deliverable B consumes.
-- SS: A and B are two faces of the same feature — they must START together in the same sprint
-      and progress in parallel. Neither can open its ticket before the other starts.
+- SS: A and B are two faces of the same feature — must START together in the same sprint.
       Use when: action+counter-action, parallel tracks of same feature, symmetric pairs.
 - FF: A and B must FINISH together — neither has value shipped without the other.
       Use when: UI + backend of same feature, notification + trigger, report + processing.
@@ -54,13 +102,20 @@ E2: [20]Créer projet de recrutement | [21]Définir compétences requises
 E3: [30]Afficher tableau de bord recruteur | [31]Exporter les résultats de recrutement
 E5: [50]S'authentifier en tant que recruteur (JWT) | [51]S'authentifier en tant que candidat
 
-Example output:
+Step 1 AUTH MAP: {Recruteur: [50], Candidat: [51]}
+Step 2 ACTOR→ACTION: [11]→Recruteur+auth, [20]→Recruteur+auth, [21]→Recruteur+auth, [30]→Recruteur+auth, [31]→Recruteur+auth
+Step 3 EMIT: 50→11, 50→20, 50→21, 50→30, 50→31 (all action stories of Recruteur in E1/E2/E3)
+
+Example output (RULE 1 exhaustive, then RULE 2/3):
 [
-  {"from_story_id": 50, "to_story_id": 20, "dependency_type": "functional", "relation_type": "FS", "reason": "Créer un projet nécessite que l'authentification recruteur soit livrée en premier"},
-  {"from_story_id": 50, "to_story_id": 21, "dependency_type": "functional", "relation_type": "FS", "reason": "Définir les compétences est une action sécurisée qui requiert l'auth JWT"},
+  {"from_story_id": 50, "to_story_id": 11, "dependency_type": "functional", "relation_type": "FS", "reason": "Mettre à jour le profil nécessite que l'auth recruteur soit livrée — le recruteur doit être connecté"},
+  {"from_story_id": 50, "to_story_id": 20, "dependency_type": "functional", "relation_type": "FS", "reason": "Créer un projet est une action sécurisée — le recruteur ne peut pas y accéder sans être authentifié"},
+  {"from_story_id": 50, "to_story_id": 21, "dependency_type": "functional", "relation_type": "FS", "reason": "Définir les compétences requises exige que le recruteur soit authentifié"},
+  {"from_story_id": 50, "to_story_id": 30, "dependency_type": "functional", "relation_type": "FS", "reason": "Le tableau de bord est accessible uniquement après authentification recruteur"},
+  {"from_story_id": 50, "to_story_id": 31, "dependency_type": "functional", "relation_type": "FS", "reason": "L'export des résultats requiert une session recruteur active"},
   {"from_story_id": 10, "to_story_id": 20, "dependency_type": "functional", "relation_type": "FS", "reason": "Créer un projet requiert qu'un compte recruteur existe d'abord"},
-  {"from_story_id": 30, "to_story_id": 31, "dependency_type": "functional", "relation_type": "FF", "reason": "L'export des résultats et le tableau de bord doivent être livrés ensemble — l'un sans l'autre n'a pas de valeur pour le recruteur"},
-  {"from_story_id": 50, "to_story_id": 51, "dependency_type": "functional", "relation_type": "SS", "reason": "Auth recruteur et auth candidat sont deux faces symétriques du même module d'authentification, elles démarrent ensemble"}
+  {"from_story_id": 30, "to_story_id": 31, "dependency_type": "functional", "relation_type": "FF", "reason": "L'export des résultats et le tableau de bord doivent être livrés ensemble"},
+  {"from_story_id": 50, "to_story_id": 51, "dependency_type": "functional", "relation_type": "SS", "reason": "Auth recruteur et auth candidat sont deux faces symétriques du même module auth"}
 ]
 
 Rules:
@@ -81,14 +136,27 @@ FILTRE DE VALIDATION ANTI-FAUX-POSITIFS — APPLIQUER À CHAQUE PAIRE
 ══════════════════════════════════════════════════════
 Avant d'émettre une dépendance A→B, vérifier les 4 conditions OBLIGATOIRES :
 
-  1. DÉPENDANCE DE LIVRAISON, pas de runtime
-     → Question test : "L'équipe peut-elle ouvrir le ticket B et commencer à coder
-       SANS que A soit mergée en production ?"
-       Si OUI → ce n'est PAS une dépendance de livraison → NE PAS émettre.
+  1. DÉPENDANCE DE LIVRAISON FONCTIONNELLE — basée sur l'USAGE EN PRODUCTION
+     → Question test (UNIQUE) :
+       "L'utilisateur final peut-il utiliser la fonctionnalité de B en production
+        SANS que A ait été mergée et soit disponible ?"
+       - Si OUI → PAS de dépendance bloquante → NE PAS émettre.
+       - Si NON → DÉPENDANCE BLOQUANTE → émettre (même si B peut être codée
+         avec des mocks pendant le développement).
 
-     Faux positif typique : "B utilise les données produites par A au runtime"
-     → Pendant le développement, B peut être codée avec des mocks/stubs.
-       Les deux stories peuvent avancer en parallèle. NE PAS émettre.
+     ⚠️ INTERDICTION FORMELLE :
+     Ne JAMAIS utiliser la capacité à mocker/stubber A comme raison pour ignorer
+     la dépendance. Le critère est l'USAGE UTILISATEUR EN PRODUCTION,
+     pas la facilité de développement parallèle.
+
+     Exemples concrets :
+       ✅ ÉMETTRE "Déposer un CV" → "Visualiser le profil structuré extrait du CV"
+          (l'utilisateur ne peut PAS visualiser un profil tant qu'aucun CV n'a été
+          déposé et analysé en production — peu importe que le dev mocke le CV)
+       ✅ ÉMETTRE "Calculer le score" → "Afficher le score à l'utilisateur"
+          (rien à afficher tant que le calcul n'est pas livré)
+       ❌ NE PAS émettre "Logging applicatif" → "Endpoint /candidates"
+          (le user n'a pas conscience du logging — c'est purement transversal)
 
   2. PAS UN COMPOSANT TRANSVERSAL NON-FONCTIONNEL
      → Si A est un composant purement technique utilisé PARTOUT et SANS impact UX
@@ -101,11 +169,16 @@ Avant d'émettre une dépendance A→B, vérifier les 4 conditions OBLIGATOIRES 
      légitimes — voir Pattern 1. Toute action utilisateur sécurisée DOIT être
      reliée à sa story d'auth/rôle correspondante.
 
-  3. PAS UNE DÉPENDANCE DE DONNÉES AU RUNTIME
-     → "B traite/affiche/transforme les données créées par A" n'est PAS bloquant
-       au niveau livraison : B peut être développée avec un jeu de données fictives.
-     → Émettre uniquement si B nécessite le SCHÉMA/CONTRAT (API, modèle DB, format)
-       que A définit, pas juste les instances de données.
+  3. DÉPENDANCE FONCTIONNELLE DE PRODUCTION (PAS UN ÉCARTEMENT TECHNIQUE)
+     → Si "B affiche/traite/transforme des données produites par A", la question
+       n'est PAS "le dev peut-il mocker ?" — c'est :
+       "En PRODUCTION, l'utilisateur peut-il observer un résultat valide de B
+        sans qu'A soit déjà disponible et ait produit ses sorties ?"
+       - Si NON → ÉMETTRE (functional FS) — l'utilisateur final est bloqué.
+       - Si OUI (B peut tourner sur des défauts/cas vides) → ne pas émettre.
+     → Le mock est un détail d'implémentation, JAMAIS un argument anti-dépendance.
+     → Pour le pur "technical FS" : utiliser uniquement quand B consomme un
+       SCHÉMA/CONTRAT que seul A peut figer (API, modèle DB) sans impact UX direct.
 
   4. PAS DE CYCLE
      → Si une dépendance B→A (ou un chemin B→...→A) existe déjà dans tes émissions,
@@ -171,15 +244,17 @@ Si UNE SEULE des 7 conditions n'est pas satisfaite → IGNORER la paire.
 RAISONNEMENT INTERNE — ne pas inclure dans la réponse
 ══════════════════════════════════════════════════════
 Pour chaque paire (A, B), répondre silencieusement OUI/NON aux 7 questions :
-  Q1. L'équipe est-elle BLOQUÉE pour démarrer B sans A en production ?
+  Q1. L'UTILISATEUR FINAL peut-il utiliser B en PRODUCTION sans qu'A soit livré ?
+      (Si NON → dépendance bloquante. Mockabilité du dev = NON PERTINENTE.)
   Q2. A n'est-il PAS un composant transversal global non-fonctionnel ?
-  Q3. La dépendance est-elle sur un CONTRAT (API/schéma) ou un FLUX MÉTIER,
-      pas sur des données runtime ?
+  Q3. En production, B produit-il une sortie utile à l'utilisateur sans qu'A
+      ait déjà tourné et fourni ses données/contrats ?
+      (Si NON → bloquante. Le critère est l'usage utilisateur, pas le mock.)
   Q4. L'arc inverse n'existe-t-il PAS dans le graphe ?
   Q5. La DIRECTION est-elle correcte ? (A est-il VRAIMENT le prérequis de B ?)
   Q6. Aucune chaîne A→Y→B n'existe déjà ? (sinon redondant par transitivité)
   Q7. Si A est un paramétrage, B ne peut-il PAS fonctionner avec des défauts ?
-Émettre uniquement si TOUS les 7 = OUI.
+Émettre la dépendance si Q1=NON OU Q3=NON, et que Q2,Q4,Q5,Q6,Q7 = OUI.
 
 ══════════════════════════════════════════════════════
 PATTERNS SÉMANTIQUES À DÉTECTER ACTIVEMENT
@@ -189,36 +264,67 @@ Ces règles s'appliquent APRÈS le filtre de validation : la dépendance candida
 DOIT TOUJOURS satisfaire les 4 conditions du filtre avant d'être émise.
 
 ──────────────────────────────────────────────────────
-Pattern 1 — PRÉREQUIS D'ACCÈS / AUTHENTIFICATION
+Pattern 1 — PRÉREQUIS D'ACCÈS / AUTHENTIFICATION [ALGORITHME OBLIGATOIRE]
 ──────────────────────────────────────────────────────
-Pour CHAQUE story qui décrit une action faite par un utilisateur EN ÉTANT CONNECTÉ
-(verbes : accéder à, consulter, télécharger, soumettre, modifier mon, lancer,
-configurer, gérer son, recevoir, déposer son…),
+Exécute ces étapes DANS L'ORDRE avant tout autre pattern :
 
-CHERCHER dans le backlog une story dont l'objectif principal est :
-  • la connexion ou l'authentification de cet utilisateur
-  • la génération d'un token ou d'une session
-  • la gestion ou l'attribution de rôles/droits/permissions pour cet utilisateur
-  • l'inscription ou la création de compte de cet utilisateur
+⚠️ DISTINCTION FONDAMENTALE — CONNEXION vs GESTION DES RÔLES
 
-QUESTION TEST :
-"En production, l'utilisateur peut-il faire cette action SANS être authentifié
-ou sans avoir le bon rôle ?"
-Si NON → DÉPENDANCE OBLIGATOIRE story d'auth/rôles → story d'action,
-type "functional", relation "FS".
+  • CONNEXION (authentification) : story dont le but est "se connecter /
+    s'authentifier / login / obtenir un token JWT". C'est le PRÉREQUIS de
+    TOUTE action qui nécessite d'être connecté, quel que soit le rôle.
 
-Règle d'émission :
-- Émettre la dépendance pour CHAQUE story d'action sécurisée trouvée
-  (pas de plafond — si 5 stories nécessitent l'auth, émettre 5 dépendances)
-- Faire correspondre le RÔLE : story d'auth admin → actions admin,
-  story d'auth client → actions client, etc.
-- Pour les actions liées à un rôle spécifique (ex : "configurer X pour
-  chaque rôle"), lier à la story de gestion des rôles, pas seulement à la
-  story de connexion générique.
+  • GESTION DES RÔLES (attribution/révocation) : story qui permet à un admin
+    d'ajouter ou retirer des rôles à des utilisateurs. Ce n'est un prérequis
+    QUE pour les stories qui utilisent EXPLICITEMENT les rôles (afficher le
+    rôle d'un utilisateur, conditionner une action à l'existence d'un rôle,
+    gérer l'administration des rôles elle-même).
+
+  RÈGLE DE DÉCISION :
+    → Pour une action métier (configurer, superviser, paramétrer, rapporter…)
+      → prérequis = CONNEXION seulement, jamais la story de gestion des rôles
+      sauf si "rôle" est explicitement mentionné dans le titre ou la description.
+
+ÉTAPE A — Classifier les stories d'identité
+  Identifier dans ce lot les deux types de stories d'identité par RÔLE :
+
+  TYPE 1 — CONNEXION (prérequis universel pour toutes les actions du rôle) :
+    • se connecter / s'authentifier / login / sign in
+    • obtenir un token JWT / session token
+    → Note l'ID et le RÔLE.
+
+  TYPE 2 — GESTION DES RÔLES (prérequis ciblé, voir règle ci-dessus) :
+    • gérer les rôles / attribuer des permissions / révocation d'accès
+    → Note l'ID. Ne lier qu'aux stories mentionnant "rôle" explicitement.
+
+  TYPE 3 — INSCRIPTION/CRÉATION DE COMPTE (prérequis de la connexion) :
+    • s'inscrire / créer son compte / register
+    → Ces stories sont prérequis de la story de CONNEXION, pas des actions directes.
+
+ÉTAPE B — Scanner TOUTES les stories d'action
+  Pour chaque story qui N'EST PAS une story d'identité :
+    • Extraire le RÔLE de l'acteur ("En tant que [Rôle], je veux…")
+    • Poser la question : "En production, cet acteur peut-il réaliser cette
+      action SANS être connecté (token valide) ?"
+    • Si NON → cette story est BLOQUÉE par la story de CONNEXION du même rôle.
+
+ÉTAPE C — Émettre les dépendances d'auth (EXHAUSTIF, SANS EXCEPTION)
+  Pour chaque paire (story_connexion, story_action) de MÊME rôle et MÊME epic :
+    → ÉMETTRE : story_connexion → story_action, type "functional", relation "FS"
+
+  ⚠️ NE JAMAIS ignorer une story d'action en disant "elle peut utiliser un
+     mock token" — le critère est l'USAGE EN PRODUCTION.
+  ⚠️ Chaque story d'action sécurisée DOIT avoir sa story de CONNEXION comme
+     prédécesseur. Aucune exception, aucun plafond.
+  ⚠️ Correspondance stricte par RÔLE :
+     - story de connexion Candidat   → TOUTES les actions "En tant que Candidat"
+     - story de connexion Recruteur  → TOUTES les actions "En tant que Recruteur"
+     - story de connexion Admin      → TOUTES les actions "En tant qu'Administrateur"
+  ⚠️ NE PAS lier la story de GESTION DES RÔLES aux actions générales
+     (configuration, supervision, paramétrage, rapport) sauf mention de "rôle".
 
 Cette règle PRIME sur le filtre "composant transversal" : l'authentification
-EST une dépendance fonctionnelle légitime quand elle conditionne l'accès UX,
-pas un simple cross-cutting concern.
+EST une dépendance fonctionnelle légitime quand elle conditionne l'accès UX.
 
 ──────────────────────────────────────────────────────
 Pattern 2 — RÉFÉRENTIEL/PRODUCTEUR PARTAGÉ (schéma, pas données)
@@ -332,19 +438,45 @@ RÈGLE DE DÉCISION (appliquer AVANT d'émettre) :
 ══════════════════════════════════════════════════════
 SWEEP DE COUVERTURE — vérification finale obligatoire
 ══════════════════════════════════════════════════════
-Avant de retourner le tableau final, parcourir TOUTES les stories en entrée
-et vérifier que chaque story apparaît au moins UNE FOIS dans une dépendance
-(soit comme source, soit comme cible).
+Avant de retourner le tableau final, effectuer DEUX passes de vérification :
 
-Pour chaque story orpheline :
-- Re-poser la question : "Cette story est-elle vraiment indépendante de toutes
-  les autres ?"
-- Si NON : appliquer à nouveau les 4 patterns sémantiques pour trouver
+────────────────────────────────────────────────────
+PASSE 1 — VÉRIFICATION D'AUTHENTIFICATION SYSTÉMATIQUE PAR RÔLE
+────────────────────────────────────────────────────
+Pour chaque RÔLE présent dans le backlog (Candidat, Recruteur, Administrateur…) :
+
+  1. Identifier la story de CONNEXION pour ce rôle (titre contenant "se connecter"
+     ou "s'authentifier" ou "login" pour ce rôle).
+     Si aucune story de connexion n'existe pour ce rôle → passer au rôle suivant.
+
+  2. Pour CHAQUE autre story de ce même rôle qui n'est pas déjà cible d'une
+     dépendance depuis la story de connexion :
+       → AJOUTER la dépendance : connexion → story_action, "functional", "FS"
+
+  3. EXCEPTIONS — ne pas ajouter la dépendance pour :
+       • La story de connexion elle-même
+       • Les stories de réinitialisation de mot de passe / mot de passe oublié
+         (elles sont accessibles SANS être connecté — c'est leur raison d'être)
+       • Les stories purement techniques sans interface utilisateur (jobs batch,
+         traitements automatisés) qui ne sont jamais déclenchés par un utilisateur
+
+  Cette passe garantit qu'aucune story d'action d'un rôle ne reste orpheline
+  si une story de connexion pour ce rôle existe.
+
+────────────────────────────────────────────────────
+PASSE 2 — COUVERTURE GÉNÉRALE
+────────────────────────────────────────────────────
+Parcourir TOUTES les stories en entrée et vérifier que chaque story apparaît
+au moins UNE FOIS dans une dépendance (soit comme source, soit comme cible).
+
+Pour chaque story orpheline après la Passe 1 :
+- Re-poser la question : "Cette story est-elle vraiment indépendante ?"
+- Si NON : appliquer à nouveau les patterns sémantiques pour trouver
   la ou les dépendance(s) manquante(s) et les ajouter
 - Si OUI (story d'utilité ou de pure infra non-bloquante) : laisser orpheline
 
-L'objectif : minimiser les stories orphelines tout en respectant le filtre des
-5 conditions. Une couverture de >80% des stories est un bon indicateur.
+L'objectif : minimiser les stories orphelines tout en respectant le filtre.
+Une couverture de >80% des stories est un bon indicateur.
 
 ══════════════════════════════════════════════════════
 CLASSIFICATION DU TYPE DE DÉPENDANCE (SAFe) — PROCESSUS EN 2 ÉTAPES
@@ -450,6 +582,46 @@ def build_pass1_prompt(stories: list[dict]) -> str:
     ])
 
     return f"""Analyse ces user stories appartenant au MÊME epic et détecte UNIQUEMENT les dépendances BLOQUANTES.
+
+══════════════════════════════════════════════════════
+TEST DE BLOCAGE — OBLIGATOIRE AVANT TOUT ÉMISSION
+══════════════════════════════════════════════════════
+Pour chaque paire candidate (A, B), pose UNIQUEMENT cette question :
+
+  "L'utilisateur final peut-il utiliser la fonctionnalité de B en PRODUCTION
+   sans que A soit livrée et disponible ?"
+
+  - Si OUI → PAS de dépendance bloquante.
+  - Si NON → DÉPENDANCE BLOQUANTE → émettre.
+
+⚠️ INTERDICTION FORMELLE :
+   Ne JAMAIS utiliser la capacité à mocker A pendant le développement comme
+   raison pour ignorer la dépendance. Le critère est l'USAGE UTILISATEUR EN
+   PRODUCTION, pas la facilité de codage parallèle.
+
+Exemples typiques de dépendances FONCTIONNELLES intra-epic à NE PAS rater :
+  ✅ "Déposer un CV" → "Visualiser le profil structuré extrait du CV"
+  ✅ "Déposer un CV" → "Obtenir un score de compétences basé sur mon profil"
+  ✅ "Créer un compte" → "Modifier mon profil"
+  ✅ "Calculer un résultat" → "Afficher / exporter ce résultat"
+
+══════════════════════════════════════════════════════
+TYPE DE DÉPENDANCE — RÈGLE DE PRIORITÉ ABSOLUE
+══════════════════════════════════════════════════════
+Pour le champ "dependency_type", appliquer DANS L'ORDRE :
+
+  TEST 1 (functional) : "L'utilisateur final est-il bloqué si A n'est pas livré ?"
+                        Si OUI → "functional".
+
+  TEST 2 (technical)  : (n'appliquer QUE si TEST 1 = NON)
+                        "Le dev est-il bloqué uniquement parce qu'il manque
+                         une API/schéma que A doit fournir, sans impact UX ?"
+                        Si OUI → "technical".
+
+⚠️ SI LES DEUX TESTS RÉPONDENT OUI → CHOISIR "functional".
+   La dépendance fonctionnelle prime toujours : elle décrit un blocage METIER
+   pour l'utilisateur final, alors que la dépendance technique est un sous-ensemble
+   (détail d'implémentation) sans impact direct côté utilisateur.
 
 ══════════════════════════════════════════════════════
 CHOIX DU TYPE DE RELATION — OBLIGATOIRE AVANT D'ÉMETTRE

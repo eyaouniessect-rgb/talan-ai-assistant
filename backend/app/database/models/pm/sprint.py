@@ -3,9 +3,9 @@
 #
 # Table : sprints
 # Un sprint = une itération de livraison (1 à 4 semaines).
-# Créé en Phase 10 par le Sprint Planner Agent.
+# Créé par le Sprint Planner Agent.
 # capacity_hours = somme des heures disponibles de l'équipe sur la période.
-# Utilisé par le Sprint Planner pour ne pas dépasser la vélocité.
+# Utilisé par le Sprint Planner pour ne pas dépasser la vélocité (en story points).
 
 from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, func
 from sqlalchemy.orm import relationship
@@ -22,10 +22,9 @@ class Sprint(Base):
     start_date     = Column(Date, nullable=True)
     end_date       = Column(Date, nullable=True)
 
-    # Capacité totale en heures — utilisée par le Sprint Planner pour l'affectation des tâches
+    # Capacité totale en heures — utilisée par le Sprint Planner pour l'affectation des stories
     capacity_hours = Column(Float, nullable=True)
 
     created_at     = Column(DateTime, server_default=func.now())
 
     project = relationship("Project", foreign_keys=[project_id])
-    tasks   = relationship("Task", back_populates="sprint")

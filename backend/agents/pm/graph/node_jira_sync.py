@@ -61,8 +61,11 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
                 sync_ok = False
                 print(f"[JIRA SYNC] ⚠ Aucune story créée dans Jira ({nb_stories} attendues) — phase NON marquée comme synchronisée")
 
-        elif phase == "tasks":
-            patch = await _sync_tasks(state)
+        elif phase == "cpm":
+            patch = await _sync_cpm(state)
+
+        elif phase == "story_deps":
+            patch = await _sync_story_deps(state)
 
         elif phase == "sprints":
             patch = await _sync_sprints(state)
@@ -200,7 +203,10 @@ async def _sync_stories(state: PMPipelineState) -> dict:
     epic_map         = state.get("jira_epic_map") or {}
     project_id       = state.get("project_id")
     jira_project_key = state.get("jira_project_key", "")
+    from agents.pm.jira import client as _jira_client
+    sp_fields = _jira_client.get_story_points_field_ids()
     print(f"\n[JIRA SYNC] >>> STORIES : {len(stories)} stories à créer dans Jira projet '{jira_project_key}'")
+    print(f"[JIRA SYNC]   story_points fields détectés : {sp_fields}")
     print(f"[JIRA SYNC]   jira_epic_map = {epic_map}")
 
     if not stories:
@@ -241,7 +247,16 @@ async def _sync_stories(state: PMPipelineState) -> dict:
         if existing_key:
             story_map[i] = existing_key
             skipped += 1
-            print(f"[JIRA SYNC]   [SKIP] Story {i+1}/{len(stories)} déjà dans Jira → {existing_key}")
+            sp = story.get("story_points")
+            if sp:
+                try:
+                    actions.update_story_points(existing_key, sp)
+                    print(f"[JIRA SYNC]   [UPDATE SP] {existing_key} → story_points={sp}")
+                except Exception as sp_err:
+                    errors += 1
+                    print(f"[JIRA SYNC]   [ERREUR SP] {existing_key} story_points={sp} : {sp_err}")
+            else:
+                print(f"[JIRA SYNC]   [SKIP] Story {i+1}/{len(stories)} {existing_key} (story_points absent en DB)")
             continue
 
         try:
@@ -290,44 +305,98 @@ async def _sync_stories(state: PMPipelineState) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# PHASE 7 — Tasks
+# PHASE CPM — Label "critical-path" sur les stories critiques
 # ──────────────────────────────────────────────────────────────
 
-async def _sync_tasks(state: PMPipelineState) -> dict:
-    tasks            = state.get("tasks") or []
-    story_map        = state.get("jira_story_map") or {}
-    jira_project_key = state.get("jira_project_key", "")
-    print(f"\n[JIRA SYNC] >>> TASKS : {len(tasks)} tasks a creer dans Jira projet '{jira_project_key}'")
+async def _sync_cpm(state: PMPipelineState) -> dict:
+    critical_path = state.get("critical_path") or []
+    project_id    = state.get("project_id")
+    print(f"\n[JIRA SYNC] >>> CPM : {len(critical_path)} stories sur le chemin critique")
 
-    if not tasks:
-        print("[JIRA SYNC] SKIP — state['tasks'] est vide")
+    if not critical_path:
+        print("[JIRA SYNC] SKIP — critical_path vide")
         return {}
 
-    task_map = {}
-    errors   = 0
-    for i, task in enumerate(tasks):
-        try:
-            story_idx  = task.get("story_id")
-            parent_key = story_map.get(str(story_idx)) or story_map.get(story_idx)
+    # Résoudre db_id → jira_issue_key depuis la DB
+    db_stories   = await get_stories(project_id) if project_id else []
+    jira_by_dbid = {s.id: s.jira_issue_key for s in db_stories if s.jira_issue_key}
 
-            key = actions.create_task(
-                title       = task["title"],
-                description = task.get("description", ""),
-                project_key = jira_project_key,
-                parent_key  = parent_key,
-            )
-            task_map[i] = key
-            print(f"[JIRA SYNC]   [OK] Task {i+1}/{len(tasks)} → {key} (parent={parent_key})")
+    if not jira_by_dbid:
+        print("[JIRA SYNC] SKIP — aucune story n'a de clé Jira (phase stories non synchronisée ?)")
+        return {}
+
+    labeled  = 0
+    skipped  = 0
+    errors   = 0
+    for story_id in critical_path:
+        jira_key = jira_by_dbid.get(story_id)
+        if not jira_key:
+            skipped += 1
+            print(f"[JIRA SYNC]   [SKIP] story_id={story_id} : clé Jira introuvable")
+            continue
+        try:
+            actions.add_label(jira_key, "critical-path")
+            labeled += 1
         except Exception as e:
             errors += 1
-            print(f"[JIRA SYNC]   [ERREUR] Task {i+1} '{task.get('title','')[:50]}' : {e}")
+            print(f"[JIRA SYNC]   [ERREUR] {jira_key} : {e}")
 
-    print(f"\n[JIRA SYNC] Tasks : {len(task_map)} creees, {errors} erreurs")
-    return {"jira_task_map": task_map}
+    print(f"\n[JIRA SYNC] CPM : {labeled} labels ajoutés, {skipped} ignorés, {errors} erreurs")
+    return {}
 
 
 # ──────────────────────────────────────────────────────────────
-# PHASE 10 — Sprints
+# PHASE 4 — Dépendances (Issue Links)
+# ──────────────────────────────────────────────────────────────
+
+async def _sync_story_deps(state: PMPipelineState) -> dict:
+    deps       = state.get("story_dependencies") or []
+    project_id = state.get("project_id")
+    print(f"\n[JIRA SYNC] >>> STORY DEPS : {len(deps)} dépendances à créer comme Issue Links")
+
+    if not deps:
+        print("[JIRA SYNC] SKIP — state['story_dependencies'] est vide")
+        return {}
+
+    # Construire db_id → jira_issue_key depuis la DB (source de vérité)
+    db_stories   = await get_stories(project_id) if project_id else []
+    jira_by_dbid = {s.id: s.jira_issue_key for s in db_stories if s.jira_issue_key}
+
+    if not jira_by_dbid:
+        print("[JIRA SYNC] SKIP — aucune story n'a encore de clé Jira (phase stories non synchronisée ?)")
+        return {}
+
+    created = 0
+    skipped = 0
+    errors  = 0
+
+    for dep in deps:
+        from_id = dep.get("from_story_id")
+        to_id   = dep.get("to_story_id")
+        rel     = dep.get("relation_type", "FS")
+
+        from_key = jira_by_dbid.get(from_id)
+        to_key   = jira_by_dbid.get(to_id)
+
+        if not from_key or not to_key:
+            skipped += 1
+            print(f"[JIRA SYNC]   [SKIP] dep {from_id}→{to_id} : clé Jira manquante (from={from_key}, to={to_key})")
+            continue
+
+        try:
+            actions.create_issue_link(from_key, to_key, rel)
+            created += 1
+            print(f"[JIRA SYNC]   [OK] {from_key} --{rel}--> {to_key}")
+        except Exception as e:
+            errors += 1
+            print(f"[JIRA SYNC]   [ERREUR] {from_key}→{to_key} : {e}")
+
+    print(f"\n[JIRA SYNC] Issue Links : {created} créés, {skipped} ignorés, {errors} erreurs")
+    return {}
+
+
+# ──────────────────────────────────────────────────────────────
+# PHASE 7 — Sprints
 # ──────────────────────────────────────────────────────────────
 
 async def _sync_sprints(state: PMPipelineState) -> dict:

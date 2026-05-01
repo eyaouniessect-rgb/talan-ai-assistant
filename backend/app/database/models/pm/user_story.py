@@ -47,7 +47,6 @@ class UserStory(Base):
     created_at          = Column(DateTime, server_default=func.now())
 
     epic         = relationship("Epic", back_populates="user_stories")
-    tasks        = relationship("Task", back_populates="user_story", cascade="all, delete-orphan")
     dependencies = relationship(
         "StoryDependency",
         foreign_keys="[StoryDependency.story_id]",

@@ -19,35 +19,17 @@ class StoryStatusEnum(str, enum.Enum):
     REJECTED  = "rejected"
 
 
-class TaskStatusEnum(str, enum.Enum):
-    TODO        = "todo"
-    IN_PROGRESS = "in_progress"
-    DONE        = "done"
-    BLOCKED     = "blocked"
-
-
-class TaskTypeEnum(str, enum.Enum):
-    FEATURE       = "feature"
-    BUG           = "bug"
-    DOCUMENTATION = "documentation"
-    TESTING       = "testing"
-    DEVOPS        = "devops"
-    DESIGN        = "design"
-
-
 class PipelinePhaseEnum(str, enum.Enum):
-    # Les 11 phases correspondent exactement aux phases du pipeline IA
+    # Les 9 phases correspondent exactement aux phases du pipeline IA
     PHASE_1_EXTRACTION       = "phase_1_extraction"
     PHASE_2_EPICS            = "phase_2_epics"
     PHASE_3_STORIES          = "phase_3_stories"
-    PHASE_5_STORY_DEPS       = "phase_5_story_deps"
-    PHASE_6_PRIORITIZATION   = "phase_6_prioritization"
-    PHASE_7_TASKS            = "phase_7_tasks"
-    PHASE_8_TASK_DEPS        = "phase_8_task_deps"
-    PHASE_9_CRITICAL_PATH    = "phase_9_critical_path"
-    PHASE_10_SPRINT_PLANNING = "phase_10_sprint_planning"
-    PHASE_11_STAFFING        = "phase_11_staffing"
-    PHASE_12_MONITORING      = "phase_12_monitoring"
+    PHASE_4_STORY_DEPS       = "phase_4_story_deps"
+    PHASE_5_PRIORITIZATION   = "phase_5_prioritization"
+    PHASE_6_CRITICAL_PATH    = "phase_6_critical_path"
+    PHASE_7_SPRINT_PLANNING  = "phase_7_sprint_planning"
+    PHASE_8_STAFFING         = "phase_8_staffing"
+    PHASE_9_MONITORING       = "phase_9_monitoring"
 
 
 class PipelineStatusEnum(str, enum.Enum):
@@ -61,6 +43,6 @@ class ProjectGlobalStatus(str, enum.Enum):
     NOT_STARTED    = "not_started"    # projet créé, aucune phase lancée
     IN_PROGRESS    = "in_progress"    # pipeline IA en cours
     PENDING_HUMAN  = "pending_human"  # une phase attend la validation du PM
-    PIPELINE_DONE  = "pipeline_done"  # 11/11 phases validées — prêt pour le développement
+    PIPELINE_DONE  = "pipeline_done"  # 9/9 phases validées — prêt pour le développement
     IN_DEVELOPMENT = "in_development" # développement en cours (progress 0→100)
     DELIVERED      = "delivered"      # projet livré (progress = 100)
