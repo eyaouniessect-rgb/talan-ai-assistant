@@ -9,8 +9,8 @@ from pydantic import BaseModel
 from datetime import date, datetime
 from typing import Optional, Any
 from .enums import (
-    EpicStatusEnum, StoryStatusEnum, TaskStatusEnum,
-    TaskTypeEnum, PipelinePhaseEnum, PipelineStatusEnum,
+    EpicStatusEnum, StoryStatusEnum,
+    PipelinePhaseEnum, PipelineStatusEnum,
 )
 
 
@@ -90,24 +90,3 @@ class SprintResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ─────────────────────────────────────────────
-# Task
-# ─────────────────────────────────────────────
-
-class TaskResponse(BaseModel):
-    id: int
-    user_story_id: int
-    title: str
-    type: Optional[TaskTypeEnum] = None
-    estimated_hours: Optional[float] = None
-    status: TaskStatusEnum
-    assigned_employee_id: Optional[int] = None
-    sprint_id: Optional[int] = None
-    earliest_start: Optional[float] = None
-    latest_start: Optional[float] = None
-    slack: Optional[float] = None
-    is_critical: bool
-    jira_task_key: Optional[str] = None
-    ai_metadata: Optional[Any] = None
-
-    model_config = {"from_attributes": True}

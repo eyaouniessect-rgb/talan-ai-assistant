@@ -2,9 +2,7 @@
 Script de suppression complète d'un ou plusieurs projets PM.
 
 Supprime dans l'ordre correct (respect des FK) :
-  project_management.task_dependencies
   project_management.story_dependencies
-  project_management.tasks
   project_management.user_stories
   project_management.sprints
   project_management.epics
@@ -75,13 +73,11 @@ async def list_projects(conn) -> list[dict]:
             p.created_at,
             COUNT(DISTINCT e.id)   AS nb_epics,
             COUNT(DISTINCT us.id)  AS nb_stories,
-            COUNT(DISTINCT t.id)   AS nb_tasks,
             COUNT(DISTINCT ps.id)  AS nb_pipeline_phases,
             COUNT(DISTINCT pd.id)  AS nb_documents
         FROM crm.projects p
         LEFT JOIN project_management.epics          e  ON e.project_id  = p.id
         LEFT JOIN project_management.user_stories   us ON us.epic_id    = e.id
-        LEFT JOIN project_management.tasks          t  ON t.user_story_id = us.id
         LEFT JOIN project_management.pipeline_state ps ON ps.project_id = p.id
         LEFT JOIN project_management.project_documents pd ON pd.project_id = p.id
         GROUP BY p.id
@@ -96,12 +92,12 @@ def print_projects(projects: list[dict]):
         return
 
     print(f"\n  {'ID':>4}  {'Nom':<35} {'Statut':<18} {'Arch':>4}  "
-          f"{'Epics':>5}  {'Stories':>7}  {'Tasks':>5}  {'Phases':>6}  {'Docs':>4}")
+          f"{'Epics':>5}  {'Stories':>7}  {'Phases':>6}  {'Docs':>4}")
     _sep()
     for p in projects:
         arch = "oui" if p["archived"] else "non"
         print(f"  {p['id']:>4}  {str(p['name']):<35} {str(p['status']):<18} {arch:>4}  "
-              f"{p['nb_epics']:>5}  {p['nb_stories']:>7}  {p['nb_tasks']:>5}  "
+              f"{p['nb_epics']:>5}  {p['nb_stories']:>7}  "
               f"{p['nb_pipeline_phases']:>6}  {p['nb_documents']:>4}")
     _sep()
     print(f"  Total : {len(projects)} projet(s)\n")
@@ -149,22 +145,7 @@ async def delete_one_project(conn, project_id: int, dry_run: bool = False) -> di
                 _skip(f"{label} : 0 ligne")
             stats[label] = count
 
-    # ── 1. task_dependencies ─────────────────────────────────
-    await _delete(
-        "task_dependencies",
-        """
-        DELETE FROM project_management.task_dependencies
-        WHERE task_id IN (
-            SELECT t.id FROM project_management.tasks t
-            JOIN project_management.user_stories us ON us.id = t.user_story_id
-            JOIN project_management.epics e ON e.id = us.epic_id
-            WHERE e.project_id = $1
-        )
-        """,
-        project_id,
-    )
-
-    # ── 2. story_dependencies ────────────────────────────────
+    # ── 1. story_dependencies ────────────────────────────────
     await _delete(
         "story_dependencies",
         """
@@ -178,21 +159,7 @@ async def delete_one_project(conn, project_id: int, dry_run: bool = False) -> di
         project_id,
     )
 
-    # ── 3. tasks ─────────────────────────────────────────────
-    await _delete(
-        "tasks",
-        """
-        DELETE FROM project_management.tasks
-        WHERE user_story_id IN (
-            SELECT us.id FROM project_management.user_stories us
-            JOIN project_management.epics e ON e.id = us.epic_id
-            WHERE e.project_id = $1
-        )
-        """,
-        project_id,
-    )
-
-    # ── 4. user_stories ──────────────────────────────────────
+    # ── 2. user_stories ──────────────────────────────────────
     await _delete(
         "user_stories",
         """
@@ -204,35 +171,35 @@ async def delete_one_project(conn, project_id: int, dry_run: bool = False) -> di
         project_id,
     )
 
-    # ── 5. sprints ───────────────────────────────────────────
+    # ── 3. sprints ───────────────────────────────────────────
     await _delete(
         "sprints",
         "DELETE FROM project_management.sprints WHERE project_id = $1",
         project_id,
     )
 
-    # ── 6. epics ─────────────────────────────────────────────
+    # ── 4. epics ─────────────────────────────────────────────
     await _delete(
         "epics",
         "DELETE FROM project_management.epics WHERE project_id = $1",
         project_id,
     )
 
-    # ── 7. pipeline_state ────────────────────────────────────
+    # ── 5. pipeline_state ────────────────────────────────────
     await _delete(
         "pipeline_state",
         "DELETE FROM project_management.pipeline_state WHERE project_id = $1",
         project_id,
     )
 
-    # ── 8. project_documents ─────────────────────────────────
+    # ── 6. project_documents ─────────────────────────────────
     await _delete(
         "project_documents",
         "DELETE FROM project_management.project_documents WHERE project_id = $1",
         project_id,
     )
 
-    # ── 9. project (crm) ─────────────────────────────────────
+    # ── 7. project (crm) ─────────────────────────────────────
     await _delete(
         "crm.projects",
         "DELETE FROM crm.projects WHERE id = $1",

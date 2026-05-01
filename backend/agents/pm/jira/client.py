@@ -36,3 +36,53 @@ def post(path: str, body: dict) -> dict:
 
 def put(path: str, body: dict) -> dict:
     return _request("PUT", path, json=body)
+
+
+# ──────────────────────────────────────────────────────────────
+# Résolution dynamique du champ "Story Points"
+# ──────────────────────────────────────────────────────────────
+
+_STORY_POINTS_FIELD_IDS: list[str] | None = None   # cache in-process
+
+# Jira Cloud expose deux champs distincts selon le type de projet :
+#   customfield_10016 = "Story point estimate" (next-gen / sprint planning)
+#   customfield_10028 = "Story Points"         (classic / colonne backlog)
+# On met les deux à jour pour couvrir tous les cas.
+_STORY_POINTS_NAMES = {
+    "story points", "story point estimate", "estimation", "points",
+    "story point", "sp", "complexity",
+}
+
+def get_story_points_field_ids() -> list[str]:
+    """
+    Retourne la liste de tous les IDs de champs Jira correspondant aux story points.
+    Jira Cloud peut avoir deux champs (customfield_10016 ET customfield_10028) ;
+    les deux sont mis à jour pour que la valeur apparaisse partout (backlog + ticket detail).
+    """
+    global _STORY_POINTS_FIELD_IDS
+    if _STORY_POINTS_FIELD_IDS is not None:
+        return _STORY_POINTS_FIELD_IDS
+
+    found: list[str] = []
+    try:
+        fields = _request("GET", "field")
+        if isinstance(fields, list):
+            for f in fields:
+                name = (f.get("name") or "").strip().lower()
+                if name in _STORY_POINTS_NAMES:
+                    found.append(f["id"])
+                    print(f"[Jira] Story Points field trouvé : '{f['name']}' → id={f['id']}")
+    except Exception as e:
+        print(f"[Jira] Impossible de résoudre les champs Story Points : {e}")
+
+    if not found:
+        found = ["customfield_10016"]
+        print("[Jira] Story Points field non trouvé → fallback customfield_10016")
+
+    _STORY_POINTS_FIELD_IDS = found
+    return _STORY_POINTS_FIELD_IDS
+
+
+def get_story_points_field_id() -> str:
+    """Retourne le premier champ story points détecté (compatibilité)."""
+    return get_story_points_field_ids()[0]

@@ -18,6 +18,7 @@ import {
   resyncJira,
   restartMissingStories,
   exportBacklogPdf,
+  rerunPrioritization,
 } from "../../api/pipeline";
 import { getDocument } from "../../api/projects";
 import { PHASES, PHASE_KEY_MAP } from "./constants/phases";
@@ -218,7 +219,7 @@ export default function PipelineDetail() {
     if (!project || project.phases.length === 0) return "not_started";
     if (
       project.phases.every((p) => p.status === "validated") &&
-      project.phases.length === 12
+      project.phases.length === 9
     )
       return "completed";
     if (project.phases.some((p) => p.status === "pending_validation"))
@@ -276,7 +277,7 @@ export default function PipelineDetail() {
             {project?.project_name}
           </h1>
           <p className="text-slate-500 text-sm mt-0.5">
-            Pipeline IA · {project?.phases.length ?? 0} / 12 phases enregistrées
+            Pipeline IA · {project?.phases.length ?? 0} / 9 phases enregistrées
           </p>
           {project?.jira_project_key && (
             <span className="inline-flex items-center gap-1 mt-1 text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-full">
@@ -411,9 +412,9 @@ export default function PipelineDetail() {
                       <CheckCircle size={11} /> Validé
                     </span>
                   )}
-                  {getPhaseStatus(activePhase) === "done" &&
+                  {["done", "active"].includes(getPhaseStatus(activePhase)) &&
                     project?.jira_project_key &&
-                    ["epics", "stories", "tasks", "sprints"].includes(activePhase) && (
+                    ["epics", "stories", "story_deps", "cpm", "sprints"].includes(activePhase) && (
                       <button
                         onClick={() => handleResyncJira(activePhase)}
                         disabled={resyncLoading}
@@ -463,6 +464,12 @@ export default function PipelineDetail() {
                   onRefresh={() => fetchData(true)}
                   onContinue={
                     activePhase === "stories" ? handleContinueStories : undefined
+                  }
+                  criticalPath={phaseMap["cpm"]?.ai_output?.critical_path ?? []}
+                  onRerunPrioritization={
+                    activePhase === "prioritization"
+                      ? () => rerunPrioritization(id)
+                      : undefined
                   }
                 />
               )}

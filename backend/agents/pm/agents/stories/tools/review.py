@@ -11,7 +11,7 @@ import re
 
 from app.core.groq_client import invoke_with_fallback
 
-_RETRY_DELAYS = [3, 7]   # secondes avant 1er et 2e retry
+_RETRY_DELAYS = []   # pas de retry — la review est un audit qualité, fail-safe immédiat si vide
 
 
 def _to_str_list(lst: list) -> list[str]:
@@ -144,7 +144,7 @@ Retourne UNIQUEMENT ce JSON :
                 ],
                 max_tokens     = 768,
                 temperature    = 0,
-                nvidia_retries = 2,   # 2 tentatives par clé (temp 0 puis 0.05)
+                nvidia_retries = 1,   # 1 seule tentative — fail-safe immédiat si vide
             )
 
             if not raw or not raw.strip():

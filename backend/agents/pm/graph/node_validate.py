@@ -1,6 +1,6 @@
 # agents/pm/graph/node_validate.py
 # ═══════════════════════════════════════════════════════════════
-# Noeud de validation humaine — partagé par toutes les phases 2→11
+# Noeud de validation humaine — partagé par toutes les phases 2→8
 #
 # Flux :
 #   phase_N → node_validate → (validated) → jira_sync → phase_N+1
@@ -128,12 +128,35 @@ async def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
                 pass
         return {"epics": epics_state}
 
+    if phase == "cpm":
+        cpm_result    = state.get("cpm_result") or {}
+        critical_path = state.get("critical_path") or []
+        stories       = state.get("stories") or []
+        deps          = state.get("story_dependencies") or []
+        story_map     = {
+            str(s.get("db_id") or s.get("id")): s.get("title", "")
+            for s in stories
+            if (s.get("db_id") or s.get("id")) is not None
+        }
+        project_duration = max(
+            (v["earliest_finish"] for v in cpm_result.values()), default=0
+        )
+        max_slack = max(
+            (v["slack"] for v in cpm_result.values()), default=0
+        )
+        return {
+            "cpm_result":         cpm_result,
+            "critical_path":      critical_path,
+            "story_dependencies": deps,
+            "story_map":          story_map,
+            "project_duration":   project_duration,
+            "critical_tasks":     len(critical_path),
+            "max_slack":          round(max_slack, 2),
+        }
+
     phase_field_map = {
         "story_deps":      "story_dependencies",
         "prioritization":  "priorities",
-        "tasks":           "tasks",
-        "task_deps":       "task_dependencies",
-        "cpm":             "cpm_result",
         "sprints":         "sprints",
         "staffing":        "staffing",
     }

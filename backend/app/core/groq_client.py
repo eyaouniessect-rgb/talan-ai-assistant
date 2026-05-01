@@ -229,11 +229,10 @@ async def invoke_with_fallback(
                     )
                     text = _extract_text(response)
                     if not text or not text.strip():
-                        print(f"⚠️ [NVIDIA] {key_label} Réponse vide (tentative {attempt+1}/{nvidia_retries}) — content={repr(response.content)[:80]}")
-                        if attempt < nvidia_retries - 1:
-                            await asyncio.sleep(2)
-                            continue
-                        nvidia_failed = True
+                        print(f"⚠️ [NVIDIA] {key_label} Réponse vide — content={repr(response.content)[:80]} → fallback Groq immédiat")
+                        # Réponse vide = toutes les clés NVIDIA partagent le même problème
+                        # (rate limit ou modèle surchargé) → aller directement à Groq
+                        all_nvidia_failed = True
                         break
                     print(f"✅ [NVIDIA] {key_label} Succès ({len(text)} chars)")
                     return text
@@ -257,6 +256,9 @@ async def invoke_with_fallback(
                     logger.warning(f"NVIDIA {key_label} échec final : {str(e)[:120]}")
                     break
 
+            # Sortie immédiate si réponse vide (all_nvidia_failed mis à True dans la boucle interne)
+            if all_nvidia_failed:
+                break
             if nvidia_failed and key_idx < len(ordered_keys) - 1:
                 print(f"🔄 [NVIDIA] {key_label} épuisée → rotation vers clé suivante")
                 await asyncio.sleep(1)

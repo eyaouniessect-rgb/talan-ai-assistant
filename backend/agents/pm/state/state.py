@@ -126,62 +126,43 @@ class PMPipelineState(TypedDict):
     # ╚══════════════════════════════════════════════════════╝
 
     priorities: list[dict]
-    # { "story_id": int, "moscow": str, "value_score": float, "final_rank": int }
+    # { "story_id": int, "priority_score": int, "final_rank": int }
+    # Trié du plus prioritaire au moins prioritaire (final_rank=1 = priorité max).
 
 
     # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 7 — Tasks                                    ║
-    # ╚══════════════════════════════════════════════════════╝
-
-    tasks: list[dict]
-    # {
-    #   "story_id": int, "title": str, "description": str,
-    #   "duration_days": int,
-    #   "task_type": str   — "frontend"|"backend"|"design"|"devops"|"qa"|"other"
-    # }
-
-
-    # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 8 — Dépendances entre Tasks                  ║
-    # ╚══════════════════════════════════════════════════════╝
-
-    task_dependencies: list[dict]
-    # { "task_id": int, "depends_on_id": int }
-
-
-    # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 9 — Critical Path Method (CPM)               ║
+    # ║  PHASE 7 — Critical Path Method (CPM) sur stories   ║
     # ╚══════════════════════════════════════════════════════╝
 
     cpm_result: dict
-    # { task_idx → { "earliest_start": float, "latest_start": float,
+    # { story_id → { "earliest_start": float, "latest_start": float,
     #                "slack": float, "is_critical": bool } }
 
     critical_path: list[int]
-    # Index des tasks sur le chemin critique (slack == 0)
+    # IDs des stories sur le chemin critique (slack == 0)
 
 
     # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 10 — Sprint Planning                         ║
+    # ║  PHASE 8 — Sprint Planning                          ║
     # ╚══════════════════════════════════════════════════════╝
 
     sprints: list[dict]
     # {
     #   "name": str, "goal": str, "start_date": str, "end_date": str,
-    #   "story_ids": list[int], "task_ids": list[int]
+    #   "story_ids": list[int]
     # }
 
 
     # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 11 — Staffing                                ║
+    # ║  PHASE 9 — Staffing                                 ║
     # ╚══════════════════════════════════════════════════════╝
 
     staffing: dict
-    # { task_idx (int) → employee_id (int) }
+    # { story_id (int) → employee_id (int) }
 
 
     # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 12 — Monitoring continu                      ║
+    # ║  PHASE 10 — Monitoring continu                      ║
     # ╚══════════════════════════════════════════════════════╝
 
     monitoring_plan: dict
@@ -197,7 +178,7 @@ class PMPipelineState(TypedDict):
 
     # Nom de la phase en cours
     # "extract"|"epics"|"stories"|"story_deps"|
-    # "prioritization"|"tasks"|"task_deps"|"cpm"|"sprints"|"staffing"|"monitoring"
+    # "prioritization"|"cpm"|"sprints"|"staffing"|"monitoring"
     current_phase: str
 
     pipeline_state_id: int
@@ -225,7 +206,6 @@ class PMPipelineState(TypedDict):
     jira_project_key: str
     jira_epic_map: dict       # { local_epic_idx: jira_epic_key }
     jira_story_map: dict      # { local_story_idx: jira_issue_key }
-    jira_task_map: dict       # { local_task_idx: jira_subtask_key }
     jira_sprint_map: dict     # { local_sprint_idx: jira_sprint_id }
     jira_synced_phases: list[str]
 

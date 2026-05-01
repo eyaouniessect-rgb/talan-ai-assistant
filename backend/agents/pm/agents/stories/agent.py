@@ -20,13 +20,34 @@ from agents.pm.agents.stories.repository import (
     update_story,
 )
 from agents.pm.agents.stories.tools.targeted_regen import improve_targeted_stories
+from agents.pm.agents.epics.repository import get_epics
 
 
 async def node_stories(state: PMPipelineState) -> dict:
     """Noeud LangGraph — Phase 3 : génération des User Stories."""
     project_id            = state.get("project_id")
-    epics                 = state.get("epics", [])
     human_feedback        = state.get("human_feedback")
+
+    # Toujours relire les epics depuis la DB pour exclure ceux supprimés
+    # (le state LangGraph peut contenir des epics stale si l'utilisateur en a supprimé)
+    if project_id:
+        try:
+            db_epics = await get_epics(project_id)
+            epics = [
+                {
+                    "title":              e.title,
+                    "description":        e.description or "",
+                    "splitting_strategy": e.splitting_strategy or "by_feature",
+                    "db_id":              e.id,
+                }
+                for e in db_epics
+            ]
+            print(f"[stories] {len(epics)} epics chargés depuis la DB (state ignoré pour éviter les epics supprimés)")
+        except Exception as exc:
+            print(f"[stories] ⚠ Impossible de relire les epics DB ({exc}) → fallback state")
+            epics = state.get("epics", [])
+    else:
+        epics = state.get("epics", [])
     targeted_story_ids    = state.get("targeted_story_ids") or []
     architecture_detected = state.get("architecture_detected", False)
     architecture_details  = state.get("architecture_details") if architecture_detected else None

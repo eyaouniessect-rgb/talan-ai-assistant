@@ -11,12 +11,9 @@
 # Mapping phase → opération Jira :
 #   epics           → create Epics (issue type: Epic)
 #   stories         → create Issues (issue type: Story)
-#   refinement      → update Issues (description + acceptance criteria)
 #   story_deps      → create Issue Links (type: "is blocked by")
 #   prioritization  → update Priority field sur chaque Issue
-#   tasks           → create Sub-tasks
-#   task_deps       → create Issue Links entre sub-tasks
-#   cpm             → add label "critical-path" sur les tasks critiques
+#   cpm             → add label "critical-path" sur les stories critiques
 #   sprints         → create Sprints + move Issues dans les sprints
 #   staffing        → assign Issues aux membres Jira
 #
@@ -34,11 +31,8 @@ from agents.pm.state import PMPipelineState
 _PHASE_SYNC_MAP = {
     "epics":           "create_epics",
     "stories":         "create_stories",
-
     "story_deps":      "create_story_links",
     "prioritization":  "update_priority",
-    "tasks":           "create_subtasks",
-    "task_deps":       "create_task_links",
     "cpm":             "update_critical_labels",
     "sprints":         "create_sprints",
     "staffing":        "assign_issues",
