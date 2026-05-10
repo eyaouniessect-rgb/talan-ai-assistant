@@ -12,9 +12,12 @@ export const PHASE_KEY_MAP = {
   PHASE_4_STORY_DEPS:      "story_deps",
   PHASE_5_PRIORITIZATION:  "prioritization",
   PHASE_6_CRITICAL_PATH:   "cpm",
+  PHASE_7_STAFFING:        "staffing",
+  PHASE_8_SPRINT_PLANNING: "sprints",
+  PHASE_9_MONITORING:      "monitoring",
+  // Anciens noms uppercase (DB records créés avant le swap staffing/sprints)
   PHASE_7_SPRINT_PLANNING: "sprints",
   PHASE_8_STAFFING:        "staffing",
-  PHASE_9_MONITORING:      "monitoring",
   // Lowercase fallback (anciennes valeurs, migration en cours ou pas encore appliquée)
   phase_1_extraction:      "extract",
   phase_2_epics:           "epics",
@@ -22,8 +25,10 @@ export const PHASE_KEY_MAP = {
   phase_4_story_deps:      "story_deps",
   phase_5_prioritization:  "prioritization",
   phase_6_critical_path:   "cpm",
+  phase_7_staffing:        "staffing",
   phase_7_sprint_planning: "sprints",
   phase_8_staffing:        "staffing",
+  phase_8_sprint_planning: "sprints",
   phase_9_monitoring:      "monitoring",
 };
 
@@ -34,8 +39,8 @@ export const PHASES = [
   { id: "story_deps",     label: "Dépendances Stories",  icon: GitBranch,  desc: "Analyse des dépendances entre User Stories" },
   { id: "cpm",            label: "Chemin Critique",      icon: TrendingUp, desc: "Critical Path Method sur les stories" },
   { id: "prioritization", label: "Priorisation MoSCoW",  icon: BarChart2,  desc: "Classement valeur métier × effort" },
-  { id: "sprints",        label: "Sprint Planning",      icon: Calendar,   desc: "Répartition des stories par sprint" },
   { id: "staffing",       label: "Staffing",             icon: Users,      desc: "Affectation des stories aux membres de l'équipe" },
+  { id: "sprints",        label: "Sprint Planning",      icon: Calendar,   desc: "Répartition des stories par sprint" },
   { id: "monitoring",     label: "Monitoring",           icon: Activity,   desc: "KPIs, alertes et synchronisation Jira" },
 ];
 

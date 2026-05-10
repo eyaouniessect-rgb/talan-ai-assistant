@@ -70,6 +70,11 @@ router = APIRouter(prefix="/pipeline", tags=["Pipeline PM"])
 
 _JIRA_ENABLED = bool(os.getenv("JIRA_BASE_URL") and os.getenv("JIRA_API_TOKEN"))
 
+# Verrou par projet — empêche deux pm_graph.ainvoke() concurrents sur le même
+# thread_id (causerait des appels NVIDIA en parallèle qui se piétinent les clés).
+# Utilisé par tous les endpoints qui invoquent le graph (validate, restart…).
+_pm_graph_running: set[int] = set()
+
 
 # ──────────────────────────────────────────────────────────────
 # RBAC
@@ -209,6 +214,67 @@ class StoryCreateRequest(BaseModel):
 class ResyncJiraRequest(BaseModel):
     """Corps de la requête POST /pipeline/{project_id}/jira-resync."""
     phase: Optional[str] = None   # ex: "stories", "epics" — défaut = phase courante
+
+
+class UpdateStaffingProfilesRequest(BaseModel):
+    """Corps de la requête PATCH /pipeline/{project_id}/staffing/profiles."""
+    stories_profiles: list[dict]
+
+
+class UpdateNormalizationDecisionsRequest(BaseModel):
+    """Corps de la requête PATCH /pipeline/{project_id}/staffing/normalization-decisions."""
+    pm_decisions: dict[str, str]   # { required_profile: "accept" | "recruit" }
+
+
+class UpdateSprintCapacitiesRequest(BaseModel):
+    """Corps de la requête PATCH /pipeline/{project_id}/staffing/sprint-capacities.
+
+    capacities : capacité cible (en SP) pour chaque sprint, dans l'ordre.
+                 Longueur = nombre de sprints existants. Toutes ≥ 1.
+    """
+    capacities: list[int]
+
+
+class ResolveManualDecisionRequest(BaseModel):
+    """Corps de la requête PATCH /pipeline/{project_id}/staffing/matching/manual-decision.
+
+    Le PM choisit l'employé à retenir parmi les candidate_options proposés.
+    """
+    sprint_number:    int
+    story_id:         int
+    required_profile: str
+    employee_id:      int
+
+
+class ChangeAssignmentRequest(BaseModel):
+    """Corps de la requête PATCH /pipeline/{project_id}/staffing/matching/change-assignment.
+
+    Le PM change l'employé affecté à un (sprint, story, profile) parmi les
+    alternative_candidates fournies par le matching auto.
+    """
+    sprint_number:    int
+    story_id:         int
+    required_profile: str
+    new_employee_id:  int
+
+
+class RecruitmentRequestRequest(BaseModel):
+    """Corps de la requête POST /pipeline/{project_id}/staffing/recruitment-request.
+
+    Le PM signale un besoin RH non couvert en interne. Tous les champs sont
+    déjà composés côté frontend : le PM édite le sujet, le corps, les
+    destinataires et le CC dans une UI type email avant d'envoyer.
+    """
+    to:               list[str]
+    cc:               Optional[list[str]] = None
+    subject:          str
+    body:             str
+    profile:          str
+    required_skills:  Optional[list[str]] = None
+    required_level:   Optional[str]       = None
+    sprint_number:    Optional[int]       = None
+    sprint_start:     Optional[str]       = None
+    sprint_end:       Optional[str]       = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -385,6 +451,8 @@ async def get_project_pipeline(
         "project_id":       project_id,
         "project_name":     proj.name,
         "jira_project_key": proj.jira_project_key,
+        "start_date":       proj.start_date.isoformat() if proj.start_date else None,
+        "end_date":         proj.end_date.isoformat()   if proj.end_date   else None,
         "phases":           phase_list,
     }
 
@@ -397,6 +465,7 @@ async def get_project_pipeline(
 async def validate_phase(
     project_id:   int,
     body:         ValidateRequest,
+    background:   BackgroundTasks,
     current_user: dict         = Depends(require_pm),
     db:           AsyncSession = Depends(get_db),
 ):
@@ -408,6 +477,14 @@ async def validate_phase(
     """
     if not body.approved and not (body.feedback or "").strip():
         raise HTTPException(400, "Un feedback est obligatoire en cas de rejet.")
+
+    # Guard : refuser si une exécution graph est déjà en cours pour ce projet
+    if project_id in _pm_graph_running:
+        raise HTTPException(
+            409,
+            "Une exécution du pipeline est déjà en cours pour ce projet. "
+            "Attendez qu'elle termine avant de relancer."
+        )
 
     user_id     = current_user["user_id"]
     employee_id = await get_employee_id_by_user(user_id)
@@ -467,11 +544,31 @@ async def validate_phase(
         as_node="node_validate",
     )
 
-    try:
-        await pm_graph.ainvoke(None, config=config)
-    except Exception as e:
-        if "GraphInterrupt" not in type(e).__name__:
-            raise HTTPException(500, f"Erreur lors de la reprise du pipeline : {str(e)}")
+    # Pour le staffing : exécution en arrière-plan (peut prendre 5+ min)
+    # Pour les autres phases : exécution synchrone (rapide, finit avant le timeout HTTP)
+    is_staffing = pending.phase.value == PipelinePhaseEnum.PHASE_8_STAFFING.value
+
+    if is_staffing:
+        async def _run():
+            _pm_graph_running.add(project_id)
+            try:
+                await pm_graph.ainvoke(None, config=config)
+            except Exception as e:
+                if "GraphInterrupt" not in type(e).__name__:
+                    print(f"[validate_phase] erreur graph projet {project_id} : {e}")
+            finally:
+                _pm_graph_running.discard(project_id)
+
+        background.add_task(_run)
+    else:
+        _pm_graph_running.add(project_id)
+        try:
+            await pm_graph.ainvoke(None, config=config)
+        except Exception as e:
+            if "GraphInterrupt" not in type(e).__name__:
+                raise HTTPException(500, f"Erreur lors de la reprise du pipeline : {str(e)}")
+        finally:
+            _pm_graph_running.discard(project_id)
 
     # Mettre à jour project.status si toutes les phases sont validées
     all_phases = await get_all_pipeline_states(project_id)
@@ -665,6 +762,1330 @@ async def restart_missing_stories(
         "message": f"Génération lancée pour {len(missing_epics)} epic(s) manquant(s).",
         "missing": missing_indices,
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/staffing/available-profiles — Profils disponibles (PM)
+# GET /pipeline/staffing/available-skills   — Compétences disponibles (PM)
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/staffing/available-profiles")
+async def get_available_profiles(
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Retourne les job_titles distincts des employés (hors management)
+    pour alimenter le sélecteur de profils dans l'UI staffing PM.
+    """
+    from app.database.models.hris import Employee, SeniorityEnum
+    from sqlalchemy import select as sa_select
+
+    result = await db.execute(
+        sa_select(Employee.job_title)
+        .where(
+            Employee.job_title.isnot(None),
+            Employee.seniority.notin_([SeniorityEnum.LEAD, SeniorityEnum.HEAD, SeniorityEnum.PRINCIPAL]),
+        )
+        .distinct()
+        .order_by(Employee.job_title)
+    )
+    titles = [row[0] for row in result.all() if row[0] and row[0].strip()]
+    return {"profiles": titles}
+
+
+@router.get("/staffing/available-skills")
+async def get_available_skills(
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Retourne toutes les compétences disponibles en base
+    pour alimenter le sélecteur de compétences dans l'UI staffing PM.
+    """
+    from app.database.models.hris import Skill
+    from sqlalchemy import select as sa_select
+
+    result = await db.execute(sa_select(Skill.name).order_by(Skill.name))
+    skills = [row[0] for row in result.all() if row[0]]
+    return {"skills": skills}
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/staffing/hr-contacts
+# Retourne les utilisateurs actifs avec le rôle RH pour pré-remplir le
+# champ "À" du dialog "Signaler un besoin en recrutement". Le PM peut
+# ensuite ajouter ou retirer des destinataires comme dans Gmail.
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/staffing/hr-contacts")
+async def get_hr_contacts(
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Retourne tous les users actifs avec role='rh', triés par nom.
+    Format : [{ "id", "name", "email" }, …]
+    """
+    from app.database.models.public.user import User
+    from sqlalchemy import select as sa_select
+
+    rows = (await db.execute(
+        sa_select(User.id, User.name, User.email)
+        .where(User.role == "rh", User.is_active == True)  # noqa: E712
+        .order_by(User.name)
+    )).all()
+
+    contacts = [
+        {"id": r[0], "name": r[1] or r[2], "email": r[2]}
+        for r in rows
+        if r[2] and r[2].strip()
+    ]
+    return {"contacts": contacts}
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/staffing/profiles — Correction manuelle
+# ──────────────────────────────────────────────────────────────
+
+@router.patch("/{project_id}/staffing/profiles")
+async def update_staffing_profiles(
+    project_id:   int,
+    body:         UpdateStaffingProfilesRequest,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Permet au PM de corriger manuellement les profils extraits par le LLM
+    (profils requis, compétences, niveau) sans relancer toute la phase.
+
+    Met à jour :
+      1. Le checkpoint LangGraph (état en mémoire)
+      2. Le pipeline_state en base de données (ai_output)
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    # ── 1. Lire l'état courant du checkpoint ──────────────────
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+    steps    = staffing.get("steps") or {}
+
+    # ── 2. Mettre à jour profile_extraction.result ────────────
+    new_steps = {
+        **steps,
+        "profile_extraction": {
+            **steps.get("profile_extraction", {}),
+            "result": {"stories_profiles": body.stories_profiles},
+        },
+    }
+    new_staffing = {**staffing, "steps": new_steps}
+
+    await pm_graph.aupdate_state(
+        config,
+        {"staffing": new_staffing},
+        as_node="node_staffing",
+    )
+
+    # ── 3. Mettre à jour pipeline_state en DB ─────────────────
+    phases = await get_all_pipeline_states(project_id)
+    staffing_phase = next(
+        (p for p in phases if p.phase.value in (
+            PipelinePhaseEnum.PHASE_8_STAFFING.value,
+        )),
+        None,
+    )
+    if staffing_phase:
+        from sqlalchemy.orm.attributes import flag_modified
+        async with AsyncSessionLocal() as session:
+            ps = (await session.execute(
+                select(PipelineState).where(PipelineState.id == staffing_phase.id)
+            )).scalar_one_or_none()
+            if ps:
+                current_ai = dict(ps.ai_output or {})
+                current_ai["staffing"] = new_staffing
+                ps.ai_output = current_ai
+                flag_modified(ps, "ai_output")
+                await session.commit()
+
+    return {"project_id": project_id, "updated": True, "profiles_count": len(body.stories_profiles)}
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/staffing/normalization-decisions
+# ──────────────────────────────────────────────────────────────
+
+@router.patch("/{project_id}/staffing/normalization-decisions")
+async def update_normalization_decisions(
+    project_id:   int,
+    body:         UpdateNormalizationDecisionsRequest,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Permet au PM de modifier les décisions accept/recruit pour chaque profil
+    après la normalisation (step 2).
+
+    Met à jour :
+      1. Le checkpoint LangGraph
+      2. Le pipeline_state en base de données (ai_output)
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+    steps    = staffing.get("steps") or {}
+
+    norm_step = steps.get("profile_normalization", {})
+    if norm_step.get("status") != "done" or not norm_step.get("result"):
+        raise HTTPException(400, "La normalisation des profils n'est pas encore terminée.")
+
+    # Valider les valeurs
+    for profile, decision in body.pm_decisions.items():
+        if decision not in ("accept", "recruit"):
+            raise HTTPException(400, f"Décision invalide '{decision}' pour '{profile}'. Valeurs acceptées : accept, recruit.")
+
+    # Mettre à jour pm_decisions dans le résultat de normalization
+    updated_norm_result = {
+        **norm_step["result"],
+        "pm_decisions": body.pm_decisions,
+    }
+    new_steps = {
+        **steps,
+        "profile_normalization": {
+            **norm_step,
+            "result": updated_norm_result,
+        },
+    }
+    new_staffing = {**staffing, "steps": new_steps}
+
+    await pm_graph.aupdate_state(
+        config,
+        {"staffing": new_staffing},
+        as_node="node_staffing",
+    )
+
+    # Mettre à jour pipeline_state en DB
+    phases = await get_all_pipeline_states(project_id)
+    staffing_phase = next(
+        (p for p in phases if p.phase.value in (
+            PipelinePhaseEnum.PHASE_8_STAFFING.value,
+        )),
+        None,
+    )
+    if staffing_phase:
+        from sqlalchemy.orm.attributes import flag_modified
+        async with AsyncSessionLocal() as session:
+            ps = (await session.execute(
+                select(PipelineState).where(PipelineState.id == staffing_phase.id)
+            )).scalar_one_or_none()
+            if ps:
+                current_ai = dict(ps.ai_output or {})
+                current_ai["staffing"] = new_staffing
+                ps.ai_output = current_ai
+                flag_modified(ps, "ai_output")
+                await session.commit()
+
+    # Synchroniser les besoins de recrutement en base
+    await _sync_recruitment_needs(
+        project_id   = project_id,
+        pm_decisions = body.pm_decisions,
+        norm_result  = updated_norm_result,
+    )
+
+    print(f"[pipeline] ✅ décisions PM normalization mises à jour pour projet {project_id} : {body.pm_decisions}")
+    return {"project_id": project_id, "updated": True, "decisions": body.pm_decisions}
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/staffing/sprint-capacities
+# Permet au PM d'ajuster manuellement la capacité cible (SP) de chaque
+# sprint après la répartition initiale (step 3). Re-distribue les stories
+# selon les nouvelles capacités tout en conservant l'ordre final_rank.
+# ──────────────────────────────────────────────────────────────
+
+@router.patch("/{project_id}/staffing/sprint-capacities")
+async def update_sprint_capacities(
+    project_id:   int,
+    body:         UpdateSprintCapacitiesRequest,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Re-répartit les stories selon des capacités cible personnalisées par sprint.
+
+    Logique :
+      1. Lit le state LangGraph + résultat actuel de story_distribution
+      2. Re-distribue déterministe (sans LLM) avec les nouvelles capacités
+      3. Met à jour le checkpoint LangGraph + DB pipeline_state
+      4. Reset les étapes aval (candidate_filtering, matching, velocity_feasibility)
+         à 'pending' si elles étaient 'done' — leurs résultats sont stales
+    """
+    if project_id in _pm_graph_running:
+        raise HTTPException(409, "Une exécution du pipeline est déjà en cours pour ce projet.")
+
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+    steps    = staffing.get("steps") or {}
+
+    distrib_step = steps.get("story_distribution", {})
+    if distrib_step.get("status") != "done" or not distrib_step.get("result"):
+        raise HTTPException(400, "La répartition initiale n'est pas encore terminée.")
+
+    distrib_result = distrib_step["result"]
+    existing_sprints = distrib_result.get("sprints", []) or []
+
+    if len(body.capacities) != len(existing_sprints):
+        raise HTTPException(
+            400,
+            f"Nombre de capacités fournies ({len(body.capacities)}) "
+            f"≠ nombre de sprints existants ({len(existing_sprints)}).",
+        )
+    if any(c < 1 for c in body.capacities):
+        raise HTTPException(400, "Toutes les capacités doivent être ≥ 1 SP.")
+
+    # Recalculer la distribution avec les nouvelles capacités
+    from agents.pm.agents.staffing.steps.story_distribution.service import (
+        redistribute_with_capacities,
+    )
+
+    stories_state    = current_state.get("stories",    []) or []
+    priorities_state = current_state.get("priorities", []) or []
+
+    stories_input = [
+        {
+            "story_id":     s.get("db_id") or s.get("id"),
+            "db_id":        s.get("db_id"),
+            "title":        s.get("title", ""),
+            "story_points": s.get("story_points", 3),
+        }
+        for s in stories_state
+        if (s.get("db_id") or s.get("id")) is not None
+    ]
+
+    try:
+        new_result = redistribute_with_capacities(
+            distrib_result    = distrib_result,
+            stories_input     = stories_input,
+            priorities        = priorities_state,
+            target_capacities = body.capacities,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # Construire les nouveaux steps : story_distribution mis à jour,
+    # et les étapes aval reset à 'pending' (leurs résultats sont obsolètes)
+    new_steps = {
+        **steps,
+        "story_distribution": {
+            **distrib_step,
+            "result": new_result.model_dump(),
+        },
+    }
+    downstream = ["candidate_filtering", "matching", "velocity_feasibility"]
+    reset_keys = [k for k in downstream if (steps.get(k) or {}).get("status") == "done"]
+    for k in downstream:
+        new_steps[k] = {"status": "pending", "result": None}
+
+    new_staffing = {**staffing, "steps": new_steps}
+
+    # Met à jour le checkpoint LangGraph
+    await pm_graph.aupdate_state(
+        config,
+        {"staffing": new_staffing},
+        as_node="node_staffing",
+    )
+
+    # Met à jour le pipeline_state en DB
+    phases = await get_all_pipeline_states(project_id)
+    staffing_phase = next(
+        (p for p in phases if p.phase.value == PipelinePhaseEnum.PHASE_8_STAFFING.value),
+        None,
+    )
+    if staffing_phase:
+        from sqlalchemy.orm.attributes import flag_modified
+        async with AsyncSessionLocal() as session:
+            ps = (await session.execute(
+                select(PipelineState).where(PipelineState.id == staffing_phase.id)
+            )).scalar_one_or_none()
+            if ps:
+                current_ai = dict(ps.ai_output or {})
+                current_ai["staffing"] = new_staffing
+                ps.ai_output = current_ai
+                flag_modified(ps, "ai_output")
+                await session.commit()
+
+    print(
+        f"[pipeline] ✅ capacités sprint mises à jour projet {project_id} : "
+        f"{body.capacities} | reset aval = {reset_keys or 'aucun'}"
+    )
+    return {
+        "project_id":     project_id,
+        "updated":        True,
+        "capacities":     body.capacities,
+        "result":         new_result.model_dump(),
+        "downstream_reset": reset_keys,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/staffing/restart — Réinitialise et relance
+# ──────────────────────────────────────────────────────────────
+
+_STAFFING_EMPTY_STEPS = {
+    "profile_extraction":    {"status": "pending", "result": None},
+    "profile_normalization": {"status": "pending", "result": None},
+    "story_distribution":    {"status": "pending", "result": None},
+    "candidate_filtering":   {"status": "pending", "result": None},
+    "matching":              {"status": "pending", "result": None},
+    "velocity_feasibility":  {"status": "pending", "result": None},
+}
+
+_STAFFING_STEP_ORDER = [
+    "profile_extraction",
+    "profile_normalization",
+    "story_distribution",
+    "candidate_filtering",
+    "matching",
+    "velocity_feasibility",
+]
+
+
+@router.post("/{project_id}/staffing/restart")
+async def restart_staffing(
+    project_id:   int,
+    background:   BackgroundTasks,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Réinitialise et relance la phase Staffing depuis l'étape 1 (Profile Extraction).
+
+    Utile quand la phase est en statut VALIDATED ou REJECTED en base mais que
+    les sous-étapes internes sont en erreur (ex : timeout NVIDIA, rejet PM).
+
+    Actions :
+      1. Remet les steps staffing à all-pending dans le checkpoint LangGraph
+      2. Remet la phase à PENDING_VALIDATION en DB
+      3. Lance le graph en arrière-plan (protégé contre les doubles appels) :
+           node_validate → node_staffing (sous-étapes non done) → node_validate → interrupt
+    """
+    # Guard : refuser si une exécution graph est déjà en cours pour ce projet
+    if project_id in _pm_graph_running:
+        raise HTTPException(409, "Le staffing est déjà en cours d'exécution pour ce projet.")
+
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+
+    # Réinitialiser UNIQUEMENT les étapes à partir de la première non-terminée
+    # (l'étape en erreur ou en cours). Les étapes "done" précédentes sont
+    # préservées — leurs résultats restent valides et ne sont pas re-calculés.
+    existing_steps = dict(staffing.get("steps") or {})
+    for k, default in _STAFFING_EMPTY_STEPS.items():
+        if k not in existing_steps:
+            existing_steps[k] = default.copy()
+
+    reset_idx = next(
+        (
+            i for i, k in enumerate(_STAFFING_STEP_ORDER)
+            if (existing_steps.get(k) or {}).get("status") != "done"
+        ),
+        None,
+    )
+    new_steps = {**existing_steps}
+    if reset_idx is not None:
+        for k in _STAFFING_STEP_ORDER[reset_idx:]:
+            new_steps[k] = {"status": "pending", "result": None}
+        print(
+            f"[restart_staffing] reset à partir de '{_STAFFING_STEP_ORDER[reset_idx]}' "
+            f"({len(_STAFFING_STEP_ORDER) - reset_idx} step(s))"
+        )
+        # Si le reset embarque le step matching → vider la matérialisation DB.
+        if "matching" in _STAFFING_STEP_ORDER[reset_idx:]:
+            try:
+                from agents.pm.agents.staffing.steps.matching.repository import clear_assignments
+                cleared = await clear_assignments(project_id)
+                if cleared:
+                    print(f"[restart_staffing]   ↳ {cleared} affectation(s) supprimées en DB")
+            except Exception as clr_err:
+                print(f"[restart_staffing] ⚠️  clear assignments échoué : {clr_err}")
+    else:
+        print("[restart_staffing] toutes les étapes étaient 'done' — aucun reset nécessaire")
+
+    new_staffing = {**staffing, "steps": new_steps}
+
+    # Injecter le nouvel état : steps réinitialisés + validation_status=validated
+    # as_node="node_validate" → le graph reprend depuis le routeur de node_validate
+    await pm_graph.aupdate_state(
+        config,
+        {
+            "staffing":          new_staffing,
+            "current_phase":     "staffing",
+            "validation_status": "validated",
+            "human_feedback":    None,
+            "error":             None,
+        },
+        as_node="node_validate",
+    )
+
+    # Remettre le pipeline_state en PENDING_VALIDATION en DB
+    await upsert_pipeline_state(
+        project_id = project_id,
+        phase      = PipelinePhaseEnum.PHASE_8_STAFFING,
+        status     = PipelineStatusEnum.PENDING_VALIDATION,
+        ai_output  = {"staffing": new_staffing},
+    )
+
+    # Lancer l'exécution en arrière-plan pour éviter le timeout HTTP
+    async def _run():
+        _pm_graph_running.add(project_id)
+        try:
+            await pm_graph.ainvoke(None, config=config)
+        except Exception as e:
+            if "GraphInterrupt" not in type(e).__name__:
+                print(f"[restart_staffing] erreur graph projet {project_id} : {e}")
+        finally:
+            _pm_graph_running.discard(project_id)
+
+    background.add_task(_run)
+
+    print(f"[restart_staffing] Phase Staffing réinitialisée pour projet {project_id} — exécution en arrière-plan")
+    return {
+        "project_id": project_id,
+        "message":    "Phase Staffing réinitialisée. L'exécution reprend en arrière-plan.",
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/{project_id}/staffing/matching
+# Lecture détaillée du résultat du matching (depuis la table persistée
+# + sortie complète du state pour les vues détaillées). Utilisé par le
+# dashboard PM et l'écran de validation Step 5.
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/{project_id}/staffing/matching")
+async def get_staffing_matching(
+    project_id:   int,
+    current_user: dict = Depends(require_pm),
+):
+    """
+    Retourne :
+      - matching      : MatchingResult complet depuis le state LangGraph (peut être null)
+      - assignments   : liste des affectations persistées en DB (vue à plat pour dashboard)
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+    snapshot = await pm_graph.aget_state(config)
+
+    matching_result = None
+    if snapshot and snapshot.values:
+        staffing = snapshot.values.get("staffing") or {}
+        steps    = staffing.get("steps") or {}
+        m_step   = steps.get("matching") or {}
+        if m_step.get("status") == "done":
+            matching_result = m_step.get("result")
+
+    from agents.pm.agents.staffing.steps.matching.repository import get_assignments_by_project
+    assignments = await get_assignments_by_project(project_id)
+
+    return {
+        "project_id":  project_id,
+        "matching":    matching_result,
+        "assignments": assignments,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/staffing/matching/manual-decision
+# Le PM résout un manual_decision_required en choisissant l'employé.
+# Met à jour le state LangGraph + recalcule les statuts story/sprint
+# + met à jour la matérialisation DB.
+# ──────────────────────────────────────────────────────────────
+
+@router.patch("/{project_id}/staffing/matching/manual-decision")
+async def resolve_matching_manual_decision(
+    project_id:   int,
+    body:         ResolveManualDecisionRequest,
+    current_user: dict = Depends(require_pm),
+):
+    """
+    Le PM tranche un manual_decision_required :
+      - choisit un employee_id parmi candidate_options ;
+      - le ProfileAssignment passe à status="assigned" (warning_type conservé
+        si le candidat retenu était dans le groupe medium/weak — calculé d'après
+        son match_level enregistré dans options) ;
+      - candidate_options est vidé ;
+      - story_status & sprint_status sont recalculés ;
+      - la table staffing_assignments est resynchronisée.
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    # Guard : si un recalcul tourne en arrière-plan, l'état est en transition.
+    if project_id in _pm_graph_running:
+        raise HTTPException(
+            423,
+            "Un recalcul est en cours pour ce projet. "
+            "Veuillez rafraîchir la page et réessayer dans quelques secondes.",
+        )
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+    steps    = staffing.get("steps") or {}
+    m_step   = steps.get("matching") or {}
+    if m_step.get("status") != "done" or not m_step.get("result"):
+        raise HTTPException(400, "Le matching n'est pas encore terminé.")
+
+    matching = dict(m_step["result"])
+    sprint_key = f"sprint_{body.sprint_number}"
+    sprint = (matching.get("matching_by_sprint") or {}).get(sprint_key)
+    if not sprint:
+        raise HTTPException(404, f"Sprint {body.sprint_number} introuvable.")
+
+    # Trouver la story + le profil concerné
+    target_story  = next(
+        (s for s in sprint.get("story_assignments", []) if s.get("story_id") == body.story_id),
+        None,
+    )
+    if not target_story:
+        raise HTTPException(404, f"Story {body.story_id} introuvable dans sprint {body.sprint_number}.")
+
+    target_profile_assignment = next(
+        (a for a in target_story.get("assignments", [])
+         if a.get("required_profile") == body.required_profile),
+        None,
+    )
+    if not target_profile_assignment:
+        raise HTTPException(404, f"Profil '{body.required_profile}' introuvable pour la story {body.story_id}.")
+    current_status = target_profile_assignment.get("status")
+    if current_status != "manual_decision_required":
+        # Si déjà résolue avec le même employé → réponse idempotente (200)
+        if current_status in ("assigned", "assigned_with_warning") and \
+                target_profile_assignment.get("employee_id") == body.employee_id:
+            return {
+                "project_id":       project_id,
+                "sprint_number":    body.sprint_number,
+                "story_id":         body.story_id,
+                "required_profile": body.required_profile,
+                "employee_id":      body.employee_id,
+                "story_status":     next(
+                    (s.get("story_status") for s in sprint.get("story_assignments", [])
+                     if s.get("story_id") == body.story_id),
+                    "fully_assigned",
+                ),
+                "sprint_status":    sprint.get("sprint_status", ""),
+                "already_resolved": True,
+            }
+        raise HTTPException(
+            400,
+            f"Cette affectation a le statut '{current_status}' et ne peut plus être modifiée. "
+            "Rafraîchissez la page pour voir l'état actuel.",
+        )
+
+    options = target_profile_assignment.get("candidate_options", []) or []
+    chosen  = next((o for o in options if o.get("employee_id") == body.employee_id), None)
+    if not chosen:
+        raise HTTPException(400, f"Employee {body.employee_id} ne fait pas partie des candidate_options.")
+
+    # Calcul du nouveau status / warning selon le match_level du candidat retenu
+    from agents.pm.agents.staffing.steps.matching.selection import (
+        compute_sprint_status,
+        compute_story_status,
+        warning_for_match_level,
+    )
+    chosen_level = chosen.get("match_level", "good")
+    if chosen_level in ("medium", "weak"):
+        new_status  = "assigned_with_warning"
+        new_warning = warning_for_match_level(chosen_level)
+    else:
+        new_status  = "assigned"
+        new_warning = None
+
+    target_profile_assignment.update({
+        "employee_id":       chosen["employee_id"],
+        "employee_name":     chosen.get("name"),
+        "employee_seniority": chosen.get("seniority"),
+        "job_title":         chosen.get("job_title"),
+        "skill_score":       chosen.get("skill_score"),
+        "match_level":       chosen_level,
+        "matched_skills":    chosen.get("matched_skills",   []),
+        "inferred_matches":  chosen.get("inferred_matches", []),
+        "missing_skills":    chosen.get("missing_skills",   []),
+        "status":            new_status,
+        "warning_type":      new_warning,
+        "candidate_options": [],
+        "reason":            f"Décision PM : {chosen.get('name', '')} retenu parmi les candidats équivalents.",
+    })
+
+    # Recalcul des statuts story et sprint
+    target_story["story_status"] = compute_story_status([
+        a.get("status", "") for a in target_story.get("assignments", [])
+    ])
+    sprint["sprint_status"] = compute_sprint_status([
+        s.get("story_status", "") for s in sprint.get("story_assignments", [])
+    ])
+
+    # Reconstruire les vues filtrées issues / manual_decisions du sprint
+    sprint["issues"] = [
+        a for s in sprint.get("story_assignments", [])
+        for a in s.get("assignments", [])
+        if a.get("status") in ("missing_profile", "capacity_gap", "seniority_gap", "no_available_candidate")
+    ]
+    sprint["manual_decisions"] = [
+        a for s in sprint.get("story_assignments", [])
+        for a in s.get("assignments", [])
+        if a.get("status") == "manual_decision_required"
+    ]
+
+    # Recalcul global_summary (compteurs simples)
+    summary = matching.get("global_summary") or {}
+    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
+    summary["fully_staffed_sprints"]     = sum(1 for s in sprints_iter if s.get("sprint_status") == "fully_staffed")
+    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
+    summary["partially_staffed_sprints"] = sum(1 for s in sprints_iter if s.get("sprint_status") == "partially_staffed")
+    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
+    summary["manual_decision_sprints"]   = sum(1 for s in sprints_iter if s.get("sprint_status") == "manual_decision_required")
+    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
+    summary["not_staffed_sprints"]       = sum(1 for s in sprints_iter if s.get("sprint_status") == "not_staffed")
+    matching["global_summary"] = summary
+
+    # Mise à jour state LangGraph
+    new_steps    = {**steps, "matching": {**m_step, "result": matching}}
+    new_staffing = {**staffing, "steps": new_steps}
+    await pm_graph.aupdate_state(config, {"staffing": new_staffing}, as_node="node_staffing")
+
+    # Mise à jour DB pipeline_state. Non bloquant : la source de vérité est le
+    # state LangGraph mis à jour ci-dessus. Cette table est une matérialisation
+    # pour les vues/lectures.
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+        async with AsyncSessionLocal() as session:
+            ps = (await session.execute(
+                select(PipelineState).where(
+                    PipelineState.project_id == project_id,
+                    PipelineState.phase == PipelinePhaseEnum.PHASE_8_STAFFING,
+                )
+            )).scalar_one_or_none()
+            if ps:
+                current_ai = dict(ps.ai_output or {})
+                current_ai["staffing"] = new_staffing
+                ps.ai_output = current_ai
+                flag_modified(ps, "ai_output")
+                await session.commit()
+    except Exception as state_err:
+        import traceback
+        print(
+            f"[matching] ⚠️  mise à jour pipeline_state après manual decision échouée — "
+            f"{type(state_err).__name__}: {state_err}"
+        )
+        traceback.print_exc()
+
+    # Resynchroniser la matérialisation DB. Non bloquant : le state LangGraph
+    # est la source de vérité, la table staffing_assignments sert au dashboard.
+    # Si la sync échoue, l'utilisateur voit quand même sa décision appliquée.
+    try:
+        from agents.pm.agents.staffing.steps.matching.repository import persist_assignments
+        await persist_assignments(project_id, matching)
+    except Exception as persist_err:
+        import traceback
+        print(
+            f"[matching] ⚠️  persistance DB après manual decision échouée — "
+            f"{type(persist_err).__name__}: {persist_err}"
+        )
+        traceback.print_exc()
+
+    print(
+        f"[matching] ✅ manual decision résolue projet={project_id} "
+        f"sprint={body.sprint_number} story={body.story_id} "
+        f"profile='{body.required_profile}' → employee={body.employee_id}"
+    )
+    return {
+        "project_id":       project_id,
+        "sprint_number":    body.sprint_number,
+        "story_id":         body.story_id,
+        "required_profile": body.required_profile,
+        "employee_id":      body.employee_id,
+        "story_status":     target_story["story_status"],
+        "sprint_status":    sprint["sprint_status"],
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# PATCH /pipeline/{project_id}/staffing/matching/change-assignment
+# Permet au PM de changer l'employé affecté à un (sprint, story, profile)
+# parmi les alternative_candidates calculés par le matching automatique.
+# Recompute les capacités du sprint impacté et le recommended_team.
+# ──────────────────────────────────────────────────────────────
+
+@router.patch("/{project_id}/staffing/matching/change-assignment")
+async def change_matching_assignment(
+    project_id:   int,
+    body:         ChangeAssignmentRequest,
+    current_user: dict = Depends(require_pm),
+):
+    """
+    Le PM remplace l'employé sur une affectation existante :
+      - le candidat doit faire partie des alternative_candidates ;
+      - la capacité du sprint est recalculée à partir de toutes les
+        affectations du sprint (l'employé sortant récupère ses SP,
+        l'entrant en consomme) ;
+      - story_status / sprint_status sont rafraîchis ;
+      - la table staffing_assignments est resynchronisée.
+    """
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    if project_id in _pm_graph_running:
+        raise HTTPException(
+            423,
+            "Un recalcul est en cours pour ce projet. "
+            "Veuillez rafraîchir la page et réessayer dans quelques secondes.",
+        )
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+    steps    = staffing.get("steps") or {}
+    m_step   = steps.get("matching") or {}
+    if m_step.get("status") != "done" or not m_step.get("result"):
+        raise HTTPException(400, "Le matching n'est pas encore terminé.")
+
+    matching = dict(m_step["result"])
+    sprint_key = f"sprint_{body.sprint_number}"
+    sprint = (matching.get("matching_by_sprint") or {}).get(sprint_key)
+    if not sprint:
+        raise HTTPException(404, f"Sprint {body.sprint_number} introuvable.")
+
+    target_story = next(
+        (s for s in sprint.get("story_assignments", []) if s.get("story_id") == body.story_id),
+        None,
+    )
+    if not target_story:
+        raise HTTPException(404, f"Story {body.story_id} introuvable dans sprint {body.sprint_number}.")
+
+    target_assignment = next(
+        (a for a in target_story.get("assignments", [])
+         if a.get("required_profile") == body.required_profile),
+        None,
+    )
+    if not target_assignment:
+        raise HTTPException(404, f"Profil '{body.required_profile}' introuvable pour la story {body.story_id}.")
+
+    # Le PM ne peut changer qu'une affectation existante (pas un missing_profile).
+    if target_assignment.get("status") not in ("assigned", "assigned_with_warning"):
+        raise HTTPException(
+            400,
+            f"Cette affectation a le statut '{target_assignment.get('status')}' — "
+            "elle ne peut pas être changée. Utilise 'Signaler un besoin RH' à la place.",
+        )
+
+    # Vérifier que le nouvel employé fait partie des alternatives proposées
+    alternatives = target_assignment.get("alternative_candidates", []) or []
+    new_candidate = next(
+        (a for a in alternatives if a.get("employee_id") == body.new_employee_id),
+        None,
+    )
+    if not new_candidate:
+        raise HTTPException(
+            400,
+            f"L'employé {body.new_employee_id} ne fait pas partie des candidats alternatifs "
+            "pour ce profil.",
+        )
+
+    # Idempotence : si on choisit déjà l'employé courant
+    if target_assignment.get("employee_id") == body.new_employee_id:
+        return {
+            "project_id":       project_id,
+            "sprint_number":    body.sprint_number,
+            "story_id":         body.story_id,
+            "required_profile": body.required_profile,
+            "employee_id":      body.new_employee_id,
+            "already_assigned": True,
+            "story_status":     target_story.get("story_status", ""),
+            "sprint_status":    sprint.get("sprint_status", ""),
+        }
+
+    # Calcul du nouveau status / warning selon le match_level du candidat
+    from agents.pm.agents.staffing.steps.matching.selection import (
+        compute_sprint_status,
+        compute_story_status,
+        warning_for_match_level,
+        CAPACITY_BY_SENIORITY,
+    )
+    new_match_level = new_candidate.get("match_level", "good")
+    if new_match_level in ("medium", "weak"):
+        new_status  = "assigned_with_warning"
+        new_warning = warning_for_match_level(new_match_level)
+    else:
+        new_status  = "assigned"
+        new_warning = None
+
+    # Garder seniority_downgrade_from si dégradation initiale
+    downgrade = target_assignment.get("seniority_downgrade_from")
+    if downgrade and new_status == "assigned":
+        new_status = "assigned_with_warning"
+
+    # Mise à jour de l'affectation
+    target_assignment.update({
+        "employee_id":         body.new_employee_id,
+        "employee_name":       new_candidate.get("name"),
+        "employee_seniority":  new_candidate.get("seniority"),
+        "job_title":           new_candidate.get("job_title"),
+        "skill_score":         new_candidate.get("skill_score"),
+        "match_level":         new_match_level,
+        "matched_skills":      new_candidate.get("matched_skills",   []),
+        "inferred_matches":    new_candidate.get("inferred_matches", []),
+        "missing_skills":      new_candidate.get("missing_skills",   []),
+        "status":              new_status,
+        "warning_type":        new_warning,
+        "reason":              f"Affectation modifiée par le PM : {new_candidate.get('name', '')}.",
+    })
+
+    # Recalcul des capacités et du recommended_team du sprint à partir des
+    # affectations actuelles de ce sprint.
+    capacity_state: dict[int, dict] = {}
+    for st in sprint.get("story_assignments", []):
+        for a in st.get("assignments", []):
+            eid = a.get("employee_id")
+            if eid is None:
+                continue
+            if eid not in capacity_state:
+                seniority = a.get("employee_seniority", "MID") or "MID"
+                cap = CAPACITY_BY_SENIORITY.get(seniority, 8)
+                capacity_state[eid] = {
+                    "employee_id":           eid,
+                    "name":                  a.get("employee_name", ""),
+                    "job_title":             a.get("job_title", ""),
+                    "seniority":             seniority,
+                    "capacity_sp":           cap,
+                    "assigned_sp":           0.0,
+                    "remaining_capacity_sp": float(cap),
+                    "stories_handled":       0,
+                }
+            sp = float(a.get("allocated_sp", 0.0) or 0.0)
+            capacity_state[eid]["assigned_sp"]           = round(capacity_state[eid]["assigned_sp"] + sp, 4)
+            capacity_state[eid]["remaining_capacity_sp"] = round(capacity_state[eid]["remaining_capacity_sp"] - sp, 4)
+            if a.get("status") in ("assigned", "assigned_with_warning"):
+                capacity_state[eid]["stories_handled"] += 1
+
+    # Reconstruction du recommended_team
+    sprint["recommended_team"] = [
+        {
+            "employee_id":           s["employee_id"],
+            "name":                  s["name"],
+            "job_title":             s["job_title"],
+            "seniority":             s["seniority"],
+            "capacity_sp":           s["capacity_sp"],
+            "assigned_sp":           s["assigned_sp"],
+            "remaining_capacity_sp": s["remaining_capacity_sp"],
+            "stories_handled":       s["stories_handled"],
+        }
+        for s in capacity_state.values()
+        if s["assigned_sp"] > 0
+    ]
+
+    # Recalcul story_status et sprint_status
+    target_story["story_status"] = compute_story_status([
+        a.get("status", "") for a in target_story.get("assignments", [])
+    ])
+    sprint["sprint_status"] = compute_sprint_status([
+        s.get("story_status", "") for s in sprint.get("story_assignments", [])
+    ])
+
+    # Reconstruction des vues filtrées du sprint
+    sprint["issues"] = [
+        a for s in sprint.get("story_assignments", [])
+        for a in s.get("assignments", [])
+        if a.get("status") in ("missing_profile", "capacity_gap", "seniority_gap", "no_available_candidate")
+    ]
+    sprint["manual_decisions"] = [
+        a for s in sprint.get("story_assignments", [])
+        for a in s.get("assignments", [])
+        if a.get("status") == "manual_decision_required"
+    ]
+
+    # Recalcul global_summary (compteurs)
+    summary = matching.get("global_summary") or {}
+    sprints_iter = list((matching.get("matching_by_sprint") or {}).values())
+    summary["fully_staffed_sprints"]     = sum(1 for s in sprints_iter if s.get("sprint_status") == "fully_staffed")
+    summary["partially_staffed_sprints"] = sum(1 for s in sprints_iter if s.get("sprint_status") == "partially_staffed")
+    summary["manual_decision_sprints"]   = sum(1 for s in sprints_iter if s.get("sprint_status") == "manual_decision_required")
+    summary["not_staffed_sprints"]       = sum(1 for s in sprints_iter if s.get("sprint_status") == "not_staffed")
+    matching["global_summary"] = summary
+
+    # Mise à jour state LangGraph
+    new_steps    = {**steps, "matching": {**m_step, "result": matching}}
+    new_staffing = {**staffing, "steps": new_steps}
+    await pm_graph.aupdate_state(config, {"staffing": new_staffing}, as_node="node_staffing")
+
+    # Mise à jour DB pipeline_state (non bloquant)
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+        async with AsyncSessionLocal() as session:
+            ps = (await session.execute(
+                select(PipelineState).where(
+                    PipelineState.project_id == project_id,
+                    PipelineState.phase == PipelinePhaseEnum.PHASE_8_STAFFING,
+                )
+            )).scalar_one_or_none()
+            if ps:
+                current_ai = dict(ps.ai_output or {})
+                current_ai["staffing"] = new_staffing
+                ps.ai_output = current_ai
+                flag_modified(ps, "ai_output")
+                await session.commit()
+    except Exception as state_err:
+        import traceback
+        print(f"[matching] ⚠️  pipeline_state update échouée — {type(state_err).__name__}: {state_err}")
+        traceback.print_exc()
+
+    # Resynchroniser staffing_assignments (non bloquant)
+    try:
+        from agents.pm.agents.staffing.steps.matching.repository import persist_assignments
+        await persist_assignments(project_id, matching)
+    except Exception as persist_err:
+        import traceback
+        print(f"[matching] ⚠️  persistance DB échouée — {type(persist_err).__name__}: {persist_err}")
+        traceback.print_exc()
+
+    print(
+        f"[matching] ✅ change assignment projet={project_id} "
+        f"sprint={body.sprint_number} story={body.story_id} "
+        f"profile='{body.required_profile}' → employee={body.new_employee_id}"
+    )
+    return {
+        "project_id":       project_id,
+        "sprint_number":    body.sprint_number,
+        "story_id":         body.story_id,
+        "required_profile": body.required_profile,
+        "employee_id":      body.new_employee_id,
+        "story_status":     target_story["story_status"],
+        "sprint_status":    sprint["sprint_status"],
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/staffing/recruitment-request
+# Envoi d'une demande de recrutement à l'équipe RH (email).
+# Le PM compose le contenu (To, CC, sujet, corps) côté frontend dans une UI
+# type éditeur d'email. Cet endpoint envoie l'email + met à jour la table
+# staffing_recruitment_needs (statut "open" + reason enrichie).
+# ──────────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/staffing/recruitment-request")
+async def send_recruitment_request(
+    project_id:   int,
+    body:         RecruitmentRequestRequest,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Le PM signale un besoin RH non couvert en interne :
+      - Email à l'équipe RH (et CC) avec un template HTML dédié.
+      - Marque le besoin comme "open" dans staffing_recruitment_needs (idempotent).
+
+    Côté frontend, le contenu de l'email a été pré-rempli puis ajusté par le PM
+    avant l'envoi (sujet, corps, To, CC).
+    """
+    if not body.to:
+        raise HTTPException(400, "Au moins un destinataire est requis dans le champ 'À'.")
+    if not body.subject.strip():
+        raise HTTPException(400, "Le sujet ne peut pas être vide.")
+    if not body.body.strip():
+        raise HTTPException(400, "Le corps de l'email ne peut pas être vide.")
+    if not body.profile.strip():
+        raise HTTPException(400, "Le profil concerné est requis.")
+
+    # Récupérer le nom du projet
+    project = (await db.execute(
+        select(Project).where(Project.id == project_id)
+    )).scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, f"Projet {project_id} introuvable.")
+
+    project_name = project.name or f"Projet #{project_id}"
+
+    # Composer le label du sprint
+    sprint_label = "—"
+    if body.sprint_number:
+        sprint_label = f"Sprint {body.sprint_number}"
+        if body.sprint_start and body.sprint_end:
+            sprint_label += f" ({body.sprint_start} → {body.sprint_end})"
+
+    pm_name = current_user.get("name") or current_user.get("email") or None
+
+    # Envoi : 1 email par destinataire (le SMTP gère le CC une seule fois,
+    # donc on envoie au premier "to" + CC = reste des destinataires + body.cc).
+    primary_to = body.to[0]
+    extra_recipients = body.to[1:] + (body.cc or [])
+
+    from utils.email import send_recruitment_request_email
+    try:
+        send_recruitment_request_email(
+            to_email     = primary_to,
+            subject      = body.subject,
+            body         = body.body,
+            project_name = project_name,
+            profile      = body.profile,
+            seniority    = body.required_level or "—",
+            sprint_label = sprint_label,
+            skills       = body.required_skills or [],
+            pm_name      = pm_name,
+            cc_emails    = extra_recipients or None,
+        )
+    except Exception as e:
+        print(f"[recruitment-request] ❌ envoi email échoué : {e}")
+        raise HTTPException(502, f"Échec de l'envoi de l'email : {e}")
+
+    # Mise à jour staffing_recruitment_needs (idempotent)
+    try:
+        from app.database.models.pm.staffing_recruitment_need import StaffingRecruitmentNeed
+        from sqlalchemy import select as sa_select
+        async with AsyncSessionLocal() as session:
+            row = (await session.execute(
+                sa_select(StaffingRecruitmentNeed).where(
+                    StaffingRecruitmentNeed.project_id       == project_id,
+                    StaffingRecruitmentNeed.required_profile == body.profile,
+                )
+            )).scalar_one_or_none()
+            enriched_reason = (
+                f"Demande RH envoyée par {pm_name or 'le PM'} pour {sprint_label}. "
+                + (body.body[:240] + "…" if len(body.body) > 240 else body.body)
+            )
+            if row:
+                row.status = "open"
+                row.reason = enriched_reason
+            else:
+                session.add(StaffingRecruitmentNeed(
+                    project_id           = project_id,
+                    required_profile     = body.profile,
+                    suggested_job_titles = [],
+                    reason               = enriched_reason,
+                    status               = "open",
+                ))
+            await session.commit()
+    except Exception as persist_err:
+        # Non bloquant — l'email a été envoyé.
+        print(f"[recruitment-request] ⚠️  upsert staffing_recruitment_needs échoué : {persist_err}")
+
+    print(
+        f"[recruitment-request] ✅ projet={project_id} profil='{body.profile}' "
+        f"→ {primary_to} (cc: {len(extra_recipients)}) — {sprint_label}"
+    )
+    return {
+        "project_id":  project_id,
+        "profile":     body.profile,
+        "to":          body.to,
+        "cc":          body.cc or [],
+        "sprint":      sprint_label,
+        "sent":        True,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# POST /pipeline/{project_id}/staffing/matching/rerun
+# Relance UNIQUEMENT le matching (Step 5) sans toucher aux étapes amont.
+# Utile quand le PM a fait recruter un nouveau profil et veut voir si le
+# matching est désormais résolu sans re-tourner toute la phase.
+# ──────────────────────────────────────────────────────────────
+
+@router.post("/{project_id}/staffing/matching/rerun")
+async def rerun_matching(
+    project_id:   int,
+    background:   BackgroundTasks,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Relance le step Matching (et velocity_feasibility en aval) sans réinitialiser
+    profile_extraction / normalization / story_distribution / candidate_filtering.
+
+    Utile après ajout RH d'un nouveau profil en base : le PM clique pour voir
+    si le matching résout les manques précédents.
+
+    Pré-condition : candidate_filtering doit être à status='done'.
+    Sinon : 400.
+    """
+    if project_id in _pm_graph_running:
+        raise HTTPException(409, "Le staffing est déjà en cours d'exécution pour ce projet.")
+
+    pm_graph = get_pm_graph()
+    if pm_graph is None:
+        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
+
+    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
+    snapshot = await pm_graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
+
+    current_state: dict = dict(snapshot.values)
+    staffing = current_state.get("staffing") or {}
+    steps    = staffing.get("steps") or {}
+
+    if (steps.get("candidate_filtering") or {}).get("status") != "done":
+        raise HTTPException(
+            400,
+            "Le filtrage des candidats doit être terminé avant de relancer le matching.",
+        )
+
+    # Reset matching + velocity_feasibility uniquement
+    new_steps = {
+        **steps,
+        "matching":             {"status": "pending", "result": None},
+        "velocity_feasibility": {"status": "pending", "result": None},
+    }
+    new_staffing = {**staffing, "steps": new_steps}
+
+    # Vider la matérialisation DB (idempotent)
+    try:
+        from agents.pm.agents.staffing.steps.matching.repository import clear_assignments
+        cleared = await clear_assignments(project_id)
+        if cleared:
+            print(f"[rerun_matching]   ↳ {cleared} affectation(s) supprimées en DB")
+    except Exception as clr_err:
+        print(f"[rerun_matching] ⚠️  clear assignments échoué : {clr_err}")
+
+    # Injecter le nouvel état + repasser en "validated" pour retourner dans node_validate
+    # qui re-routera vers node_staffing (matching pending) → recalcul.
+    await pm_graph.aupdate_state(
+        config,
+        {
+            "staffing":          new_staffing,
+            "current_phase":     "staffing",
+            "validation_status": "validated",
+            "human_feedback":    None,
+            "error":             None,
+        },
+        as_node="node_validate",
+    )
+
+    # Repasser le pipeline_state en PENDING_VALIDATION
+    await upsert_pipeline_state(
+        project_id = project_id,
+        phase      = PipelinePhaseEnum.PHASE_8_STAFFING,
+        status     = PipelineStatusEnum.PENDING_VALIDATION,
+        ai_output  = {"staffing": new_staffing},
+    )
+
+    async def _run():
+        _pm_graph_running.add(project_id)
+        try:
+            await pm_graph.ainvoke(None, config=config)
+        except Exception as e:
+            if "GraphInterrupt" not in type(e).__name__:
+                print(f"[rerun_matching] erreur graph projet {project_id} : {e}")
+        finally:
+            _pm_graph_running.discard(project_id)
+
+    background.add_task(_run)
+
+    print(f"[rerun_matching] ✅ matching relancé pour projet {project_id} — exécution en arrière-plan")
+    return {
+        "project_id": project_id,
+        "message":    "Matching relancé. L'analyse reprend en arrière-plan.",
+    }
+
+
+async def _sync_recruitment_needs(
+    project_id:   int,
+    pm_decisions: dict[str, str],
+    norm_result:  dict,
+) -> None:
+    """
+    Synchronise la table staffing_recruitment_needs selon les décisions PM :
+    - "recruit" → créer ou remettre à "open"
+    - "accept"  → passer à "cancelled" si un besoin ouvert existe
+    """
+    from app.database.models.pm.staffing_recruitment_need import StaffingRecruitmentNeed
+    from sqlalchemy import select as sa_select
+
+    # Construire un index profil → mapping pour récupérer les suggested_job_titles et reason
+    mappings_index: dict[str, dict] = {
+        m["required_profile"]: m
+        for m in norm_result.get("profile_mappings", [])
+        if isinstance(m, dict) and "required_profile" in m
+    }
+
+    async with AsyncSessionLocal() as session:
+        for profile, decision in pm_decisions.items():
+            row = (await session.execute(
+                sa_select(StaffingRecruitmentNeed).where(
+                    StaffingRecruitmentNeed.project_id       == project_id,
+                    StaffingRecruitmentNeed.required_profile == profile,
+                )
+            )).scalar_one_or_none()
+
+            mapping = mappings_index.get(profile, {})
+            suggested = mapping.get("matched_job_titles", [])
+            reason    = mapping.get("reason", "") or f"Profil '{profile}' non couvert en interne."
+
+            if decision == "recruit":
+                if row:
+                    row.status               = "open"
+                    row.suggested_job_titles = suggested
+                    row.reason               = reason
+                else:
+                    session.add(StaffingRecruitmentNeed(
+                        project_id           = project_id,
+                        required_profile     = profile,
+                        suggested_job_titles = suggested,
+                        reason               = reason,
+                        status               = "open",
+                    ))
+            elif decision == "accept" and row and row.status == "open":
+                row.status = "cancelled"
+
+        await session.commit()
+    print(f"[pipeline] recruitment_needs synchronisés pour projet {project_id}")
 
 
 # ──────────────────────────────────────────────────────────────

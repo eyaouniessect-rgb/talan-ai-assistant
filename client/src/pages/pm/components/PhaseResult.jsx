@@ -8,6 +8,7 @@ import { updateStory, deleteStory, getProjectStories, getProjectEpics, addEpic, 
 import StoryDepsSection from "./StoryDepsSection";
 import CpmSection from "./CpmSection";
 import PriorisationSection from "./PriorisationSection";
+import StaffingSection from "./StaffingSection";
 
 // ── Rendu du rapport de sécurité ──────────────────────────────
 const SEVERITY_STYLE = {
@@ -1092,7 +1093,7 @@ function EpicsSection({ aiOutput, projectId, onRefresh }) {
 }
 
 
-export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, onRefresh, criticalPath = [], onRerunPrioritization }) {
+export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, onRefresh, criticalPath = [], onRerunPrioritization, project }) {
   if (!aiOutput && phaseId !== "extract")
     return <p className="text-slate-400 text-sm italic">Aucun résultat disponible pour cette phase.</p>;
   if (!aiOutput) aiOutput = {};
@@ -1302,6 +1303,10 @@ export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, 
 
   if (phaseId === "prioritization") {
     return <PriorisationSection aiOutput={aiOutput} projectId={projectId} criticalPath={criticalPath} onRerun={onRerunPrioritization} />;
+  }
+
+  if (phaseId === "staffing") {
+    return <StaffingSection aiOutput={aiOutput} projectId={projectId} project={project} onRefresh={onRefresh} />;
   }
 
   return (
