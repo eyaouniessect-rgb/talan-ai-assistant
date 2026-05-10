@@ -9,8 +9,8 @@
 #       → story_deps → validate → jira_sync
 #       → prioritization → validate → jira_sync
 #       → cpm → validate → jira_sync
-#       → sprints → validate → jira_sync
 #       → staffing → validate → jira_sync
+#       → sprints → validate → jira_sync
 #       → monitoring → END (pas de validation)
 #
 # Persistance :
@@ -61,7 +61,7 @@ pm_graph = None
 _PHASE_ORDER = [
     "extract", "epics", "stories",
     "story_deps", "cpm", "prioritization",
-    "sprints", "staffing", "monitoring",
+    "staffing", "sprints", "monitoring",
 ]
 
 _PHASE_TO_NODE: dict[str, str] = {
@@ -90,9 +90,21 @@ def _next_phase(current: str) -> str:
 def _route_after_validate(state: PMPipelineState) -> str:
     """
     - validated → jira_sync → phase suivante
+      Exception staffing : si des sous-étapes sont encore pending/error,
+      on re-route vers node_staffing pour continuer le pipeline interne.
     - rejected  → retour à la phase courante (relance avec human_feedback)
     """
     if state.get("validation_status") == "validated":
+        if state.get("current_phase") == "staffing":
+            staffing = state.get("staffing") or {}
+            steps    = staffing.get("steps") or {}
+            all_done = all(
+                isinstance(s, dict) and s.get("status") == "done"
+                for s in steps.values()
+            )
+            if not all_done:
+                print("[graph] staffing : sous-étapes non terminées → retour node_staffing")
+                return "node_staffing"
         return "jira_sync"
     phase = state.get("current_phase", "")
     return _PHASE_TO_NODE.get(phase, END)

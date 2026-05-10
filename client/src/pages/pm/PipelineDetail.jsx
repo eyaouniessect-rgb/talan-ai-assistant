@@ -110,7 +110,18 @@ export default function PipelineDetail() {
     const hasRunning = project.phases.some(
       (p) => p.status === "pending_ai" || p.status === "in_progress",
     );
-    if (hasRunning) {
+    // Staffing transitoire : phase validée mais des sous-étapes encore pending
+    // (le graph tourne en arrière-plan entre deux interrupts).
+    const staffingInTransit = project.phases.some((p) => {
+      const key = PHASE_KEY_MAP[p.phase] ?? p.phase;
+      if (key !== "staffing") return false;
+      if (p.status !== "validated") return false;
+      const steps = p.ai_output?.staffing?.steps ?? {};
+      const stepValues = Object.values(steps);
+      if (stepValues.length === 0) return false;
+      return stepValues.some((s) => s?.status === "pending" || s?.status === "running");
+    });
+    if (hasRunning || staffingInTransit) {
       pollRef.current = setInterval(() => fetchData(true), 4000);
     } else {
       clearInterval(pollRef.current);
@@ -260,6 +271,27 @@ export default function PipelineDetail() {
   const activePhaseDb = phaseMap[activePhase];
   const isPendingHuman =
     activePhase && phaseMap[activePhase]?.status === "pending_validation";
+
+  // Staffing : si une sous-étape est en erreur, on masque la ValidationCard
+  // pour forcer l'utilisateur à passer par "Relancer le staffing" (évite
+  // les appels concurrents au graph).
+  const staffingHasError = (() => {
+    if (activePhase !== "staffing") return false;
+    const steps = activePhaseDb?.ai_output?.staffing?.steps ?? {};
+    return Object.values(steps).some((s) => s?.status === "error");
+  })();
+
+  // Staffing : phase validée mais sous-étapes encore en pending → le graph
+  // tourne en arrière-plan (entre deux interrupts). On masque la ValidationCard
+  // et on affiche un indicateur de progression.
+  const staffingProcessingInBackground = (() => {
+    if (activePhase !== "staffing") return false;
+    if (activePhaseDb?.status !== "validated") return false;
+    const steps = activePhaseDb?.ai_output?.staffing?.steps ?? {};
+    const stepValues = Object.values(steps);
+    if (stepValues.length === 0) return false;
+    return stepValues.some((s) => s?.status === "pending" || s?.status === "running");
+  })();
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
@@ -461,6 +493,7 @@ export default function PipelineDetail() {
                   phaseId={activePhase}
                   aiOutput={activePhaseDb?.ai_output}
                   projectId={id}
+                  project={project}
                   onRefresh={() => fetchData(true)}
                   onContinue={
                     activePhase === "stories" ? handleContinueStories : undefined
@@ -514,7 +547,19 @@ export default function PipelineDetail() {
               currentPhase={processingState.phase}
               approved={processingState.approved}
             />
-          ) : isPendingHuman ? (
+          ) : staffingProcessingInBackground ? (
+            <div className="card p-4 border border-blue-200 bg-blue-50 flex items-center gap-3">
+              <Loader size={20} className="text-blue-500 animate-spin shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-blue-800">
+                  Étape de staffing en cours…
+                </p>
+                <p className="text-xs text-blue-600">
+                  L'IA traite la sous-étape suivante. Rafraîchissement automatique toutes les 4 secondes.
+                </p>
+              </div>
+            </div>
+          ) : isPendingHuman && !staffingHasError ? (
             <ValidationCard
               phase={activePhase}
               aiOutput={activePhaseDb?.ai_output}

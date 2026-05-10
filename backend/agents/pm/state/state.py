@@ -143,7 +143,26 @@ class PMPipelineState(TypedDict):
 
 
     # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 8 — Sprint Planning                          ║
+    # ║  PHASE 8 — Staffing                                 ║
+    # ╚══════════════════════════════════════════════════════╝
+
+    staffing: dict
+    # {
+    #   "steps": {
+    #     "profile_extraction":  { "status": str, "result": dict },
+    #     "candidate_filtering": { "status": str, "result": dict },
+    #     "matching":            { "status": str, "result": dict },
+    #     "velocity_feasibility":{ "status": str, "result": dict },
+    #   },
+    #   "recommended_team": list[dict],
+    #   "assignments":      list[dict],
+    #   "velocity":         dict,
+    #   "recommendations":  list[str],
+    # }
+
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  PHASE 9 — Sprint Planning                          ║
     # ╚══════════════════════════════════════════════════════╝
 
     sprints: list[dict]
@@ -151,14 +170,6 @@ class PMPipelineState(TypedDict):
     #   "name": str, "goal": str, "start_date": str, "end_date": str,
     #   "story_ids": list[int]
     # }
-
-
-    # ╔══════════════════════════════════════════════════════╗
-    # ║  PHASE 9 — Staffing                                 ║
-    # ╚══════════════════════════════════════════════════════╝
-
-    staffing: dict
-    # { story_id (int) → employee_id (int) }
 
 
     # ╔══════════════════════════════════════════════════════╗

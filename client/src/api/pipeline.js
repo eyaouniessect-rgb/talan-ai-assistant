@@ -84,6 +84,46 @@ export const addStory = (projectId, body) =>
 export const rerunPrioritization = (projectId) =>
   api.post(`/pipeline/${projectId}/prioritization/rerun`).then(r => r.data)
 
+// ── Staffing — mise à jour manuelle des profils extraits ──────
+
+export const updateStaffingProfiles = (projectId, storiesProfiles) =>
+  api.patch(`/pipeline/${projectId}/staffing/profiles`, { stories_profiles: storiesProfiles }).then(r => r.data)
+
+export const getStaffingAvailableProfiles = () =>
+  api.get('/pipeline/staffing/available-profiles').then(r => r.data.profiles)
+
+export const getStaffingAvailableSkills = () =>
+  api.get('/pipeline/staffing/available-skills').then(r => r.data.skills)
+
+export const updateNormalizationDecisions = (projectId, pmDecisions) =>
+  api.patch(`/pipeline/${projectId}/staffing/normalization-decisions`, { pm_decisions: pmDecisions }).then(r => r.data)
+
+export const restartStaffing = (projectId) =>
+  api.post(`/pipeline/${projectId}/staffing/restart`).then(r => r.data)
+
+export const updateSprintCapacities = (projectId, capacities) =>
+  api.patch(`/pipeline/${projectId}/staffing/sprint-capacities`, { capacities }).then(r => r.data)
+
+// ── Staffing — Step 5 Matching ────────────────────────────────
+
+export const getStaffingMatching = (projectId) =>
+  api.get(`/pipeline/${projectId}/staffing/matching`).then(r => r.data)
+
+export const resolveMatchingManualDecision = (projectId, body) =>
+  api.patch(`/pipeline/${projectId}/staffing/matching/manual-decision`, body).then(r => r.data)
+
+export const changeMatchingAssignment = (projectId, body) =>
+  api.patch(`/pipeline/${projectId}/staffing/matching/change-assignment`, body).then(r => r.data)
+
+export const sendRecruitmentRequest = (projectId, body) =>
+  api.post(`/pipeline/${projectId}/staffing/recruitment-request`, body).then(r => r.data)
+
+export const getHrContacts = () =>
+  api.get('/pipeline/staffing/hr-contacts').then(r => r.data.contacts)
+
+export const rerunMatching = (projectId) =>
+  api.post(`/pipeline/${projectId}/staffing/matching/rerun`).then(r => r.data)
+
 // ── Story Dependencies ────────────────────────────────────────
 
 export const getStoryDependencies = (projectId) =>

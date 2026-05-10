@@ -11,3 +11,5 @@ from .epic import Epic
 from .user_story import UserStory
 from .story_dependency import StoryDependency
 from .sprint import Sprint
+from .staffing_recruitment_need import StaffingRecruitmentNeed
+from .staffing_assignment       import StaffingAssignment

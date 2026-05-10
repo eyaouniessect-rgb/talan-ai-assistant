@@ -358,6 +358,74 @@ def send_leave_rejected_email(
     _send(to_email, subject, plain, html, cc_emails)
 
 
+def send_recruitment_request_email(
+    to_email:       str,
+    subject:        str,
+    body:           str,
+    project_name:   str,
+    profile:        str,
+    seniority:      str,
+    sprint_label:   str,
+    skills:         list[str],
+    pm_name:        str | None = None,
+    cc_emails:      list[str] | None = None,
+) -> None:
+    """
+    Envoie une demande de recrutement à l'équipe RH.
+
+    Le corps `body` est composé côté frontend (le PM peut l'éditer avant envoi).
+    Les autres champs alimentent un encart "À retenir" en HTML pour faciliter
+    la lecture rapide côté RH.
+    """
+    cc_emails = cc_emails or []
+
+    skills_html = "".join(
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:12px;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:600;margin:2px;">{s}</span>'
+        for s in (skills or [])
+    ) or '<span style="color:#94a3b8;font-style:italic;font-size:12px;">Aucune précisée</span>'
+
+    body_html_lines = "".join(
+        f'<p style="margin:0 0 8px;font-size:14px;color:#334155;line-height:1.55;">{line if line.strip() else "&nbsp;"}</p>'
+        for line in body.split("\n")
+    )
+
+    pm_signature = (
+        f'<p style="margin:14px 0 0;font-size:12px;color:#64748b;">'
+        f'Demande émise par <strong>{pm_name}</strong>.</p>'
+    ) if pm_name else ""
+
+    html = _base_html(
+        header_color="#7c3aed",
+        header_icon="🧑‍💼",
+        header_title="Besoin de recrutement",
+        content_html=f"""
+          <p style="margin:0 0 16px;font-size:14px;color:#475569;">
+            Une nouvelle demande de recrutement est émise depuis le pipeline Project Management.
+          </p>
+
+          <table width="100%" cellpadding="0" cellspacing="0"
+                 style="background:#f5f3ff;border-left:4px solid #7c3aed;border-radius:6px;padding:14px 18px;margin-bottom:18px;">
+            {_info_row("Projet",     project_name)}
+            {_info_row("Profil",     f"<strong>{profile}</strong>")}
+            {_info_row("Séniorité",  seniority)}
+            {_info_row("Sprint",     sprint_label)}
+            <tr>
+              <td style="padding:7px 0;font-size:14px;color:#64748b;width:40%;vertical-align:top;">Compétences</td>
+              <td style="padding:7px 0;">{skills_html}</td>
+            </tr>
+          </table>
+
+          <div style="line-height:1.6;border-top:1px solid #e2e8f0;padding-top:14px;">
+            {body_html_lines}
+          </div>
+
+          {pm_signature}
+        """,
+    )
+
+    _send(to_email, subject, body, html, cc_emails)
+
+
 def send_generic_email(
     to_email: str,
     subject: str,
