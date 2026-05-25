@@ -92,7 +92,7 @@ export default function ProjectCard({ project, onClick, onAdvance, onArchive, on
         </h3>
         <p className="text-xs text-slate-500 mb-3">{project.client_name}</p>
 
-        {project.global_status !== "completed" && project.current_phase && (
+        {project.global_status !== "delivered" && project.current_phase && (
           <div className="flex items-center gap-1.5 mb-1">
             <Zap size={11} className="text-cyan shrink-0" />
             <span className="text-xs text-slate-600">

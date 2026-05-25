@@ -61,8 +61,9 @@ export default function MesProjets() {
   // ── Filtres ───────────────────────────────────────────────
   const counts = {
     all:            projects.length,
-    pending_human:  projects.filter((p) => p.global_status === "pending_human").length,
+    not_started:    projects.filter((p) => p.global_status === "not_started").length,
     in_progress:    projects.filter((p) => p.global_status === "in_progress").length,
+    pending_human:  projects.filter((p) => p.global_status === "pending_human").length,
     pipeline_done:  projects.filter((p) => p.global_status === "pipeline_done").length,
     in_development: projects.filter((p) => p.global_status === "in_development").length,
     delivered:      projects.filter((p) => p.global_status === "delivered").length,
@@ -78,13 +79,15 @@ export default function MesProjets() {
     (p.project_name + p.client_name).toLowerCase().includes(search.toLowerCase())
   );
 
+  // Labels alignés avec STATUS_CONFIG du dashboard PM (DeliverySection.jsx)
   const FILTERS = [
     { key: "all",            label: `Tous (${counts.all})` },
-    { key: "pending_human",  label: `En attente (${counts.pending_human})` },
+    { key: "not_started",    label: `Non démarré (${counts.not_started})` },
     { key: "in_progress",    label: `Pipeline IA (${counts.in_progress})` },
-    { key: "pipeline_done",  label: `Pipeline terminé (${counts.pipeline_done})` },
+    { key: "pending_human",  label: `Validation PM (${counts.pending_human})` },
+    { key: "pipeline_done",  label: `Prêt pour le développement (${counts.pipeline_done})` },
     { key: "in_development", label: `En développement (${counts.in_development})` },
-    { key: "delivered",      label: `Livrés (${counts.delivered})` },
+    { key: "delivered",      label: `Livré (${counts.delivered})` },
   ];
 
   // ── Actions ───────────────────────────────────────────────

@@ -205,6 +205,64 @@ def add_issues_to_sprint(sprint_id: int, issue_keys: list[str]) -> None:
         print(f"[Jira] add_issues_to_sprint erreur : {e}")
 
 
+def start_sprint(sprint_id: int, actual_start: str, planned_end: str) -> bool:
+    """
+    Démarre un Sprint Jira (state: future → active).
+
+    actual_start : date réelle de démarrage (clic PM, format ISO YYYY-MM-DD).
+                   C'est cette date que Jira utilise pour le burndown.
+    planned_end  : date de fin planifiée (engagement initial).
+    """
+    print(f"[Jira] start_sprint id={sprint_id} actual_start={actual_start} planned_end={planned_end}")
+    try:
+        import requests, os
+        url   = os.getenv("JIRA_BASE_URL", "").rstrip("/")
+        email = os.getenv("JIRA_EMAIL", "")
+        token = os.getenv("JIRA_API_TOKEN", "")
+        r = requests.post(
+            f"{url}/rest/agile/1.0/sprint/{sprint_id}",
+            auth=(email, token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={
+                "state":     "active",
+                "startDate": actual_start,
+                "endDate":   planned_end,
+            },
+            timeout=10,
+        )
+        if r.ok:
+            print(f"[Jira] Sprint {sprint_id} démarré (active)")
+            return True
+        print(f"[Jira] start_sprint HTTP {r.status_code} : {r.text[:200]}")
+    except Exception as e:
+        print(f"[Jira] start_sprint erreur : {e}")
+    return False
+
+
+def complete_sprint(sprint_id: int) -> bool:
+    """Clôture un Sprint Jira (state: active → closed)."""
+    print(f"[Jira] complete_sprint id={sprint_id}")
+    try:
+        import requests, os
+        url   = os.getenv("JIRA_BASE_URL", "").rstrip("/")
+        email = os.getenv("JIRA_EMAIL", "")
+        token = os.getenv("JIRA_API_TOKEN", "")
+        r = requests.post(
+            f"{url}/rest/agile/1.0/sprint/{sprint_id}",
+            auth=(email, token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={"state": "closed"},
+            timeout=10,
+        )
+        if r.ok:
+            print(f"[Jira] Sprint {sprint_id} clôturé (closed)")
+            return True
+        print(f"[Jira] complete_sprint HTTP {r.status_code} : {r.text[:200]}")
+    except Exception as e:
+        print(f"[Jira] complete_sprint erreur : {e}")
+    return False
+
+
 # ──────────────────────────────────────────────────────────────
 # PHASE 4 — Dépendances (Issue Links)
 # ──────────────────────────────────────────────────────────────

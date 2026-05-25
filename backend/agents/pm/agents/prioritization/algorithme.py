@@ -7,7 +7,12 @@
 #   state["cpm_result"]         — { story_id → { slack, ... } }  (calculé par node_cpm)
 #
 # Sortie :
-#   priorities : [{ "story_id": int, "priority_score": float, "final_rank": int }]
+#   priorities : [{ "story_id": int, "priority_score": float, "final_rank": int, "is_critical": bool }]
+#
+# Persistance :
+#   priority_score, rank et is_critical sont également écrits sur user_stories
+#   (colonnes dédiées) pour servir aux consommateurs aval (story_distribution,
+#   dashboard consultant) sans dépendre de pipeline_state.ai_output.
 #
 # Algorithme :
 #   1. Tri topologique (Kahn) — erreur si cycle détecté.
@@ -17,7 +22,11 @@
 #        avec successeurs → priority = MAX(priority[s] + marge_max - marge[n])
 #   4. Tri : priority↓, marge↑, nb_successeurs↓, story_points↑, id↑
 
+from sqlalchemy import update
+
 from agents.pm.state import PMPipelineState
+from app.database.connection import AsyncSessionLocal
+from app.database.models.pm.user_story import UserStory
 
 
 async def node_prioritization(state: PMPipelineState) -> dict:
@@ -109,16 +118,37 @@ async def node_prioritization(state: PMPipelineState) -> dict:
         ),
     )
 
+    # is_critical depuis CPM (slack ≈ 0 → chemin critique)
+    # Lu directement depuis cpm_result pour rester source de vérité unique.
+    def _is_critical(sid: int) -> bool:
+        key = str(sid) if str(sid) in cpm_result else sid
+        if key not in cpm_result:
+            return False
+        val = cpm_result[key].get("is_critical")
+        if isinstance(val, bool):
+            return val
+        return abs(float(cpm_result[key].get("slack", 0.0))) < 1e-9
+
     priorities = [
         {
             "story_id":       sid,
             "priority_score": priority[sid],
             "final_rank":     rank,
+            "is_critical":    _is_critical(sid),
         }
         for rank, sid in enumerate(ranked, start=1)
     ]
 
     print(f"[prioritization] scores : {[(p['story_id'], p['priority_score']) for p in priorities]}")
+
+    # ── Persistance sur user_stories ──────────────────────────────
+    # Source de vérité pour story_distribution + dashboard consultant.
+    # Best-effort : on ne fait pas crasher le node si la DB tombe (le
+    # state LangGraph + ai_output gardent la valeur en backup).
+    try:
+        await _persist_priorities_to_db(priorities)
+    except Exception as e:
+        print(f"[prioritization] ⚠ persistance DB échouée : {type(e).__name__}: {e}")
 
     return {
         "priorities":        priorities,
@@ -127,3 +157,24 @@ async def node_prioritization(state: PMPipelineState) -> dict:
         "human_feedback":    None,
         "error":             None,
     }
+
+
+async def _persist_priorities_to_db(priorities: list[dict]) -> None:
+    """Écrit priority_score / rank / is_critical sur user_stories."""
+    if not priorities:
+        return
+    async with AsyncSessionLocal() as session:
+        for p in priorities:
+            sid = p.get("story_id")
+            if sid is None:
+                continue
+            await session.execute(
+                update(UserStory)
+                .where(UserStory.id == sid)
+                .values(
+                    priority_score = float(p.get("priority_score") or 0.0),
+                    rank           = int(p.get("final_rank") or 0),
+                    is_critical    = bool(p.get("is_critical") or False),
+                )
+            )
+        await session.commit()

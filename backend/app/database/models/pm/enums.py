@@ -20,13 +20,17 @@ class StoryStatusEnum(str, enum.Enum):
 
 
 class PipelinePhaseEnum(str, enum.Enum):
-    # Les 9 phases correspondent exactement aux phases du pipeline IA
+    # Les 8 phases du pipeline IA (PHASE_7_SPRINT_PLANNING fusionnée dans le staffing).
     PHASE_1_EXTRACTION       = "phase_1_extraction"
     PHASE_2_EPICS            = "phase_2_epics"
     PHASE_3_STORIES          = "phase_3_stories"
     PHASE_4_STORY_DEPS       = "phase_4_story_deps"
     PHASE_5_PRIORITIZATION   = "phase_5_prioritization"
     PHASE_6_CRITICAL_PATH    = "phase_6_critical_path"
+    # PHASE_7_SPRINT_PLANNING — DEPRECATED : la phase Sprints séparée a été
+    # fusionnée dans le staffing (Step 3 — Story Distribution produit déjà les
+    # sprints). Valeur conservée dans l'enum PG pour rétrocompatibilité ; les
+    # rows existantes sont nettoyées par la migration w7x8y9z0a1b2.
     PHASE_7_SPRINT_PLANNING  = "phase_7_sprint_planning"
     PHASE_8_STAFFING         = "phase_8_staffing"
     PHASE_9_MONITORING       = "phase_9_monitoring"

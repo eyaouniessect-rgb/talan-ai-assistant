@@ -43,6 +43,8 @@ from app.database.models.pm.pipeline_state import PipelineState
 from app.database.models.pm.project_document import ProjectDocument
 from app.database.models.pm.enums import PipelineStatusEnum, PipelinePhaseEnum, ProjectGlobalStatus
 from app.database.models.pm.epic import Epic
+from app.database.models.pm.sprint import Sprint
+from app.services import pm_delivery_metrics as pdm
 
 from agents.pm.graph import get_pm_graph
 from agents.pm.db import (
@@ -69,6 +71,13 @@ from agents.pm.state import PMPipelineState
 router = APIRouter(prefix="/pipeline", tags=["Pipeline PM"])
 
 _JIRA_ENABLED = bool(os.getenv("JIRA_BASE_URL") and os.getenv("JIRA_API_TOKEN"))
+
+# Nombre total de phases du pipeline IA (synchro avec _PHASE_ORDER dans
+# agents/pm/graph/graph.py). Utilisé pour déterminer si le pipeline est terminé
+# (PIPELINE_DONE) et pour le compteur phases_done/phases_total.
+# 8 phases : extract, epics, stories, story_deps, cpm, prioritization,
+#            staffing (inclut sprint planning), monitoring.
+TOTAL_PIPELINE_PHASES = 8
 
 # Verrou par projet — empêche deux pm_graph.ainvoke() concurrents sur le même
 # thread_id (causerait des appels NVIDIA en parallèle qui se piétinent les clés).
@@ -144,8 +153,18 @@ async def list_pipeline_projects(
                 current_status = p.status.value if p.status else None
                 break
 
-        # Statut global du projet (calculé depuis les phases pipeline)
-        if phases_done == 11:
+        # Statut global du projet (calculé depuis les phases pipeline — 8 phases au total)
+        #
+        # ⚠️ in_development et delivered sont positionnés par start_sprint /
+        #    close_sprint, pas par la progression des phases. On ne doit JAMAIS
+        #    les écraser ici sinon chaque visite de MesProjets réinitialise
+        #    le statut à pipeline_done.
+        if project.status in (
+            ProjectGlobalStatus.IN_DEVELOPMENT.value,
+            ProjectGlobalStatus.DELIVERED.value,
+        ):
+            global_status = ProjectGlobalStatus(project.status)
+        elif phases_done == TOTAL_PIPELINE_PHASES:
             global_status = ProjectGlobalStatus.PIPELINE_DONE
         elif any(p.status == PipelineStatusEnum.PENDING_VALIDATION for p in phases):
             global_status = ProjectGlobalStatus.PENDING_HUMAN
@@ -164,7 +183,7 @@ async def list_pipeline_projects(
             "project_name":   project.name,
             "client_name":    project.client.name if project.client else "—",
             "phases_done":    phases_done,
-            "phases_total":   11,
+            "phases_total":   TOTAL_PIPELINE_PHASES,
             "current_phase":  current_phase,
             "current_status": current_status,
             "global_status":  global_status,
@@ -233,17 +252,6 @@ class UpdateSprintCapacitiesRequest(BaseModel):
                  Longueur = nombre de sprints existants. Toutes ≥ 1.
     """
     capacities: list[int]
-
-
-class ResolveManualDecisionRequest(BaseModel):
-    """Corps de la requête PATCH /pipeline/{project_id}/staffing/matching/manual-decision.
-
-    Le PM choisit l'employé à retenir parmi les candidate_options proposés.
-    """
-    sprint_number:    int
-    story_id:         int
-    required_profile: str
-    employee_id:      int
 
 
 class ChangeAssignmentRequest(BaseModel):
@@ -576,8 +584,11 @@ async def validate_phase(
     has_pending     = any(p.status == PipelineStatusEnum.PENDING_VALIDATION for p in all_phases)
 
     proj = (await db.execute(select(Project).where(Project.id == project_id))).scalar_one_or_none()
-    if proj:
-        if validated_count == 11:
+    if proj and proj.status not in (
+        ProjectGlobalStatus.IN_DEVELOPMENT.value,
+        ProjectGlobalStatus.DELIVERED.value,
+    ):
+        if validated_count == TOTAL_PIPELINE_PHASES:
             proj.status = ProjectGlobalStatus.PIPELINE_DONE.value
         elif has_pending:
             proj.status = ProjectGlobalStatus.PENDING_HUMAN.value
@@ -1033,7 +1044,7 @@ async def update_sprint_capacities(
       1. Lit le state LangGraph + résultat actuel de story_distribution
       2. Re-distribue déterministe (sans LLM) avec les nouvelles capacités
       3. Met à jour le checkpoint LangGraph + DB pipeline_state
-      4. Reset les étapes aval (candidate_filtering, matching, velocity_feasibility)
+      4. Reset les étapes aval (candidate_filtering, matching)
          à 'pending' si elles étaient 'done' — leurs résultats sont stales
     """
     if project_id in _pm_graph_running:
@@ -1107,7 +1118,7 @@ async def update_sprint_capacities(
             "result": new_result.model_dump(),
         },
     }
-    downstream = ["candidate_filtering", "matching", "velocity_feasibility"]
+    downstream = ["candidate_filtering", "matching"]
     reset_keys = [k for k in downstream if (steps.get(k) or {}).get("status") == "done"]
     for k in downstream:
         new_steps[k] = {"status": "pending", "result": None}
@@ -1163,7 +1174,6 @@ _STAFFING_EMPTY_STEPS = {
     "story_distribution":    {"status": "pending", "result": None},
     "candidate_filtering":   {"status": "pending", "result": None},
     "matching":              {"status": "pending", "result": None},
-    "velocity_feasibility":  {"status": "pending", "result": None},
 }
 
 _STAFFING_STEP_ORDER = [
@@ -1172,7 +1182,6 @@ _STAFFING_STEP_ORDER = [
     "story_distribution",
     "candidate_filtering",
     "matching",
-    "velocity_feasibility",
 ]
 
 
@@ -1330,227 +1339,6 @@ async def get_staffing_matching(
         "project_id":  project_id,
         "matching":    matching_result,
         "assignments": assignments,
-    }
-
-
-# ──────────────────────────────────────────────────────────────
-# PATCH /pipeline/{project_id}/staffing/matching/manual-decision
-# Le PM résout un manual_decision_required en choisissant l'employé.
-# Met à jour le state LangGraph + recalcule les statuts story/sprint
-# + met à jour la matérialisation DB.
-# ──────────────────────────────────────────────────────────────
-
-@router.patch("/{project_id}/staffing/matching/manual-decision")
-async def resolve_matching_manual_decision(
-    project_id:   int,
-    body:         ResolveManualDecisionRequest,
-    current_user: dict = Depends(require_pm),
-):
-    """
-    Le PM tranche un manual_decision_required :
-      - choisit un employee_id parmi candidate_options ;
-      - le ProfileAssignment passe à status="assigned" (warning_type conservé
-        si le candidat retenu était dans le groupe medium/weak — calculé d'après
-        son match_level enregistré dans options) ;
-      - candidate_options est vidé ;
-      - story_status & sprint_status sont recalculés ;
-      - la table staffing_assignments est resynchronisée.
-    """
-    pm_graph = get_pm_graph()
-    if pm_graph is None:
-        raise HTTPException(503, "Le pipeline PM n'est pas initialisé.")
-
-    # Guard : si un recalcul tourne en arrière-plan, l'état est en transition.
-    if project_id in _pm_graph_running:
-        raise HTTPException(
-            423,
-            "Un recalcul est en cours pour ce projet. "
-            "Veuillez rafraîchir la page et réessayer dans quelques secondes.",
-        )
-
-    config = {"configurable": {"thread_id": f"pm_{project_id}"}}
-    snapshot = await pm_graph.aget_state(config)
-    if not snapshot or not snapshot.values:
-        raise HTTPException(404, "Aucun état pipeline trouvé pour ce projet.")
-
-    current_state: dict = dict(snapshot.values)
-    staffing = current_state.get("staffing") or {}
-    steps    = staffing.get("steps") or {}
-    m_step   = steps.get("matching") or {}
-    if m_step.get("status") != "done" or not m_step.get("result"):
-        raise HTTPException(400, "Le matching n'est pas encore terminé.")
-
-    matching = dict(m_step["result"])
-    sprint_key = f"sprint_{body.sprint_number}"
-    sprint = (matching.get("matching_by_sprint") or {}).get(sprint_key)
-    if not sprint:
-        raise HTTPException(404, f"Sprint {body.sprint_number} introuvable.")
-
-    # Trouver la story + le profil concerné
-    target_story  = next(
-        (s for s in sprint.get("story_assignments", []) if s.get("story_id") == body.story_id),
-        None,
-    )
-    if not target_story:
-        raise HTTPException(404, f"Story {body.story_id} introuvable dans sprint {body.sprint_number}.")
-
-    target_profile_assignment = next(
-        (a for a in target_story.get("assignments", [])
-         if a.get("required_profile") == body.required_profile),
-        None,
-    )
-    if not target_profile_assignment:
-        raise HTTPException(404, f"Profil '{body.required_profile}' introuvable pour la story {body.story_id}.")
-    current_status = target_profile_assignment.get("status")
-    if current_status != "manual_decision_required":
-        # Si déjà résolue avec le même employé → réponse idempotente (200)
-        if current_status in ("assigned", "assigned_with_warning") and \
-                target_profile_assignment.get("employee_id") == body.employee_id:
-            return {
-                "project_id":       project_id,
-                "sprint_number":    body.sprint_number,
-                "story_id":         body.story_id,
-                "required_profile": body.required_profile,
-                "employee_id":      body.employee_id,
-                "story_status":     next(
-                    (s.get("story_status") for s in sprint.get("story_assignments", [])
-                     if s.get("story_id") == body.story_id),
-                    "fully_assigned",
-                ),
-                "sprint_status":    sprint.get("sprint_status", ""),
-                "already_resolved": True,
-            }
-        raise HTTPException(
-            400,
-            f"Cette affectation a le statut '{current_status}' et ne peut plus être modifiée. "
-            "Rafraîchissez la page pour voir l'état actuel.",
-        )
-
-    options = target_profile_assignment.get("candidate_options", []) or []
-    chosen  = next((o for o in options if o.get("employee_id") == body.employee_id), None)
-    if not chosen:
-        raise HTTPException(400, f"Employee {body.employee_id} ne fait pas partie des candidate_options.")
-
-    # Calcul du nouveau status / warning selon le match_level du candidat retenu
-    from agents.pm.agents.staffing.steps.matching.selection import (
-        compute_sprint_status,
-        compute_story_status,
-        warning_for_match_level,
-    )
-    chosen_level = chosen.get("match_level", "good")
-    if chosen_level in ("medium", "weak"):
-        new_status  = "assigned_with_warning"
-        new_warning = warning_for_match_level(chosen_level)
-    else:
-        new_status  = "assigned"
-        new_warning = None
-
-    target_profile_assignment.update({
-        "employee_id":       chosen["employee_id"],
-        "employee_name":     chosen.get("name"),
-        "employee_seniority": chosen.get("seniority"),
-        "job_title":         chosen.get("job_title"),
-        "skill_score":       chosen.get("skill_score"),
-        "match_level":       chosen_level,
-        "matched_skills":    chosen.get("matched_skills",   []),
-        "inferred_matches":  chosen.get("inferred_matches", []),
-        "missing_skills":    chosen.get("missing_skills",   []),
-        "status":            new_status,
-        "warning_type":      new_warning,
-        "candidate_options": [],
-        "reason":            f"Décision PM : {chosen.get('name', '')} retenu parmi les candidats équivalents.",
-    })
-
-    # Recalcul des statuts story et sprint
-    target_story["story_status"] = compute_story_status([
-        a.get("status", "") for a in target_story.get("assignments", [])
-    ])
-    sprint["sprint_status"] = compute_sprint_status([
-        s.get("story_status", "") for s in sprint.get("story_assignments", [])
-    ])
-
-    # Reconstruire les vues filtrées issues / manual_decisions du sprint
-    sprint["issues"] = [
-        a for s in sprint.get("story_assignments", [])
-        for a in s.get("assignments", [])
-        if a.get("status") in ("missing_profile", "capacity_gap", "seniority_gap", "no_available_candidate")
-    ]
-    sprint["manual_decisions"] = [
-        a for s in sprint.get("story_assignments", [])
-        for a in s.get("assignments", [])
-        if a.get("status") == "manual_decision_required"
-    ]
-
-    # Recalcul global_summary (compteurs simples)
-    summary = matching.get("global_summary") or {}
-    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
-    summary["fully_staffed_sprints"]     = sum(1 for s in sprints_iter if s.get("sprint_status") == "fully_staffed")
-    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
-    summary["partially_staffed_sprints"] = sum(1 for s in sprints_iter if s.get("sprint_status") == "partially_staffed")
-    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
-    summary["manual_decision_sprints"]   = sum(1 for s in sprints_iter if s.get("sprint_status") == "manual_decision_required")
-    sprints_iter = (matching.get("matching_by_sprint") or {}).values()
-    summary["not_staffed_sprints"]       = sum(1 for s in sprints_iter if s.get("sprint_status") == "not_staffed")
-    matching["global_summary"] = summary
-
-    # Mise à jour state LangGraph
-    new_steps    = {**steps, "matching": {**m_step, "result": matching}}
-    new_staffing = {**staffing, "steps": new_steps}
-    await pm_graph.aupdate_state(config, {"staffing": new_staffing}, as_node="node_staffing")
-
-    # Mise à jour DB pipeline_state. Non bloquant : la source de vérité est le
-    # state LangGraph mis à jour ci-dessus. Cette table est une matérialisation
-    # pour les vues/lectures.
-    try:
-        from sqlalchemy.orm.attributes import flag_modified
-        async with AsyncSessionLocal() as session:
-            ps = (await session.execute(
-                select(PipelineState).where(
-                    PipelineState.project_id == project_id,
-                    PipelineState.phase == PipelinePhaseEnum.PHASE_8_STAFFING,
-                )
-            )).scalar_one_or_none()
-            if ps:
-                current_ai = dict(ps.ai_output or {})
-                current_ai["staffing"] = new_staffing
-                ps.ai_output = current_ai
-                flag_modified(ps, "ai_output")
-                await session.commit()
-    except Exception as state_err:
-        import traceback
-        print(
-            f"[matching] ⚠️  mise à jour pipeline_state après manual decision échouée — "
-            f"{type(state_err).__name__}: {state_err}"
-        )
-        traceback.print_exc()
-
-    # Resynchroniser la matérialisation DB. Non bloquant : le state LangGraph
-    # est la source de vérité, la table staffing_assignments sert au dashboard.
-    # Si la sync échoue, l'utilisateur voit quand même sa décision appliquée.
-    try:
-        from agents.pm.agents.staffing.steps.matching.repository import persist_assignments
-        await persist_assignments(project_id, matching)
-    except Exception as persist_err:
-        import traceback
-        print(
-            f"[matching] ⚠️  persistance DB après manual decision échouée — "
-            f"{type(persist_err).__name__}: {persist_err}"
-        )
-        traceback.print_exc()
-
-    print(
-        f"[matching] ✅ manual decision résolue projet={project_id} "
-        f"sprint={body.sprint_number} story={body.story_id} "
-        f"profile='{body.required_profile}' → employee={body.employee_id}"
-    )
-    return {
-        "project_id":       project_id,
-        "sprint_number":    body.sprint_number,
-        "story_id":         body.story_id,
-        "required_profile": body.required_profile,
-        "employee_id":      body.employee_id,
-        "story_status":     target_story["story_status"],
-        "sprint_status":    sprint["sprint_status"],
     }
 
 
@@ -1741,16 +1529,11 @@ async def change_matching_assignment(
         s.get("story_status", "") for s in sprint.get("story_assignments", [])
     ])
 
-    # Reconstruction des vues filtrées du sprint
+    # Reconstruction de la vue filtrée des issues du sprint
     sprint["issues"] = [
         a for s in sprint.get("story_assignments", [])
         for a in s.get("assignments", [])
-        if a.get("status") in ("missing_profile", "capacity_gap", "seniority_gap", "no_available_candidate")
-    ]
-    sprint["manual_decisions"] = [
-        a for s in sprint.get("story_assignments", [])
-        for a in s.get("assignments", [])
-        if a.get("status") == "manual_decision_required"
+        if a.get("status") in ("missing_profile", "capacity_gap", "no_available_candidate")
     ]
 
     # Recalcul global_summary (compteurs)
@@ -1758,7 +1541,6 @@ async def change_matching_assignment(
     sprints_iter = list((matching.get("matching_by_sprint") or {}).values())
     summary["fully_staffed_sprints"]     = sum(1 for s in sprints_iter if s.get("sprint_status") == "fully_staffed")
     summary["partially_staffed_sprints"] = sum(1 for s in sprints_iter if s.get("sprint_status") == "partially_staffed")
-    summary["manual_decision_sprints"]   = sum(1 for s in sprints_iter if s.get("sprint_status") == "manual_decision_required")
     summary["not_staffed_sprints"]       = sum(1 for s in sprints_iter if s.get("sprint_status") == "not_staffed")
     matching["global_summary"] = summary
 
@@ -1946,7 +1728,7 @@ async def rerun_matching(
     db:           AsyncSession = Depends(get_db),
 ):
     """
-    Relance le step Matching (et velocity_feasibility en aval) sans réinitialiser
+    Relance le step Matching sans réinitialiser
     profile_extraction / normalization / story_distribution / candidate_filtering.
 
     Utile après ajout RH d'un nouveau profil en base : le PM clique pour voir
@@ -1977,11 +1759,10 @@ async def rerun_matching(
             "Le filtrage des candidats doit être terminé avant de relancer le matching.",
         )
 
-    # Reset matching + velocity_feasibility uniquement
+    # Reset matching uniquement
     new_steps = {
         **steps,
-        "matching":             {"status": "pending", "result": None},
-        "velocity_feasibility": {"status": "pending", "result": None},
+        "matching": {"status": "pending", "result": None},
     }
     new_staffing = {**staffing, "steps": new_steps}
 
@@ -2129,7 +1910,7 @@ async def jira_resync_phase(
     if not phase:
         raise HTTPException(400, "Impossible de déterminer la phase. Fournissez 'phase' dans le corps.")
 
-    syncable = {"epics", "stories", "story_deps", "cpm", "sprints"}
+    syncable = {"epics", "stories", "story_deps", "cpm", "staffing"}
     if phase not in syncable:
         raise HTTPException(400, f"Phase '{phase}' non synchronisable. Phases supportées : {sorted(syncable)}.")
 
@@ -2839,3 +2620,261 @@ async def stream_stories_events(
             "Connection":       "keep-alive",
         },
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# SPRINTS LIFECYCLE — démarrer / clôturer
+# ═══════════════════════════════════════════════════════════════
+
+class StartSprintRequest(BaseModel):
+    force: bool = False  # True = ignorer l'avertissement de démarrage anticipé
+
+
+@router.get("/{project_id}/sprints")
+async def list_project_sprints(
+    project_id:   int,
+    current_user: dict = Depends(require_pm),
+):
+    """Retourne tous les sprints du projet (pour affichage frontend)."""
+    from agents.pm.agents.staffing.steps.story_distribution.repository import (
+        get_sprints_by_project,
+    )
+    return await get_sprints_by_project(project_id)
+
+
+# ──────────────────────────────────────────────────────────────
+# GET /pipeline/{project_id}/monitoring/delivery
+#
+# Alimente l'onglet "Monitoring" du projet (phase 8 du pipeline).
+# Contrairement à /dashboard/pm/delivery (vue portefeuille), cet endpoint
+# expose le DÉTAIL sprint par sprint d'UN projet :
+#   - dates planifiées vs réelles
+#   - delta jours (avance/retard) sur start et end
+#   - jours restants ou débordement pour le sprint actif
+#   - charge story-points (actual / target)
+#
+# Le frontend (PhaseResult.jsx → MonitoringSection) rend la liste enrichie
+# avec une carte d'entête reprenant l'insight projet généré ici.
+# ──────────────────────────────────────────────────────────────
+
+@router.get("/{project_id}/monitoring/delivery")
+async def get_project_monitoring_delivery(
+    project_id:   int,
+    current_user: dict         = Depends(require_pm),
+    db:           AsyncSession = Depends(get_db),
+):
+    from datetime import date
+
+    # 1) Charge le projet (avec client pour le nom)
+    project = (await db.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .options(selectinload(Project.client))
+    )).scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Projet introuvable.")
+
+    # 2) Charge ses sprints ordonnés
+    sprints = (await db.execute(
+        select(Sprint)
+        .where(Sprint.project_id == project_id)
+        .order_by(Sprint.sprint_number)
+    )).scalars().all()
+
+    today = date.today()
+    summary = pdm.build_project_summary(project, sprints, today)
+    sprints_detail = [pdm.serialize_sprint_for_monitoring(s, today) for s in sprints]
+
+    return {
+        "project": summary,
+        "sprints": sprints_detail,
+    }
+
+
+@router.post("/{project_id}/sprints/{sprint_number}/start")
+async def start_project_sprint(
+    project_id:    int,
+    sprint_number: int,
+    body:          StartSprintRequest,
+    current_user:  dict = Depends(require_pm),
+):
+    """
+    Démarre un sprint.
+
+    Règles :
+      - Sprint en 'planned'
+      - Aucun autre sprint en 'active' (un seul actif à la fois)
+      - Sprint précédent en 'completed' (sauf sprint_number = 1)
+      - Si today < planned start_date ET force=False → 409 + payload avec
+        'requires_confirmation' pour que le frontend affiche le modal.
+
+    Effets :
+      - pm.sprints.status='active', actual_start_date=today
+      - Jira API start_sprint(actual_start=today, planned_end)
+      - crm.projects.status='in_development' si pas déjà
+    """
+    from datetime import date
+    from agents.pm.agents.staffing.steps.story_distribution.repository import (
+        get_sprint_by_number, get_sprints_by_project, mark_sprint_active,
+    )
+    from agents.pm.jira import actions as jira_actions
+
+    target = await get_sprint_by_number(project_id, sprint_number)
+    if not target:
+        raise HTTPException(404, f"Sprint {sprint_number} introuvable pour le projet {project_id}.")
+
+    if target.status != "planned":
+        raise HTTPException(409, f"Sprint {sprint_number} est déjà '{target.status}', impossible de le démarrer.")
+
+    # Contraintes séquentielles
+    all_sprints = await get_sprints_by_project(project_id)
+    active_other = next(
+        (s for s in all_sprints if s["status"] == "active" and s["sprint_number"] != sprint_number),
+        None,
+    )
+    if active_other:
+        raise HTTPException(
+            409,
+            f"Le sprint {active_other['sprint_number']} est déjà actif. "
+            f"Clôturez-le avant de démarrer le sprint {sprint_number}."
+        )
+
+    if sprint_number > 1:
+        prev = next((s for s in all_sprints if s["sprint_number"] == sprint_number - 1), None)
+        if not prev or prev["status"] != "completed":
+            prev_status = prev["status"] if prev else "introuvable"
+            raise HTTPException(
+                409,
+                f"Le sprint précédent ({sprint_number - 1}) doit être clôturé. "
+                f"Statut actuel : '{prev_status}'."
+            )
+
+    # Warning démarrage anticipé
+    today = date.today()
+    if today < target.start_date and not body.force:
+        return {
+            "requires_confirmation": True,
+            "planned_start_date":    target.start_date.isoformat(),
+            "today":                 today.isoformat(),
+            "message": (
+                f"La date planifiée du sprint {sprint_number} est le "
+                f"{target.start_date.isoformat()}. Voulez-vous le démarrer "
+                f"dès aujourd'hui ({today.isoformat()}) ?"
+            ),
+        }
+
+    # ── Jira (best-effort, ne bloque pas si Jira down) ─────────
+    jira_ok = True
+    if _JIRA_ENABLED and target.jira_sprint_id:
+        jira_ok = jira_actions.start_sprint(
+            sprint_id    = target.jira_sprint_id,
+            actual_start = today.isoformat(),
+            planned_end  = target.end_date.isoformat(),
+        )
+
+    # ── DB local : status='active', actual_start_date=today ────
+    await mark_sprint_active(target.id, today)
+
+    # ── crm.projects.status → in_development ───────────────────
+    async with AsyncSessionLocal() as session:
+        proj = (await session.execute(
+            select(Project).where(Project.id == project_id)
+        )).scalar_one_or_none()
+        if proj and proj.status != ProjectGlobalStatus.IN_DEVELOPMENT.value:
+            proj.status = ProjectGlobalStatus.IN_DEVELOPMENT.value
+            await session.commit()
+
+    return {
+        "project_id":        project_id,
+        "sprint_number":     sprint_number,
+        "status":            "active",
+        "actual_start_date": today.isoformat(),
+        "jira_synced":       jira_ok,
+    }
+
+
+@router.post("/{project_id}/sprints/{sprint_number}/close")
+async def close_project_sprint(
+    project_id:    int,
+    sprint_number: int,
+    current_user:  dict = Depends(require_pm),
+):
+    """
+    Clôture un sprint actif.
+
+    Effets :
+      - pm.sprints.status='completed', actual_end_date=today
+      - Jira API complete_sprint (state='closed')
+      - crm.projects.progress recalculé : completed/total × 100
+      - crm.projects.status='delivered' si tous les sprints completed
+    """
+    from datetime import date
+    from agents.pm.agents.staffing.steps.story_distribution.repository import (
+        get_sprint_by_number, get_sprints_by_project, mark_sprint_completed,
+    )
+    from agents.pm.jira import actions as jira_actions
+
+    target = await get_sprint_by_number(project_id, sprint_number)
+    if not target:
+        raise HTTPException(404, f"Sprint {sprint_number} introuvable pour le projet {project_id}.")
+
+    if target.status != "active":
+        raise HTTPException(409, f"Sprint {sprint_number} n'est pas actif (statut='{target.status}').")
+
+    today = date.today()
+
+    # ── Jira (best-effort) ─────────────────────────────────────
+    jira_ok = True
+    if _JIRA_ENABLED and target.jira_sprint_id:
+        jira_ok = jira_actions.complete_sprint(target.jira_sprint_id)
+
+    # ── DB local : status='completed', actual_end_date=today ───
+    await mark_sprint_completed(target.id, today)
+
+    # ── Stories du sprint clôturé : progress_status → 'done' ───
+    # Toutes les staffing_assignments de ce (project_id, sprint_number)
+    # passent automatiquement à 'done'. Le PM peut toujours réajuster
+    # manuellement par la suite si une story n'a en réalité pas été livrée.
+    from app.database.models.pm.staffing_assignment import StaffingAssignment
+    from sqlalchemy import update
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(StaffingAssignment)
+            .where(
+                StaffingAssignment.project_id    == project_id,
+                StaffingAssignment.sprint_number == sprint_number,
+            )
+            .values(progress_status="done")
+        )
+        await session.commit()
+
+    # ── Recalcul progress + status projet ──────────────────────
+    all_sprints = await get_sprints_by_project(project_id)
+    total = len(all_sprints)
+    # +1 car le mark_sprint_completed vient juste de tourner mais get_sprints_by_project
+    # peut retourner l'ancien snapshot suivant l'isolation transactionnelle.
+    completed = sum(
+        1 for s in all_sprints
+        if s["status"] == "completed" or s["sprint_number"] == sprint_number
+    )
+    progress = round(completed / total * 100, 2) if total else 0
+
+    async with AsyncSessionLocal() as session:
+        proj = (await session.execute(
+            select(Project).where(Project.id == project_id)
+        )).scalar_one_or_none()
+        if proj:
+            proj.progress = progress
+            if completed >= total:
+                proj.status = ProjectGlobalStatus.DELIVERED.value
+            await session.commit()
+
+    return {
+        "project_id":      project_id,
+        "sprint_number":   sprint_number,
+        "status":          "completed",
+        "actual_end_date": today.isoformat(),
+        "progress":        progress,
+        "project_status":  ProjectGlobalStatus.DELIVERED.value if completed >= total else ProjectGlobalStatus.IN_DEVELOPMENT.value,
+        "jira_synced":     jira_ok,
+    }

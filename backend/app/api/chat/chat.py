@@ -22,6 +22,7 @@ from langchain_core.messages import HumanMessage
 from app.orchestrator.graph import get_graph
 from app.core.security import get_current_user
 from app.core.anti_injection import scan_text
+from app.core.rate_limiter import chat_rate_limit
 from app.database.connection import get_db, AsyncSessionLocal
 from app.database.models.public.conversation import Conversation
 from app.database.models.public.message import Message
@@ -93,6 +94,7 @@ async def chat_stream(
     request: ChatRequest,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(chat_rate_limit),
 ):
     user_id = current_user["user_id"]
     role = current_user["role"]
@@ -288,6 +290,7 @@ async def chat(
     request: ChatRequest,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(chat_rate_limit),
 ):
     user_id = current_user["user_id"]
     role    = current_user["role"]

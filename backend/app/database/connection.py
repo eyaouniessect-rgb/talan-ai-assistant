@@ -15,7 +15,13 @@ DATABASE_URL = (
     f"{os.getenv('POSTGRES_DB', 'talan_assistant')}"
 )
 
-engine = create_async_engine(DATABASE_URL, echo=True, future=True)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=True,
+    future=True,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,

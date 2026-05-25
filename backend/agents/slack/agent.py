@@ -142,6 +142,34 @@ async def add_slack_reaction(channel: str, timestamp: str, reaction: str) -> str
 
 
 @tool
+async def remove_slack_reaction(channel: str, timestamp: str, reaction: str) -> str:
+    """
+    Retire un emoji réaction posée précédemment sur un message Slack.
+    ⚠️ Le bot ne peut retirer QUE ses propres réactions (limite Slack).
+    Si la réaction a été posée par un autre utilisateur, l'API renvoie "no_reaction" —
+    c'est normal, ne retente pas, passe au message suivant.
+    channel   : ID du channel contenant le message
+    timestamp : timestamp du message (champ ts)
+    reaction  : nom de l'emoji sans les :: (ex: thumbsup, white_check_mark)
+    """
+    try:
+        result = await slack_tools.remove_reaction(channel=channel, timestamp=timestamp, reaction=reaction)
+        # Si Slack renvoie "no_reaction" → c'est que la réaction n'appartient pas au bot.
+        # On renvoie un message clair pour que le LLM passe au suivant sans retry.
+        if isinstance(result, dict):
+            err = (result.get("error") or "").lower()
+            if "no_reaction" in err or "not_reactable" in err:
+                return json.dumps({
+                    "ok": False,
+                    "skip": True,
+                    "reason": f"La réaction :{reaction}: n'a pas été posée par le bot — impossible à retirer (limite Slack). Passe au message suivant.",
+                }, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+
+@tool
 async def find_slack_user(name: str) -> str:
     """
     Cherche un utilisateur Slack par son nom (prénom, nom complet ou email).
@@ -165,6 +193,7 @@ TOOLS = [
     get_slack_user,
     find_slack_user,
     add_slack_reaction,
+    remove_slack_reaction,
 ]
 
 
@@ -182,6 +211,7 @@ def _tool_to_human_text(tool_name: str, args: dict) -> str:
         "get_slack_user":       lambda a: f"Récupération du profil utilisateur `{a.get('user_id', '?')}`...",
         "find_slack_user":      lambda a: f"Recherche de l'utilisateur **{a.get('name', '?')}** dans Slack...",
         "add_slack_reaction":   lambda a: f"Ajout de la réaction :{a.get('reaction', '?')}: sur le message...",
+        "remove_slack_reaction":lambda a: f"Retrait de la réaction :{a.get('reaction', '?')}: du message...",
     }
     fn = mapping.get(tool_name)
     return fn(args) if fn else f"Exécution de {tool_name}..."
@@ -243,7 +273,7 @@ class SlackAgentExecutor(AgentExecutor):
                     async for event in self.react_agent.astream_events(
                         {"messages": [HumanMessage(content=user_input)]},
                         version="v2",
-                        config={"recursion_limit": 12},
+                        config={"recursion_limit": 25},
                     ):
                         etype = event["event"]
 

@@ -3,7 +3,8 @@ import { CheckCircle, Loader, Upload, Zap, RotateCcw } from "lucide-react";
 import { PHASES } from "../constants/phases";
 
 // Phases qui font un export Jira après validation
-const JIRA_SYNC_PHASES = new Set(["epics", "stories", "tasks", "sprints"]);
+// (staffing exporte les sprints + add issues au sprint Jira)
+const JIRA_SYNC_PHASES = new Set(["epics", "stories", "story_deps", "cpm", "staffing"]);
 
 function buildSteps(currentPhase, approved) {
   if (!approved) {
@@ -43,10 +44,11 @@ function buildSteps(currentPhase, approved) {
 
   if (JIRA_SYNC_PHASES.has(currentPhase)) {
     const labels = {
-      epics: "épics",
-      stories: "user stories",
-      tasks: "tâches",
-      sprints: "sprints",
+      epics:      "épics",
+      stories:    "user stories",
+      story_deps: "dépendances",
+      cpm:        "labels chemin critique",
+      staffing:   "sprints + affectations",
     };
     steps.push({
       icon: Upload,

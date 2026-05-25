@@ -5,21 +5,200 @@
 //        > équipe recommandée du sprint (membres, capacités)
 //        > stories du sprint :
 //             > badges status story
-//             > pour chaque profil requis : assigné OU issue OU manual
+//             > pour chaque profil requis : assigné OU issue
 //             > "Pourquoi ?" → drawer explainability avec matched/inferred/missing/reason
-//   - dialog ManualDecisionDialog quand PM clique sur "Choisir un candidat"
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import {
   ChevronDown, ChevronRight, User, Users, AlertCircle, AlertTriangle,
-  CheckCircle, XCircle, Info, Sparkles, HelpCircle, X, Eye, ArrowDownCircle,
-  Mail, Briefcase, RefreshCw,
+  CheckCircle, XCircle, Info, Sparkles, X, Eye, ArrowDownCircle,
+  Mail, Briefcase, RefreshCw, Play, Lock, Flag,
 } from "lucide-react";
 import clsx from "clsx";
-import ManualDecisionDialog from "./ManualDecisionDialog";
 import RecruitmentRequestDialog from "./RecruitmentRequestDialog";
 import ChangeAssignmentDialog from "./ChangeAssignmentDialog";
-import { rerunMatching } from "../../../api/pipeline";
+import {
+  rerunMatching,
+  getProjectSprints,
+  startSprint,
+  closeSprint,
+} from "../../../api/pipeline";
+
+
+// ─────────────────────────────────────────────────────────────
+// Lifecycle DB status (planned / active / completed)
+// ─────────────────────────────────────────────────────────────
+
+const LIFECYCLE_BADGE = {
+  planned:   { label: "Planifié", cls: "bg-slate-100   text-slate-600   border-slate-200" },
+  active:    { label: "En cours", cls: "bg-blue-100    text-blue-700    border-blue-200" },
+  completed: { label: "Terminé",  cls: "bg-emerald-100 text-emerald-700 border-emerald-200" },
+};
+
+
+function SprintLifecycleControls({ dbSprint, allDbSprints, projectId, sprintNumber, onChange }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [earlyStartModal, setEarlyStartModal] = useState(null); // { message } or null
+
+  if (!dbSprint) {
+    return (
+      <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-500 italic">
+        Sprint pas encore matérialisé en base — validez la phase staffing pour activer le cycle de vie.
+      </div>
+    );
+  }
+
+  const status = dbSprint.status;
+  const otherActive = allDbSprints.find(
+    (s) => s.status === "active" && s.sprint_number !== sprintNumber,
+  );
+  const prevSprint  = sprintNumber > 1
+    ? allDbSprints.find((s) => s.sprint_number === sprintNumber - 1)
+    : null;
+  const prevNotDone = sprintNumber > 1 && (!prevSprint || prevSprint.status !== "completed");
+
+  const canStart = status === "planned" && !otherActive && !prevNotDone;
+  const canClose = status === "active";
+
+  const startTooltip = !canStart
+    ? status !== "planned"
+      ? `Sprint déjà ${LIFECYCLE_BADGE[status]?.label?.toLowerCase() ?? status}`
+      : otherActive
+        ? `Sprint ${otherActive.sprint_number} est déjà actif — clôturez-le d'abord`
+        : `Sprint précédent (${sprintNumber - 1}) doit être clôturé`
+    : "Démarrer ce sprint";
+
+  const doStart = useCallback(async (force) => {
+    setBusy(true); setError(null);
+    try {
+      const res = await startSprint(projectId, sprintNumber, force);
+      if (res?.requires_confirmation) {
+        setEarlyStartModal({ message: res.message });
+        setBusy(false);
+        return;
+      }
+      setEarlyStartModal(null);
+      onChange?.();
+    } catch (e) {
+      setError(e?.response?.data?.detail ?? "Échec du démarrage du sprint.");
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId, sprintNumber, onChange]);
+
+  const doClose = useCallback(async () => {
+    if (!window.confirm(`Clôturer le sprint ${sprintNumber} ? Cette action est définitive.`)) return;
+    setBusy(true); setError(null);
+    try {
+      await closeSprint(projectId, sprintNumber);
+      onChange?.();
+    } catch (e) {
+      setError(e?.response?.data?.detail ?? "Échec de la clôture du sprint.");
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId, sprintNumber, onChange]);
+
+  const cfg = LIFECYCLE_BADGE[status] ?? LIFECYCLE_BADGE.planned;
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] font-semibold text-slate-600">Cycle de vie :</span>
+          <span className={clsx(
+            "text-[10px] font-semibold px-2 py-0.5 rounded-full border",
+            cfg.cls,
+          )}>
+            {cfg.label}
+          </span>
+          {dbSprint.actual_start_date && (
+            <span className="text-[10px] text-slate-500">
+              démarré le {dbSprint.actual_start_date}
+            </span>
+          )}
+          {dbSprint.actual_end_date && (
+            <span className="text-[10px] text-slate-500">
+              clôturé le {dbSprint.actual_end_date}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          {canStart && (
+            <button
+              type="button"
+              onClick={() => doStart(false)}
+              disabled={busy}
+              title={startTooltip}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+            >
+              <Play size={11} /> {busy ? "Démarrage…" : "Démarrer le sprint"}
+            </button>
+          )}
+          {!canStart && status === "planned" && (
+            <span
+              title={startTooltip}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed"
+            >
+              <Lock size={11} /> Démarrage bloqué
+            </span>
+          )}
+          {canClose && (
+            <button
+              type="button"
+              onClick={doClose}
+              disabled={busy}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-50"
+            >
+              <Flag size={11} /> {busy ? "Clôture…" : "Clôturer le sprint"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <p className="mt-2 text-[11px] text-rose-700 bg-rose-50 border border-rose-200 rounded px-2 py-1">
+          {error}
+        </p>
+      )}
+
+      {earlyStartModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-5">
+            <div className="flex items-start gap-3">
+              <AlertTriangle size={20} className="text-amber-500 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <h3 className="text-sm font-bold text-slate-800 mb-1">
+                  Démarrage anticipé du sprint
+                </h3>
+                <p className="text-xs text-slate-600">{earlyStartModal.message}</p>
+              </div>
+            </div>
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEarlyStartModal(null)}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+              >
+                Non
+              </button>
+              <button
+                type="button"
+                onClick={() => doStart(true)}
+                disabled={busy}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                Démarrer comme même
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 
 // ─────────────────────────────────────────────────────────────
@@ -29,14 +208,12 @@ import { rerunMatching } from "../../../api/pipeline";
 const SPRINT_STATUS_BADGE = {
   fully_staffed:            { label: "Sprint complet",       cls: "bg-emerald-100 text-emerald-700 border-emerald-200", Icon: CheckCircle },
   partially_staffed:        { label: "Partiellement staffé", cls: "bg-amber-100   text-amber-700   border-amber-200",   Icon: AlertTriangle },
-  manual_decision_required: { label: "Décision PM requise",  cls: "bg-violet-100  text-violet-700  border-violet-200",  Icon: HelpCircle },
   not_staffed:              { label: "Non staffé",           cls: "bg-rose-100    text-rose-700    border-rose-200",    Icon: XCircle },
 };
 
 const STORY_STATUS_BADGE = {
   fully_assigned:           { label: "Affectée",         cls: "bg-emerald-100 text-emerald-700 border-emerald-200", Icon: CheckCircle },
   partially_assigned:       { label: "Partielle",        cls: "bg-amber-100   text-amber-700   border-amber-200",   Icon: AlertTriangle },
-  manual_decision_required: { label: "PM doit choisir",  cls: "bg-violet-100  text-violet-700  border-violet-200",  Icon: HelpCircle },
   not_assigned:             { label: "Non affectée",     cls: "bg-rose-100    text-rose-700    border-rose-200",    Icon: XCircle },
 };
 
@@ -45,9 +222,7 @@ const PROFILE_STATUS_LABEL = {
   assigned_with_warning:    { label: "Affecté (avec alerte)",  cls: "bg-amber-100   text-amber-700   border-amber-200" },
   missing_profile:          { label: "À recruter",             cls: "bg-rose-100    text-rose-700    border-rose-200" },
   capacity_gap:             { label: "Capacité insuffisante",  cls: "bg-orange-100  text-orange-700  border-orange-200" },
-  seniority_gap:            { label: "Séniorité insuffisante", cls: "bg-orange-100  text-orange-700  border-orange-200" },
   no_available_candidate:   { label: "Aucun candidat",         cls: "bg-rose-100    text-rose-700    border-rose-200" },
-  manual_decision_required: { label: "À trancher",             cls: "bg-violet-100  text-violet-700  border-violet-200" },
 };
 
 const MATCH_LEVEL_BADGE = {
@@ -321,14 +496,12 @@ function ProfileAssignmentCard({
   requiredSkills,
   projectId,
   onWhy,
-  onResolveManual,
   onRecruitmentRequest,
   onChangeAssignment,
 }) {
   const statusCfg = PROFILE_STATUS_LABEL[assignment.status] ?? { label: assignment.status, cls: "bg-slate-100 text-slate-500 border-slate-200" };
   const isAssigned = assignment.status === "assigned" || assignment.status === "assigned_with_warning";
-  const isManual   = assignment.status === "manual_decision_required";
-  const isError    = ["missing_profile", "capacity_gap", "seniority_gap", "no_available_candidate"].includes(assignment.status);
+  const isError    = ["missing_profile", "capacity_gap", "no_available_candidate"].includes(assignment.status);
   // Bouton "Signaler un besoin RH" pour les statuts où aucun profil interne n'existe.
   const showRecruitButton = ["missing_profile", "no_available_candidate"].includes(assignment.status);
   const downgradeFrom = assignment.seniority_downgrade_from;
@@ -349,7 +522,6 @@ function ProfileAssignmentCard({
       "rounded-lg border p-3",
       isAssigned && assignment.status === "assigned" && "border-emerald-200 bg-emerald-50/40",
       isAssigned && assignment.status === "assigned_with_warning" && "border-amber-200 bg-amber-50/40",
-      isManual && "border-violet-200 bg-violet-50/40",
       isError && "border-rose-200 bg-rose-50/40",
     )}>
       <div className="flex items-start justify-between gap-2 flex-wrap">
@@ -444,7 +616,7 @@ function ProfileAssignmentCard({
         </div>
       )}
 
-      {/* Erreur (missing/capacity/seniority/no_available) */}
+      {/* Erreur (missing/capacity/no_available) */}
       {isError && (
         <div className="mt-2 space-y-2">
           <div className="flex items-start gap-2">
@@ -465,31 +637,6 @@ function ProfileAssignmentCard({
           )}
         </div>
       )}
-
-      {/* Manual decision */}
-      {isManual && (
-        <div className="mt-2 flex items-start gap-2">
-          <HelpCircle size={13} className="text-violet-600 shrink-0 mt-0.5" />
-          <div className="flex-1">
-            <p className="text-[11px] text-violet-800 mb-1.5">
-              {assignment.candidate_options?.length ?? 0} candidats équivalents — décision PM nécessaire.
-            </p>
-            <button
-              type="button"
-              onClick={() => onResolveManual({
-                sprintNumber,
-                storyId,
-                storyTitle,
-                requiredProfile: assignment.required_profile,
-                candidateOptions: assignment.candidate_options ?? [],
-              })}
-              className="text-[10px] font-semibold text-white bg-violet-600 hover:bg-violet-700 px-2.5 py-1 rounded-lg transition-colors"
-            >
-              Choisir un candidat
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -501,15 +648,17 @@ function ProfileAssignmentCard({
 
 function StoryMatchingRow({
   story,
+  storyMeta,
   sprintNumber,
   sprintStart,
   sprintEnd,
   projectId,
   onWhy,
-  onResolveManual,
   onRecruitmentRequest,
   onChangeAssignment,
 }) {
+  // Identifiant utilisateur : Jira key si dispo, sinon fallback DB id (#N).
+  const storyLabel = storyMeta?.jira_issue_key || `#${story.story_id}`;
   const [expanded, setExpanded] = useState(true);
   const requiredProfiles = useMemo(
     () => Array.from(new Set((story.assignments ?? []).map((a) => a.required_profile))),
@@ -530,7 +679,7 @@ function StoryMatchingRow({
           {/* Titre complet (multi-ligne autorisé, non tronqué) */}
           <div className="flex items-start gap-2 flex-wrap">
             <span className="text-xs font-semibold text-slate-800 leading-snug whitespace-normal break-words">
-              #{story.story_id} · {story.story_title}
+              <span className="font-mono text-cyan-700">{storyLabel}</span> · {story.story_title}
             </span>
             <StatusBadge map={STORY_STATUS_BADGE} status={story.story_status} />
           </div>
@@ -597,7 +746,6 @@ function StoryMatchingRow({
                 requiredProfile: a.required_profile,
                 requiredSkills: story.required_skills,
               })}
-              onResolveManual={onResolveManual}
               onRecruitmentRequest={onRecruitmentRequest}
               onChangeAssignment={onChangeAssignment}
             />
@@ -613,7 +761,7 @@ function StoryMatchingRow({
 // Card d'un sprint complet
 // ─────────────────────────────────────────────────────────────
 
-function SprintCard({ sprint, projectId, onWhy, onResolveManual, onRecruitmentRequest, onChangeAssignment, defaultExpanded = false }) {
+function SprintCard({ sprint, projectId, storyMap = {}, dbSprint, allDbSprints, onSprintLifecycleChange, onWhy, onRecruitmentRequest, onChangeAssignment, defaultExpanded = false }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const team = sprint.recommended_team ?? [];
 
@@ -644,15 +792,21 @@ function SprintCard({ sprint, projectId, onWhy, onResolveManual, onRecruitmentRe
             {sprint.issues?.length > 0 && (
               <span className="text-rose-600 font-medium">{sprint.issues.length} issue(s)</span>
             )}
-            {sprint.manual_decisions?.length > 0 && (
-              <span className="text-violet-600 font-medium">{sprint.manual_decisions.length} à trancher</span>
-            )}
           </div>
         </div>
       </button>
 
       {expanded && (
         <div className="p-4 space-y-4">
+
+          {/* Cycle de vie : démarrer / clôturer le sprint */}
+          <SprintLifecycleControls
+            dbSprint={dbSprint}
+            allDbSprints={allDbSprints}
+            projectId={projectId}
+            sprintNumber={sprint.sprint_number}
+            onChange={onSprintLifecycleChange}
+          />
 
           {/* Équipe recommandée */}
           {team.length > 0 && (
@@ -711,12 +865,12 @@ function SprintCard({ sprint, projectId, onWhy, onResolveManual, onRecruitmentRe
                 <StoryMatchingRow
                   key={s.story_id}
                   story={s}
+                  storyMeta={storyMap[s.story_id]}
                   sprintNumber={sprint.sprint_number}
                   sprintStart={sprint.start_date}
                   sprintEnd={sprint.end_date}
                   projectId={projectId}
                   onWhy={onWhy}
-                  onResolveManual={onResolveManual}
                   onRecruitmentRequest={onRecruitmentRequest}
                   onChangeAssignment={handleChangeWithTeam}
                 />
@@ -738,15 +892,38 @@ function SprintCard({ sprint, projectId, onWhy, onResolveManual, onRecruitmentRe
 // Composant principal
 // ─────────────────────────────────────────────────────────────
 
-export default function MatchingResultCard({ result, projectId, project, currentUserName, onRefresh }) {
+export default function MatchingResultCard({ result, projectId, project, currentUserName, storyMap = {}, onRefresh }) {
   const [drawer, setDrawer]               = useState({ open: false, payload: null });
-  const [dialog, setDialog]               = useState({ open: false, payload: null });
   const [recruitDialog, setRecruitDialog] = useState({ open: false, payload: null });
   const [changeDialog, setChangeDialog]   = useState({ open: false, payload: null });
   const [rerunning, setRerunning]         = useState(false);
   const [rerunError, setRerunError]       = useState(null);
   const [rerunSuccess, setRerunSuccess]   = useState(false);
   const [activeSprintKey, setActiveSprintKey] = useState(null);
+
+  // ── DB sprints (pm.sprints) pour le cycle de vie démarrer/clôturer ──
+  // Vide tant que la phase staffing n'est pas validée (jira_sync les persiste).
+  const [dbSprints, setDbSprints] = useState([]);
+
+  const reloadDbSprints = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const data = await getProjectSprints(projectId);
+      setDbSprints(Array.isArray(data) ? data : []);
+    } catch {
+      setDbSprints([]);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    reloadDbSprints();
+  }, [reloadDbSprints]);
+
+  const dbSprintByNumber = useMemo(() => {
+    const m = new Map();
+    for (const s of dbSprints) m.set(s.sprint_number, s);
+    return m;
+  }, [dbSprints]);
 
   const sprintsArr = useMemo(() => {
     const map = result?.matching_by_sprint ?? {};
@@ -767,7 +944,6 @@ export default function MatchingResultCard({ result, projectId, project, current
   const projectName = project?.name ?? `Projet #${projectId}`;
 
   const handleWhy = (payload) => setDrawer({ open: true, payload });
-  const handleResolveManual = (payload) => setDialog({ open: true, payload });
   const handleRecruitmentRequest = (payload) => setRecruitDialog({ open: true, payload });
   const handleChangeAssignment = (payload) => setChangeDialog({ open: true, payload });
 
@@ -842,12 +1018,6 @@ export default function MatchingResultCard({ result, projectId, project, current
           Icon={AlertTriangle}
         />
         <SummaryCard
-          label="Décisions PM"
-          value={summary.manual_decision_sprints ?? 0}
-          tone="violet"
-          Icon={HelpCircle}
-        />
-        <SummaryCard
           label="Avec alerte"
           value={summary.assignments_with_warning ?? 0}
           tone="orange"
@@ -894,14 +1064,6 @@ export default function MatchingResultCard({ result, projectId, project, current
               >
                 <span>Sprint {sprint.sprint_number}</span>
                 <Icon size={11} className={isActive ? "text-white" : "text-slate-500"} />
-                {sprint.manual_decisions?.length > 0 && (
-                  <span className={clsx(
-                    "ml-1 text-[9px] font-bold px-1.5 py-0.5 rounded-full",
-                    isActive ? "bg-white text-violet-700" : "bg-violet-100 text-violet-700",
-                  )}>
-                    {sprint.manual_decisions.length}
-                  </span>
-                )}
                 {sprint.issues?.length > 0 && (
                   <span className={clsx(
                     "ml-1 text-[9px] font-bold px-1.5 py-0.5 rounded-full",
@@ -924,8 +1086,11 @@ export default function MatchingResultCard({ result, projectId, project, current
                 key={sprint.key}
                 sprint={sprint}
                 projectId={projectId}
+                storyMap={storyMap}
+                dbSprint={dbSprintByNumber.get(sprint.sprint_number)}
+                allDbSprints={dbSprints}
+                onSprintLifecycleChange={() => { reloadDbSprints(); onRefresh?.(); }}
                 onWhy={handleWhy}
-                onResolveManual={handleResolveManual}
                 onRecruitmentRequest={handleRecruitmentRequest}
                 onChangeAssignment={handleChangeAssignment}
                 defaultExpanded={true}
@@ -947,19 +1112,6 @@ export default function MatchingResultCard({ result, projectId, project, current
         storyTitle={drawer.payload?.storyTitle}
         requiredProfile={drawer.payload?.requiredProfile}
         requiredSkills={drawer.payload?.requiredSkills}
-      />
-
-      {/* Dialog manual decision */}
-      <ManualDecisionDialog
-        open={dialog.open}
-        onClose={() => setDialog({ open: false, payload: null })}
-        projectId={projectId}
-        sprintNumber={dialog.payload?.sprintNumber}
-        storyId={dialog.payload?.storyId}
-        storyTitle={dialog.payload?.storyTitle}
-        requiredProfile={dialog.payload?.requiredProfile}
-        candidateOptions={dialog.payload?.candidateOptions}
-        onResolved={onRefresh}
       />
 
       {/* Dialog recruitment request */}

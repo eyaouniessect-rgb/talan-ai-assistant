@@ -1,35 +1,39 @@
 import {
   FileText, Layers, ListChecks,
   GitBranch, BarChart2, TrendingUp,
-  Calendar, Users, Activity,
+  Users, Activity,
 } from "lucide-react";
 
+// La phase "sprints" a été fusionnée dans le staffing (Step 3 — Répartition
+// initiale). Les anciennes valeurs PHASE_7_SPRINT_PLANNING / phase_*_sprint_planning
+// sont conservées dans le mapping pour compatibilité ascendante avec les anciens
+// records DB, mais ne sont plus exposées dans PHASES / PHASE_LABELS.
 export const PHASE_KEY_MAP = {
-  // Uppercase (SQLAlchemy 2.0 member names — valeurs normales après migration)
+  // Valeurs courantes (8 phases — sprints fusionnée dans staffing)
   PHASE_1_EXTRACTION:      "extract",
   PHASE_2_EPICS:           "epics",
   PHASE_3_STORIES:         "stories",
   PHASE_4_STORY_DEPS:      "story_deps",
   PHASE_5_PRIORITIZATION:  "prioritization",
   PHASE_6_CRITICAL_PATH:   "cpm",
-  PHASE_7_STAFFING:        "staffing",
-  PHASE_8_SPRINT_PLANNING: "sprints",
-  PHASE_9_MONITORING:      "monitoring",
-  // Anciens noms uppercase (DB records créés avant le swap staffing/sprints)
-  PHASE_7_SPRINT_PLANNING: "sprints",
   PHASE_8_STAFFING:        "staffing",
-  // Lowercase fallback (anciennes valeurs, migration en cours ou pas encore appliquée)
+  PHASE_9_MONITORING:      "monitoring",
+  // Lowercase fallback
   phase_1_extraction:      "extract",
   phase_2_epics:           "epics",
   phase_3_stories:         "stories",
   phase_4_story_deps:      "story_deps",
   phase_5_prioritization:  "prioritization",
   phase_6_critical_path:   "cpm",
-  phase_7_staffing:        "staffing",
-  phase_7_sprint_planning: "sprints",
   phase_8_staffing:        "staffing",
-  phase_8_sprint_planning: "sprints",
   phase_9_monitoring:      "monitoring",
+  // DEPRECATED — ancienne phase sprints standalone (fusionnée dans staffing)
+  PHASE_7_SPRINT_PLANNING: "staffing",
+  phase_7_sprint_planning: "staffing",
+  PHASE_7_STAFFING:        "staffing",   // ancien ordre swappé
+  PHASE_8_SPRINT_PLANNING: "staffing",   // ancien ordre swappé
+  phase_7_staffing:        "staffing",
+  phase_8_sprint_planning: "staffing",
 };
 
 export const PHASES = [
@@ -39,8 +43,7 @@ export const PHASES = [
   { id: "story_deps",     label: "Dépendances Stories",  icon: GitBranch,  desc: "Analyse des dépendances entre User Stories" },
   { id: "cpm",            label: "Chemin Critique",      icon: TrendingUp, desc: "Critical Path Method sur les stories" },
   { id: "prioritization", label: "Priorisation MoSCoW",  icon: BarChart2,  desc: "Classement valeur métier × effort" },
-  { id: "staffing",       label: "Staffing",             icon: Users,      desc: "Affectation des stories aux membres de l'équipe" },
-  { id: "sprints",        label: "Sprint Planning",      icon: Calendar,   desc: "Répartition des stories par sprint" },
+  { id: "staffing",       label: "Staffing",             icon: Users,      desc: "Répartition en sprints + affectation aux membres de l'équipe" },
   { id: "monitoring",     label: "Monitoring",           icon: Activity,   desc: "KPIs, alertes et synchronisation Jira" },
 ];
 
@@ -51,7 +54,6 @@ export const PHASE_LABELS = {
   story_deps:     "Dépendances Stories",
   prioritization: "Priorisation MoSCoW",
   cpm:            "Chemin Critique (CPM)",
-  sprints:        "Sprint Planning",
   staffing:       "Staffing",
   monitoring:     "Monitoring",
 };

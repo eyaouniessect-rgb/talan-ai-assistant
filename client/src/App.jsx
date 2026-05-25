@@ -13,6 +13,7 @@ import MesProjets from './pages/pm/MesProjets'
 import PipelineDetail from './pages/pm/PipelineDetail'
 import Settings from './pages/Settings'
 import RHPage from './pages/rh/RHPage'
+import MesTickets from './pages/consultant/MesTickets'
 
 function ProtectedRoute({ children }) {
   const user = useAuthStore(s => s.user)
@@ -23,6 +24,13 @@ function RHRoute({ children }) {
   const user = useAuthStore(s => s.user)
   if (!user) return <Navigate to="/" replace />
   if (user.role !== 'rh') return <Navigate to="/dashboard" replace />
+  return children
+}
+
+function ConsultantRoute({ children }) {
+  const user = useAuthStore(s => s.user)
+  if (!user) return <Navigate to="/" replace />
+  if (user.role !== 'consultant') return <Navigate to="/dashboard" replace />
   return children
 }
 
@@ -60,6 +68,7 @@ export default function App() {
           <Route path="projet/:id" element={<PipelineDetail />} />
           <Route path="settings" element={<Settings />} />
           <Route path="rh" element={<RHRoute><RHPage /></RHRoute>} />
+          <Route path="mes-tickets" element={<ConsultantRoute><MesTickets /></ConsultantRoute>} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

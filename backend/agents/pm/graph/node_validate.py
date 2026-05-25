@@ -157,7 +157,6 @@ async def _get_phase_output(state: PMPipelineState, phase: str) -> dict:
     phase_field_map = {
         "story_deps":      "story_dependencies",
         "prioritization":  "priorities",
-        "sprints":         "sprints",
         "staffing":        "staffing",
     }
 

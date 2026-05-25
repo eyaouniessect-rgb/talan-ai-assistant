@@ -309,7 +309,7 @@ export default function PipelineDetail() {
             {project?.project_name}
           </h1>
           <p className="text-slate-500 text-sm mt-0.5">
-            Pipeline IA · {project?.phases.length ?? 0} / 9 phases enregistrées
+            Pipeline IA · {project?.phases.length ?? 0} / 8 phases enregistrées
           </p>
           {project?.jira_project_key && (
             <span className="inline-flex items-center gap-1 mt-1 text-xs text-indigo-600 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-full">
@@ -446,7 +446,7 @@ export default function PipelineDetail() {
                   )}
                   {["done", "active"].includes(getPhaseStatus(activePhase)) &&
                     project?.jira_project_key &&
-                    ["epics", "stories", "story_deps", "cpm", "sprints"].includes(activePhase) && (
+                    ["epics", "stories", "story_deps", "cpm", "staffing"].includes(activePhase) && (
                       <button
                         onClick={() => handleResyncJira(activePhase)}
                         disabled={resyncLoading}
