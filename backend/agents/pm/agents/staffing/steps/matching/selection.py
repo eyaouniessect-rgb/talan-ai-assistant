@@ -116,9 +116,8 @@ def filter_eligible_with_degradation(
       - gap_reason     : "" si trouvé, sinon "no_available_candidate" | "capacity_gap"
       - downgrade_from : required_level si on a dû descendre le niveau, sinon None
 
-    Note : "seniority_gap" n'est plus émis — la dégradation gracieuse le
-    supplante. Si vraiment AUCUN candidat n'est disponible, on retourne
-    "no_available_candidate" → l'UI propose un envoi RH.
+    Si aucun candidat n'est disponible à AUCUN niveau (avec capacité),
+    on retourne "no_available_candidate" → l'UI propose un envoi RH.
     """
     if not candidates:
         return [], "no_available_candidate", None
@@ -221,27 +220,24 @@ def pick_candidate(
 
     Retourne un dict :
       {
-        "decision": "assigned" | "assigned_with_warning",
+        "decision": "assigned" | "assigned_with_warning" | "no_available_candidate",
         "warning_type": str | None,
-        "chosen": dict,                  # le candidat retenu
-        "candidate_options": list[dict]  # toujours vide (plus de manual auto)
+        "chosen": dict | None,           # le candidat retenu
       }
     """
     if not scored:
         return {
-            "decision":          "no_available_candidate",
-            "warning_type":      None,
-            "chosen":            None,
-            "candidate_options": [],
+            "decision":     "no_available_candidate",
+            "warning_type": None,
+            "chosen":       None,
         }
 
     group, level_label = pick_best_match_group(scored)
     if not group:
         return {
-            "decision":          "no_available_candidate",
-            "warning_type":      None,
-            "chosen":            None,
-            "candidate_options": [],
+            "decision":     "no_available_candidate",
+            "warning_type": None,
+            "chosen":       None,
         }
 
     # 2. Calcul du waste
@@ -256,7 +252,7 @@ def pick_candidate(
     pool      = [c for c in enriched if c["waste"] == min_waste]
 
     if len(pool) == 1:
-        return _decide(pool[0], level_label, [])
+        return _decide(pool[0], level_label)
 
     # 4. Tie-break : meilleur skill_score arrondi
     max_score = max(round(c["skill_score"], SKILL_SCORE_PRECISION) for c in pool)
@@ -265,7 +261,7 @@ def pick_candidate(
         if round(c["skill_score"], SKILL_SCORE_PRECISION) == max_score
     ]
     if len(pool) == 1:
-        return _decide(pool[0], level_label, [])
+        return _decide(pool[0], level_label)
 
     # 5. Tie-break : séniorité la plus proche du required_level
     min_dist = min(_seniority_distance(c["seniority"], required_level) for c in pool)
@@ -274,36 +270,32 @@ def pick_candidate(
         if _seniority_distance(c["seniority"], required_level) == min_dist
     ]
     if len(pool) == 1:
-        return _decide(pool[0], level_label, [])
+        return _decide(pool[0], level_label)
 
     # 6. Tie-break final : employee_id le plus petit (totalement déterministe).
-    # Le PM peut changer ce choix après-coup via "Changer l'affectation" ;
-    # plus de manual_decision_required sur égalités.
+    # Le PM peut changer ce choix après-coup via "Changer l'affectation".
     pool.sort(key=lambda c: c["employee_id"])
-    return _decide(pool[0], level_label, [])
+    return _decide(pool[0], level_label)
 
 
-def _decide(chosen: dict, level_label: str, candidate_options: list[dict]) -> dict:
+def _decide(chosen: dict, level_label: str) -> dict:
     """Construit la sortie selon le groupe retenu."""
     if level_label == "medium":
         return {
-            "decision":          "assigned_with_warning",
-            "warning_type":      "medium_skill_match",
-            "chosen":            chosen,
-            "candidate_options": candidate_options,
+            "decision":     "assigned_with_warning",
+            "warning_type": "medium_skill_match",
+            "chosen":       chosen,
         }
     if level_label == "weak":
         return {
-            "decision":          "assigned_with_warning",
-            "warning_type":      "weak_skill_match",
-            "chosen":            chosen,
-            "candidate_options": candidate_options,
+            "decision":     "assigned_with_warning",
+            "warning_type": "weak_skill_match",
+            "chosen":       chosen,
         }
     return {
-        "decision":          "assigned",
-        "warning_type":      None,
-        "chosen":            chosen,
-        "candidate_options": candidate_options,
+        "decision":     "assigned",
+        "warning_type": None,
+        "chosen":       chosen,
     }
 
 
@@ -315,7 +307,6 @@ _PROFILE_OK_STATUSES = {"assigned", "assigned_with_warning"}
 _PROFILE_ERROR_STATUSES = {
     "missing_profile",
     "capacity_gap",
-    "seniority_gap",
     "no_available_candidate",
 }
 
@@ -323,16 +314,12 @@ _PROFILE_ERROR_STATUSES = {
 def compute_story_status(profile_statuses: list[str]) -> str:
     """
     Calcule le statut d'une user story à partir des statuts de ses profils :
-      - manual si au moins un profil est manual_decision_required
       - fully_assigned si tous OK (assigned ou assigned_with_warning)
       - not_assigned si aucun n'est OK
       - partially_assigned sinon (mix OK + erreurs)
     """
     if not profile_statuses:
         return "not_assigned"
-
-    if any(s == "manual_decision_required" for s in profile_statuses):
-        return "manual_decision_required"
 
     ok_count = sum(1 for s in profile_statuses if s in _PROFILE_OK_STATUSES)
 
@@ -346,16 +333,12 @@ def compute_story_status(profile_statuses: list[str]) -> str:
 def compute_sprint_status(story_statuses: list[str]) -> str:
     """
     Calcule le statut d'un sprint à partir des statuts de ses stories :
-      - manual si au moins une story est manual_decision_required
       - fully_staffed si toutes fully_assigned
       - not_staffed si toutes not_assigned (ou aucune story du tout)
       - partially_staffed sinon
     """
     if not story_statuses:
         return "not_staffed"
-
-    if any(s == "manual_decision_required" for s in story_statuses):
-        return "manual_decision_required"
 
     if all(s == "fully_assigned" for s in story_statuses):
         return "fully_staffed"
@@ -413,7 +396,6 @@ def consume_capacity(
 
 REASON_BY_GAP = {
     "no_available_candidate": "Aucun candidat disponible pour ce profil sur ce sprint.",
-    "seniority_gap":          "Aucun candidat n'a la séniorité requise pour cette story.",
     "capacity_gap":           "Aucun candidat n'a assez de capacité restante sur ce sprint.",
     "missing_profile":        "Profil marqué à recruter par le Project Manager.",
 }
@@ -429,11 +411,6 @@ REASON_BY_WARNING = {
         "une validation ou un accompagnement par le PM."
     ),
 }
-
-REASON_MANUAL_DECISION = (
-    "Plusieurs candidats sont strictement équivalents (même niveau de match, "
-    "même waste, même score, même proximité de séniorité). Le PM doit trancher."
-)
 
 
 def reason_seniority_downgrade(required: str, actual: str) -> str:

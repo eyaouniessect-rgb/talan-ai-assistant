@@ -7,7 +7,7 @@
 # priority rempli en Phase 6 (MoSCoW : must_have | should_have | could_have | wont_have).
 # jira_issue_key rempli après validation + sync Jira.
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
+from sqlalchemy import Boolean, Column, Float, Integer, String, Text, DateTime, ForeignKey, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
@@ -29,6 +29,15 @@ class UserStory(Base):
 
     # Priorité MoSCoW issue de la Phase 6
     priority            = Column(String, nullable=True)
+
+    # ── Sortie de la phase Priorisation (Phase 5) ────────────────
+    # priority_score : score CPM/backpropagation (plus haut = plus prioritaire)
+    # rank           : ordre final (1 = à faire en premier) — utilisé par
+    #                  story_distribution + dashboard consultant
+    # is_critical    : slack CPM ≈ 0 → story sur le chemin critique
+    priority_score      = Column(Float,   nullable=True)
+    rank                = Column(Integer, nullable=True, index=True)
+    is_critical         = Column(Boolean, nullable=False, default=False, server_default="false")
 
     status              = Column(
         SAEnum(StoryStatusEnum, name="storystatusenum",

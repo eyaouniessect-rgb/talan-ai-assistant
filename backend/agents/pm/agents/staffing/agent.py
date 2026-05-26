@@ -2,19 +2,23 @@
 # ═══════════════════════════════════════════════════════════════
 # Phase 8 — Staffing (affectation des stories aux collaborateurs)
 #
-# Pipeline en 6 sous-étapes :
+# Pipeline en 5 sous-étapes :
 #   Step 1 — Profile Extraction      (LLM batch)       ← implémenté
 #   Step 2 — Profile Normalization   (LLM + DB)        ← implémenté
 #   Step 3 — Story Distribution      (déterministe)    ← implémenté
 #   Step 4 — Candidate Filtering     (DB, par sprint)  ← implémenté
-#   Step 5 — Matching                (LLM batch)       ← à venir
-#   Step 6 — Velocity & Feasibility  (déterministe)    ← à venir
+#   Step 5 — Matching                (LLM batch)       ← implémenté
+#
+# Après Step 5 (matching réussi) :
+#   - persist_assignments() → matérialise staffing_assignments en DB
+#   - persist_sprints()     → matérialise project_management.sprints en DB
+#   - state["sprints"]      → peuplé depuis distrib_result pour la sync Jira
 #
 # Flux de validation :
 #   node_staffing → node_validate (interrupt) → humain valide/rejette
 #   Si rejeté avec feedback → node_staffing relancé avec human_feedback
 #   Si validé et steps non finis → re-route vers node_staffing (step suivant)
-#   Si validé et tous done → jira_sync → node_sprints
+#   Si validé et tous done → jira_sync (crée sprints Jira + add stories) → END
 # ═══════════════════════════════════════════════════════════════
 
 from agents.pm.state import PMPipelineState
@@ -23,7 +27,6 @@ from agents.pm.agents.staffing.steps.profile_normalization.service import normal
 from agents.pm.agents.staffing.steps.story_distribution.service    import distribute_stories
 from agents.pm.agents.staffing.steps.candidate_filtering.service   import filter_candidates
 from agents.pm.agents.staffing.steps.matching.service              import match_assignments
-from agents.pm.agents.staffing.steps.matching.repository           import persist_assignments
 
 _EMPTY_STEPS = {
     "profile_extraction":    {"status": "pending", "result": None},
@@ -31,7 +34,6 @@ _EMPTY_STEPS = {
     "story_distribution":    {"status": "pending", "result": None},
     "candidate_filtering":   {"status": "pending", "result": None},
     "matching":              {"status": "pending", "result": None},
-    "velocity_feasibility":  {"status": "pending", "result": None},
 }
 
 _STEP_ORDER = [
@@ -40,7 +42,6 @@ _STEP_ORDER = [
     "story_distribution",
     "candidate_filtering",
     "matching",
-    "velocity_feasibility",
 ]
 
 
@@ -71,6 +72,10 @@ async def node_staffing(state: PMPipelineState) -> dict:
     for key, default in _EMPTY_STEPS.items():
         if key not in steps:
             steps[key] = default.copy()
+
+    # Strip any unknown/legacy step keys (e.g. velocity_feasibility removed in
+    # the post-matching refactor) so they can't block the validation routing.
+    steps = {k: v for k, v in steps.items() if k in _EMPTY_STEPS}
 
     print(f"[staffing] ▶ projet={project_id} | {len(stories)} stories | feedback={bool(human_feedback)}")
     print(f"[staffing]   statuts : " + " | ".join(
@@ -129,7 +134,6 @@ async def node_staffing(state: PMPipelineState) -> dict:
                 "story_distribution":    {"status": "pending", "result": None},
                 "candidate_filtering":   {"status": "pending", "result": None},
                 "matching":              {"status": "pending", "result": None},
-                "velocity_feasibility":  {"status": "pending", "result": None},
             }
             print(f"[staffing] ✅ Step 1 terminé — {len(result.stories_profiles)} profils extraits")
         except Exception as e:
@@ -157,7 +161,6 @@ async def node_staffing(state: PMPipelineState) -> dict:
                 "story_distribution":    {"status": "pending", "result": None},
                 "candidate_filtering":   {"status": "pending", "result": None},
                 "matching":              {"status": "pending", "result": None},
-                "velocity_feasibility":  {"status": "pending", "result": None},
             }
             total    = len(norm_result.profile_mappings)
             matched  = sum(1 for m in norm_result.profile_mappings if m.match_type != "no_match")
@@ -190,7 +193,6 @@ async def node_staffing(state: PMPipelineState) -> dict:
                 "story_distribution":  {"status": "done", "result": distrib_result.model_dump()},
                 "candidate_filtering": {"status": "pending", "result": None},
                 "matching":            {"status": "pending", "result": None},
-                "velocity_feasibility":{"status": "pending", "result": None},
             }
             print(
                 f"[staffing] ✅ Step 3 terminé — "
@@ -221,7 +223,6 @@ async def node_staffing(state: PMPipelineState) -> dict:
                 **steps,
                 "candidate_filtering": {"status": "done", "result": filter_result.model_dump()},
                 "matching":            {"status": "pending", "result": None},
-                "velocity_feasibility":{"status": "pending", "result": None},
             }
             total_candidates = sum(
                 sc["total_available"]
@@ -261,44 +262,80 @@ async def node_staffing(state: PMPipelineState) -> dict:
             matching_dump = m_res.model_dump()
             steps = {
                 **steps,
-                "matching":             {"status": "done", "result": matching_dump},
-                "velocity_feasibility": {"status": "pending", "result": None},
+                "matching": {"status": "done", "result": matching_dump},
             }
             gs = m_res.global_summary
             print(
                 f"[staffing] ✅ Step 5 terminé — "
                 f"{gs.fully_staffed_sprints}/{gs.total_sprints} fully | "
                 f"{gs.partially_staffed_sprints} partial | "
-                f"{gs.manual_decision_sprints} manual | "
                 f"{gs.assignments_with_warning} warning(s) | "
                 f"{gs.total_recommended_team_members} membres recommandés"
             )
-
-            # Matérialisation DB : delete-then-insert par project_id (idempotent).
-            # La source de vérité reste le state JSON ; la table sert au dashboard.
-            try:
-                if project_id:
-                    n = await persist_assignments(project_id, matching_dump)
-                    print(f"[staffing]   ↳ {n} affectation(s) persistées en DB")
-            except Exception as persist_err:
-                print(f"[staffing] ⚠️  persistance DB matching échouée : {persist_err}")
         except Exception as e:
             print(f"[staffing] ❌ Step 5 échoué : {e}")
             steps = {**steps, "matching": {"status": "error", "error": str(e), "result": None}}
             return _return(staffing, steps)
 
-        return _return(staffing, steps)
+        sprints_state = _build_sprints_state(distrib_result)
+        return _return(staffing, steps, sprints=sprints_state)
 
-    # ── Steps suivants (à implémenter) ────────────────────────
-    print("[staffing] ⏳ en attente de la validation PM (step 6 à implémenter)")
-    return _return(staffing, steps)
+    # ── Tous les steps sont done → en attente de la validation PM ─
+    # La persistance DB est repoussée à node_jira_sync (après validation PM),
+    # pour permettre au PM de modifier les affectations avant que les
+    # tables staffing_assignments / sprints soient écrites.
+    print("[staffing] ⏳ tous les steps terminés — en attente de la validation PM")
+    sprints_state = _build_sprints_state(distrib_result)
+    return _return(staffing, steps, sprints=sprints_state)
 
 
-def _return(staffing: dict, steps: dict) -> dict:
-    return {
+def _build_sprints_state(distrib_result: dict | None) -> list[dict] | None:
+    """
+    Construit state["sprints"] depuis distrib_result.
+    Format consommé par node_jira_sync._sync_sprints. Pas de db_id ici —
+    il sera connu seulement après que jira_sync ait persisté les sprints
+    (la sync utilise sprint_number pour relier le db_id).
+    """
+    if not distrib_result:
+        return None
+
+    sprint_to_story_dbids: dict[int, list[int]] = {}
+    for sprint_win in (distrib_result or {}).get("sprints", []):
+        sn = sprint_win.get("sprint_number")
+        if sn is None:
+            continue
+        sprint_to_story_dbids[sn] = [
+            st.get("story_id")
+            for st in sprint_win.get("assigned_stories", [])
+            if st.get("story_id") is not None
+        ]
+
+    sprints_state: list[dict] = []
+    for sprint_win in (distrib_result or {}).get("sprints", []):
+        sn = sprint_win.get("sprint_number")
+        if sn is None:
+            continue
+        sprints_state.append({
+            "sprint_number":      sn,
+            "name":               f"Sprint {sn}",
+            "start_date":         sprint_win.get("start_date"),
+            "end_date":           sprint_win.get("end_date"),
+            "target_capacity_sp": sprint_win.get("target_capacity_sp"),
+            "actual_sp":          sprint_win.get("actual_sp"),
+            "story_ids":          sprint_to_story_dbids.get(sn, []),
+        })
+
+    return sprints_state
+
+
+def _return(staffing: dict, steps: dict, sprints: list[dict] | None = None) -> dict:
+    out = {
         "staffing":          {**staffing, "steps": steps},
         "current_phase":     "staffing",
         "validation_status": "pending_human",
         "human_feedback":    None,
         "error":             None,
     }
+    if sprints is not None:
+        out["sprints"] = sprints
+    return out

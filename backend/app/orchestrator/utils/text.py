@@ -179,8 +179,14 @@ def _is_gibberish(text: str) -> bool:
 
     if len(alpha_only) >= 5 and ratio < 0.15:
         return True
-    if re.search(r"[^aeiouyàâäéèêëïîôùûüÿœæ]{6,}", alpha_only):
-        return True
+
+    # Vérifier 6+ consonnes consécutives MOT PAR MOT.
+    # Sur le texte agglutiné on aurait des faux positifs : "derniers msg du"
+    # devient "derniersmsgdu" et "rsmsgd" = 6 consonnes alors que chaque mot
+    # pris isolément est parfaitement normal.
+    for word in re.findall(r"[a-zàâäéèêëïîôùûüÿçœæ]+", clean):
+        if re.search(r"[^aeiouyàâäéèêëïîôùûüÿœæ]{6,}", word):
+            return True
     return False
 
 

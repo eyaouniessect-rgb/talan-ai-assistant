@@ -192,6 +192,9 @@ export default function PriorisationSection({ aiOutput, projectId, criticalPath 
                           </span>
                         )}
                         <p className="text-sm text-slate-800 font-medium leading-snug">
+                          {story.jira_issue_key && (
+                            <span className="font-mono text-cyan-700 mr-1.5">{story.jira_issue_key}</span>
+                          )}
                           {story.title}
                         </p>
                       </div>

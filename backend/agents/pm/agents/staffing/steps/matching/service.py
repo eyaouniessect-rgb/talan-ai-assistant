@@ -37,7 +37,6 @@ from agents.pm.agents.staffing.steps.matching.selection import (
     CAPACITY_BY_SENIORITY,
     REASON_BY_GAP,
     REASON_BY_WARNING,
-    REASON_MANUAL_DECISION,
     classify_match_level,
     compute_skill_score,
     compute_sprint_status,
@@ -325,48 +324,6 @@ def _make_assigned(
     )
 
 
-def _make_manual(
-    profile:        str,
-    required_level: str,
-    allocated_sp:   float,
-    options:        list[dict],
-    seniority_downgrade: Optional[str] = None,
-) -> ProfileAssignment:
-    """Construit un ProfileAssignment status=manual_decision_required."""
-    reason = REASON_MANUAL_DECISION
-    if seniority_downgrade and options:
-        actual = options[0].get("seniority", "MID")
-        reason = (
-            reason_seniority_downgrade(seniority_downgrade, actual)
-            + " Plusieurs candidats équivalents — le PM doit trancher."
-        )
-    return ProfileAssignment(
-        required_profile         = profile,
-        required_level           = required_level,
-        allocated_sp             = allocated_sp,
-        status                   = "manual_decision_required",
-        seniority_downgrade_from = seniority_downgrade,
-        reason                   = reason,
-        candidate_options        = [
-            CandidateOption(
-                employee_id           = o["employee_id"],
-                name                  = o["name"],
-                job_title             = o.get("job_title", ""),
-                seniority             = o.get("seniority", "MID"),
-                skill_score           = o["skill_score"],
-                match_level           = o["match_level"],
-                matched_skills        = o.get("matched_skills",   []),
-                inferred_matches      = o.get("inferred_matches", []),
-                missing_skills        = o.get("missing_skills",   []),
-                remaining_capacity_sp = o["remaining_capacity_sp"],
-                waste                 = o["waste"],
-                reason                = o.get("reason", ""),
-            )
-            for o in options
-        ],
-    )
-
-
 # ──────────────────────────────────────────────────────────────
 # Traitement d'un sprint complet
 # ──────────────────────────────────────────────────────────────
@@ -506,7 +463,6 @@ async def _match_sprint(
     # 4. Itérer les stories dans l'ordre fourni et fabriquer les assignments
     story_matchings: list[StoryMatching] = []
     issues:          list[ProfileAssignment] = []
-    manual:          list[ProfileAssignment] = []
 
     for story in assigned_stories_in_sprint:
         sid          = story["story_id"]
@@ -596,16 +552,6 @@ async def _match_sprint(
                 capacity_state  = capacity_state,
             )
 
-            if decision["decision"] == "manual_decision_required":
-                pa = _make_manual(
-                    profile, required_level, allocated_sp,
-                    decision["candidate_options"],
-                    seniority_downgrade=seniority_downgrade,
-                )
-                per_profile_assignments.append(pa)
-                manual.append(pa)
-                continue
-
             if decision["decision"] == "no_available_candidate" or decision["chosen"] is None:
                 pa = _make_unassigned(profile, required_level, allocated_sp, "no_available_candidate")
                 per_profile_assignments.append(pa)
@@ -672,7 +618,6 @@ async def _match_sprint(
         recommended_team     = recommended_team,
         story_assignments    = story_matchings,
         issues               = issues,
-        manual_decisions     = manual,
     )
 
 
@@ -748,7 +693,6 @@ async def match_assignments(
     total_sprints              = len(matching_by_sprint)
     fully_staffed_sprints      = sum(1 for s in matching_by_sprint.values() if s.sprint_status == "fully_staffed")
     partially_staffed_sprints  = sum(1 for s in matching_by_sprint.values() if s.sprint_status == "partially_staffed")
-    manual_decision_sprints    = sum(1 for s in matching_by_sprint.values() if s.sprint_status == "manual_decision_required")
     not_staffed_sprints        = sum(1 for s in matching_by_sprint.values() if s.sprint_status == "not_staffed")
 
     # Membres uniques de l'équipe recommandée (cross-sprint)
@@ -770,7 +714,6 @@ async def match_assignments(
         total_sprints                  = total_sprints,
         fully_staffed_sprints          = fully_staffed_sprints,
         partially_staffed_sprints      = partially_staffed_sprints,
-        manual_decision_sprints        = manual_decision_sprints,
         not_staffed_sprints            = not_staffed_sprints,
         total_recommended_team_members = len(unique_member_ids),
         missing_profiles               = sorted(missing_global),
@@ -783,7 +726,6 @@ async def match_assignments(
         f"[matching] ✅ Step 5 terminé — "
         f"{fully_staffed_sprints}/{total_sprints} fully | "
         f"{partially_staffed_sprints} partial | "
-        f"{manual_decision_sprints} manual | "
         f"{not_staffed_sprints} not | "
         f"{assignments_with_warning} warning(s)"
     )

@@ -130,7 +130,6 @@ _PHASE_STR_TO_ENUM: dict[str, PipelinePhaseEnum] = {
     "story_deps":     PipelinePhaseEnum.PHASE_4_STORY_DEPS,
     "prioritization": PipelinePhaseEnum.PHASE_5_PRIORITIZATION,
     "cpm":            PipelinePhaseEnum.PHASE_6_CRITICAL_PATH,
-    "sprints":        PipelinePhaseEnum.PHASE_7_SPRINT_PLANNING,
     "staffing":       PipelinePhaseEnum.PHASE_8_STAFFING,
     "monitoring":     PipelinePhaseEnum.PHASE_9_MONITORING,
 }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import {
   CheckCircle, Clock, Loader, ChevronDown, ChevronRight,
-  User, Wrench, TrendingUp, Zap, AlertCircle, RefreshCw,
+  User, Wrench, Zap, AlertCircle, RefreshCw,
   Pencil, X, Check, Save, Calendar, Users,
 } from "lucide-react";
 import clsx from "clsx";
@@ -44,12 +44,6 @@ const SUB_STEPS = [
     label: "Matching stories / équipe",
     icon:  Zap,
     desc:  "Affectation intelligente de chaque story au meilleur collaborateur",
-  },
-  {
-    key:   "velocity_feasibility",
-    label: "Vélocité & Faisabilité",
-    icon:  TrendingUp,
-    desc:  "Calcul de la vélocité estimée et analyse de la faisabilité de la deadline",
   },
 ];
 
@@ -657,6 +651,9 @@ function ProfileExtractionResult({ result, storyMap, loading, projectId }) {
                         <div className="h-3 bg-slate-100 rounded w-3/4 animate-pulse" />
                       ) : story ? (
                         <p className="text-sm text-slate-800 font-medium leading-snug">
+                          {story.jira_issue_key && (
+                            <span className="font-mono text-cyan-700 mr-1.5">{story.jira_issue_key}</span>
+                          )}
                           {story.title}
                         </p>
                       ) : (
@@ -1783,15 +1780,10 @@ export default function StaffingSection({ aiOutput, projectId, project, onRefres
               result={stepData.result}
               projectId={projectId}
               project={project}
+              storyMap={storyMap}
               currentUserName={aiOutput?.user_name ?? aiOutput?.pm_name ?? null}
               onRefresh={onRefresh}
             />
-          )}
-
-          {status === "done" && activeStep === "velocity_feasibility" && (
-            <p className="text-sm text-slate-400 italic text-center py-8">
-              Résultat vélocité & faisabilité disponible — affichage à venir.
-            </p>
           )}
         </div>
       </div>

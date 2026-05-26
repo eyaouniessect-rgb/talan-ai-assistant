@@ -130,22 +130,18 @@ ProfileAssignmentStatus = Literal[
     "assigned_with_warning",
     "missing_profile",
     "capacity_gap",
-    "seniority_gap",
     "no_available_candidate",
-    "manual_decision_required",
 ]
 
 StoryStatus = Literal[
     "fully_assigned",
     "partially_assigned",
     "not_assigned",
-    "manual_decision_required",
 ]
 
 SprintStatus = Literal[
     "fully_staffed",
     "partially_staffed",
-    "manual_decision_required",
     "not_staffed",
 ]
 
@@ -154,7 +150,8 @@ WarningType = Literal["medium_skill_match", "weak_skill_match"]
 
 
 class CandidateOption(BaseModel):
-    """Option proposée au PM en cas de manual_decision_required."""
+    """Candidat évalué pour un (story × profile). Utilisé dans alternative_candidates
+    pour permettre au PM de changer l'affectation post-matching."""
     employee_id:           int
     name:                  str
     job_title:             str
@@ -188,7 +185,6 @@ class ProfileAssignment(BaseModel):
     # Si la séniorité a été dégradée (ex : story requiert SENIOR mais on a affecté MID),
     # on indique ici le niveau initialement requis. None sinon.
     seniority_downgrade_from: Optional[Literal["JUNIOR", "MID", "SENIOR"]] = None
-    candidate_options: list[CandidateOption] = []   # rempli ssi status=manual_decision_required
     # Tous les candidats éligibles scorés par le LLM pour ce (story × profile),
     # peu importe celui qui a été retenu. Permet au PM de changer l'affectation
     # via le bouton "Changer l'affectation" côté frontend.
@@ -226,14 +222,12 @@ class SprintMatching(BaseModel):
     recommended_team:     list[TeamMemberRecommended] = []
     story_assignments:    list[StoryMatching]         = []
     issues:               list[ProfileAssignment]     = []  # vue filtrée des erreurs profils
-    manual_decisions:     list[ProfileAssignment]     = []  # vue filtrée des manual
 
 
 class GlobalMatchingSummary(BaseModel):
     total_sprints:                 int
     fully_staffed_sprints:         int = 0
     partially_staffed_sprints:     int = 0
-    manual_decision_sprints:       int = 0
     not_staffed_sprints:           int = 0
     total_recommended_team_members: int = 0
     missing_profiles:              list[str] = []
@@ -245,36 +239,6 @@ class GlobalMatchingSummary(BaseModel):
 class MatchingResult(BaseModel):
     matching_by_sprint: dict[str, SprintMatching]   # clé = "sprint_1", "sprint_2"…
     global_summary:     GlobalMatchingSummary
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 6 — Velocity & Feasibility
-# ──────────────────────────────────────────────────────────────
-
-class SprintCapacity(BaseModel):
-    sprint:   int
-    capacity: int
-
-
-class TeamMember(BaseModel):
-    employee_id:           int
-    name:                  str
-    job_title:             str
-    seniority:             Literal["JUNIOR", "MID", "SENIOR"]
-    capacity_per_sprint:   int
-    assigned_story_points: int
-    availability_status:   Literal["Available", "Partially Available"]
-
-
-class VelocityFeasibilityResult(BaseModel):
-    number_of_sprints:          int
-    sprint_duration_days:       int
-    estimated_velocity_average: float
-    required_velocity:          float
-    velocity_by_sprint:         list[SprintCapacity]
-    feasibility:                Literal["Feasible", "Risky", "Not Feasible"]
-    message:                    str
-    recommendations:            list[str]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -300,12 +264,10 @@ class StaffingOutput(BaseModel):
             "story_distribution":    StaffingStepStatus(status="pending"),
             "candidate_filtering":   StaffingStepStatus(status="pending"),
             "matching":              StaffingStepStatus(status="pending"),
-            "velocity_feasibility":  StaffingStepStatus(status="pending"),
         }
     )
 
     required_profiles:  list[dict] = []
     recommended_team:   list[dict] = []
     assignments:        list[dict] = []
-    velocity:           dict       = {}
     recommendations:    list[str]  = []

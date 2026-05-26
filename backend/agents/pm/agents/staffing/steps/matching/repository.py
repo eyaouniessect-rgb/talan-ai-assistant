@@ -69,7 +69,6 @@ async def persist_assignments(project_id: int, matching_result: dict) -> int:
                     "warning_type":       a.get("warning_type"),
                     "seniority_downgrade_from": a.get("seniority_downgrade_from"),
                     "reason":             a.get("reason", ""),
-                    "candidate_options":  a.get("candidate_options", []),
                 })
 
     async with AsyncSessionLocal() as db:
@@ -143,7 +142,6 @@ async def get_assignments_by_project(project_id: int) -> list[dict]:
             "warning_type":       r.warning_type,
             "seniority_downgrade_from": r.seniority_downgrade_from,
             "reason":             r.reason,
-            "candidate_options":  r.candidate_options or [],
         }
         for r in rows
     ]

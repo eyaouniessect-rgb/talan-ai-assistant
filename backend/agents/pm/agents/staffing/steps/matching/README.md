@@ -341,14 +341,8 @@ Si après filtrage personne n'est éligible, la story reçoit un statut d'erreur
 | Statut | Signification |
 |---|---|
 | `missing_profile` | Ce profil a été marqué "à recruter" par le PM |
-| `no_available_candidate` | Aucun employé de ce profil dans l'équipe |
+| `no_available_candidate` | Aucun employé de ce profil n'est disponible sur ce sprint |
 | `capacity_gap` | Des employés existent mais tous ont épuisé leur capacité sprint |
-
-### Décision manuelle du PM (cas rare)
-
-Ce statut n'apparaît que si plusieurs candidats sont strictement identiques
-sur les 4 critères (même waste, même score, même séniorité, même employee_id
-impossible). En pratique, le tie-break sur employee_id empêche ce cas.
 
 ---
 
@@ -359,7 +353,7 @@ impossible). En pratique, le tie-break sur employee_id empêche ce cas.
 ```
 SprintMatching
 ├── sprint_number, start_date, end_date
-├── sprint_status  ("fully_staffed" | "partially_staffed" | "not_staffed" | ...)
+├── sprint_status  ("fully_staffed" | "partially_staffed" | "not_staffed")
 ├── planned_story_points  (somme des SP des stories du sprint)
 ├── recommended_team  ← liste des employés affectés à ce sprint
 │     ├── name, seniority, job_title
@@ -369,7 +363,7 @@ SprintMatching
 │     └── stories_handled   (nombre de stories pris en charge)
 ├── story_assignments  ← liste des stories et leurs affectations
 │     ├── story_id, story_title, story_points
-│     ├── story_status  ("fully_assigned" | "partially_assigned" | ...)
+│     ├── story_status  ("fully_assigned" | "partially_assigned" | "not_assigned")
 │     └── assignments  ← liste des profils et l'employé choisi
 │           ├── required_profile  (ex: "Backend Developer")
 │           ├── employee_id, employee_name, employee_seniority
@@ -377,14 +371,13 @@ SprintMatching
 │           ├── skill_score  (0.0 → 1.0)
 │           ├── match_level  ("excellent" | "good" | "medium" | "weak")
 │           ├── matched_skills, inferred_matches, missing_skills
-│           ├── status  ("assigned" | "assigned_with_warning" | "missing_profile" | ...)
+│           ├── status  ("assigned" | "assigned_with_warning" | "missing_profile" | "capacity_gap" | "no_available_candidate")
 │           ├── warning_type  (null | "medium_skill_match" | "weak_skill_match")
 │           ├── seniority_downgrade_from  (null | "SENIOR" | "MID")
 │           ├── reason  (explication textuelle pour le PM)
 │           └── alternative_candidates  ← TOUS les candidats évalués pour ce (story × profil)
 │                 (utilisé par le bouton "Changer l'affectation")
-├── issues  ← affectations en erreur (missing_profile, no_available_candidate, ...)
-└── manual_decisions  ← affectations nécessitant une décision PM
+└── issues  ← affectations en erreur (missing_profile, capacity_gap, no_available_candidate)
 ```
 
 ### Statuts possibles d'une affectation (profil)
@@ -394,9 +387,8 @@ SprintMatching
 | `assigned` | Employé affecté avec bon niveau de compétences |
 | `assigned_with_warning` | Employé affecté mais compétences moyennes ou faibles — ou séniorité dégradée |
 | `missing_profile` | Profil marqué à recruter par le PM |
-| `no_available_candidate` | Aucun employé de ce profil dans l'équipe |
+| `no_available_candidate` | Aucun employé de ce profil disponible sur le sprint |
 | `capacity_gap` | Tous les candidats ont épuisé leur capacité sprint |
-| `manual_decision_required` | PM doit choisir (égalité parfaite — rare) |
 
 ### Statuts agrégés
 
@@ -407,7 +399,6 @@ SprintMatching
 | `fully_assigned` | Tous les profils de la story sont affectés |
 | `partially_assigned` | Certains profils OK, d'autres en erreur |
 | `not_assigned` | Aucun profil n'a pu être affecté |
-| `manual_decision_required` | Au moins un profil attend une décision PM |
 
 **Sprint status** (calculé à partir de ses stories) :
 
@@ -416,7 +407,6 @@ SprintMatching
 | `fully_staffed` | Toutes les stories sont `fully_assigned` |
 | `partially_staffed` | Mix de stories affectées et en erreur |
 | `not_staffed` | Aucune story affectée |
-| `manual_decision_required` | Au moins une story attend une décision PM |
 
 ---
 

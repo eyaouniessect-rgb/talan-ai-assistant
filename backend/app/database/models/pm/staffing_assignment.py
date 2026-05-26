@@ -53,16 +53,19 @@ class StaffingAssignment(Base):
     inferred_matches = Column(JSONB, nullable=False, default=list)
     missing_skills   = Column(JSONB, nullable=False, default=list)
 
-    # assigned | assigned_with_warning | missing_profile | capacity_gap
-    # | seniority_gap | no_available_candidate | manual_decision_required
+    # assigned | assigned_with_warning | missing_profile | capacity_gap | no_available_candidate
     status       = Column(String(40), nullable=False)
     warning_type = Column(String(40), nullable=True)
+
+    # Avancement du travail de la story par le consultant assigné.
+    # to_do (par défaut) | in_progress | done
+    # → passé à 'done' automatiquement à la clôture du sprint parent
+    #   (cf POST /pipeline/{id}/sprints/{n}/close).
+    # → utilisé par le dashboard consultant (compteurs de tickets).
+    progress_status = Column(String(20), nullable=False, default="to_do", server_default="to_do")
     # Si la séniorité a été dégradée pour ne pas bloquer le matching.
     seniority_downgrade_from = Column(String(20), nullable=True)
     reason       = Column(Text,       nullable=False, default="")
-
-    # Pour manual_decision_required : liste sérialisée de CandidateOption.
-    candidate_options = Column(JSONB, nullable=False, default=list)
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

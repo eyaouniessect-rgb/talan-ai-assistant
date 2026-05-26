@@ -1,6 +1,6 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import { useAuthStore, useNotifStore } from '../../store'
-import { LayoutDashboard, MessageSquare, Clock, Bell, Settings, Rocket, LogOut, Zap, X, ShieldCheck, FolderOpen } from 'lucide-react'
+import { LayoutDashboard, MessageSquare, Clock, Bell, Settings, Rocket, LogOut, Zap, X, ShieldCheck, FolderOpen, CheckSquare, Briefcase, Users, Building2, Award } from 'lucide-react'
 import clsx from 'clsx'
 
 const NAV = [
@@ -19,6 +19,7 @@ export default function Sidebar({ open, onClose }) {
   const nav = useNavigate()
   const isPM = user?.role === 'pm'
   const isRH = user?.role === 'rh'
+  const isConsultant = user?.role === 'consultant'
 
   const handleLogout = () => { logout(); nav('/') }
 
@@ -50,16 +51,50 @@ export default function Sidebar({ open, onClose }) {
 
         {/* User */}
         <div className="px-4 py-4 border-b border-slate-100">
-          <div className="flex items-center gap-3 p-2.5 bg-slate-50 rounded-xl">
-            <div className="w-9 h-9 bg-navy rounded-xl flex items-center justify-center shrink-0">
-              <span className="text-white text-xs font-bold">{user?.initials}</span>
+          <div className="p-2.5 bg-slate-50 rounded-xl space-y-2">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 bg-navy rounded-xl flex items-center justify-center shrink-0">
+                <span className="text-white text-xs font-bold">{user?.initials}</span>
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold text-slate-800 truncate">{user?.name}</div>
+                <span className={isPM ? 'badge-pm' : isRH ? 'badge-rh' : 'badge-consultant'}>
+                  {isPM ? 'Project Manager' : isRH ? 'RH' : 'Consultant'}
+                </span>
+              </div>
             </div>
-            <div className="min-w-0">
-              <div className="text-sm font-semibold text-slate-800 truncate">{user?.name}</div>
-              <span className={isPM ? 'badge-pm' : isRH ? 'badge-rh' : 'badge-consultant'}>
-                {isPM ? 'Project Manager' : isRH ? 'RH' : 'Consultant'}
-              </span>
-            </div>
+
+            {/* Infos RH (seniority / profil / équipe / dépt) */}
+            {(user?.seniority || user?.job_title || user?.team_name || user?.department_name) && (
+              <div className="pt-2 border-t border-slate-200 space-y-1 text-[11px]">
+                {user?.job_title && (
+                  <div className="flex items-center gap-1.5 text-slate-600">
+                    <Briefcase size={11} className="text-slate-400 shrink-0"/>
+                    <span className="truncate">{user.job_title}</span>
+                  </div>
+                )}
+                {user?.seniority && (
+                  <div className="flex items-center gap-1.5 text-slate-600">
+                    <Award size={11} className="text-slate-400 shrink-0"/>
+                    <span className="px-1.5 py-0.5 rounded-full bg-cyan/10 text-cyan font-semibold text-[10px]">
+                      {user.seniority}
+                    </span>
+                  </div>
+                )}
+                {user?.team_name && (
+                  <div className="flex items-center gap-1.5 text-slate-600">
+                    <Users size={11} className="text-slate-400 shrink-0"/>
+                    <span className="truncate">{user.team_name}</span>
+                  </div>
+                )}
+                {user?.department_name && (
+                  <div className="flex items-center gap-1.5 text-slate-500">
+                    <Building2 size={11} className="text-slate-400 shrink-0"/>
+                    <span className="truncate">{user.department_name}</span>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -100,6 +135,15 @@ export default function Sidebar({ open, onClose }) {
               <ShieldCheck size={18} className="shrink-0"/>
               <span className="flex-1">Espace RH</span>
               <span className="text-xs bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-md font-medium">RH</span>
+            </NavLink>
+          )}
+
+          {isConsultant && (
+            <NavLink to="/mes-tickets" onClick={onClose}
+              className={({isActive}) => clsx('sidebar-item mt-2', isActive && 'active')}>
+              <CheckSquare size={18} className="shrink-0"/>
+              <span className="flex-1">Mes tickets</span>
+              <span className="text-xs bg-cyan/10 text-cyan px-1.5 py-0.5 rounded-md font-medium">CONS</span>
             </NavLink>
           )}
         </nav>

@@ -49,6 +49,22 @@ export const deleteStory = (storyId) =>
 export const advanceProjectStatus = (projectId) =>
   api.patch(`/pipeline/${projectId}/status`).then(r => r.data)
 
+// ── Sprints lifecycle ────────────────────────────────────────
+
+export const getProjectSprints = (projectId) =>
+  api.get(`/pipeline/${projectId}/sprints`).then(r => r.data)
+
+// force=false (défaut) : si démarrage anticipé, l'API renvoie
+// { requires_confirmation: true, message } sans démarrer.
+// force=true : démarre malgré le warning de date.
+export const startSprint = (projectId, sprintNumber, force = false) =>
+  api.post(`/pipeline/${projectId}/sprints/${sprintNumber}/start`, { force })
+    .then(r => r.data)
+
+export const closeSprint = (projectId, sprintNumber) =>
+  api.post(`/pipeline/${projectId}/sprints/${sprintNumber}/close`)
+    .then(r => r.data)
+
 // ── Archive / Delete ──────────────────────────────────────────
 
 export const archiveProject = (projectId, reason) =>
@@ -108,9 +124,6 @@ export const updateSprintCapacities = (projectId, capacities) =>
 
 export const getStaffingMatching = (projectId) =>
   api.get(`/pipeline/${projectId}/staffing/matching`).then(r => r.data)
-
-export const resolveMatchingManualDecision = (projectId, body) =>
-  api.patch(`/pipeline/${projectId}/staffing/matching/manual-decision`, body).then(r => r.data)
 
 export const changeMatchingAssignment = (projectId, body) =>
   api.patch(`/pipeline/${projectId}/staffing/matching/change-assignment`, body).then(r => r.data)

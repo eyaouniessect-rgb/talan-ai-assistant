@@ -1,6 +1,6 @@
 // src/store/authStore.js
 import { create } from 'zustand'
-import { loginApi } from '../api/auth'
+import { loginApi, getMyProfile } from '../api/auth'
 
 // ── Helpers ───────────────────────────────────────────────
 const getInitials = (name) =>
@@ -29,6 +29,19 @@ export const useAuthStore = create((set) => ({
       },
       token: data.access_token,
     })
+    // Récupère le profil RH en best-effort (n'empêche pas la connexion si KO)
+    try {
+      const profile = await getMyProfile()
+      set(state => ({ user: { ...state.user, ...profile } }))
+    } catch { /* silent */ }
+  },
+
+  // Permet à un composant de rafraîchir les infos profil après login.
+  fetchProfile: async () => {
+    try {
+      const profile = await getMyProfile()
+      set(state => state.user ? { user: { ...state.user, ...profile } } : {})
+    } catch { /* silent */ }
   },
 
   logout: () => {
@@ -61,5 +74,10 @@ export const useAuthStore = create((set) => ({
         initials: getInitials(payload.name),
       },
     })
+
+    // Récupère les infos RH (seniority, équipe, dept…) en best-effort.
+    getMyProfile()
+      .then(profile => set(state => state.user ? { user: { ...state.user, ...profile } } : {}))
+      .catch(() => { /* silent */ })
   },
 }))

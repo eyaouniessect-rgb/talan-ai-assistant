@@ -9,6 +9,7 @@ import StoryDepsSection from "./StoryDepsSection";
 import CpmSection from "./CpmSection";
 import PriorisationSection from "./PriorisationSection";
 import StaffingSection from "./StaffingSection";
+import MonitoringSection from "./MonitoringSection";
 
 // ── Rendu du rapport de sécurité ──────────────────────────────
 const SEVERITY_STYLE = {
@@ -1307,6 +1308,10 @@ export default function PhaseResult({ phaseId, aiOutput, onContinue, projectId, 
 
   if (phaseId === "staffing") {
     return <StaffingSection aiOutput={aiOutput} projectId={projectId} project={project} onRefresh={onRefresh} />;
+  }
+
+  if (phaseId === "monitoring") {
+    return <MonitoringSection projectId={projectId} />;
   }
 
   return (

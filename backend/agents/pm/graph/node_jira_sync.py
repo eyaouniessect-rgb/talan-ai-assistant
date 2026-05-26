@@ -67,7 +67,9 @@ async def node_jira_sync(state: PMPipelineState) -> dict:
         elif phase == "story_deps":
             patch = await _sync_story_deps(state)
 
-        elif phase == "sprints":
+        elif phase == "staffing":
+            # Phase staffing : crée les sprints dans Jira + add stories au sprint.
+            # Les sprints sont produits par node_staffing (state["sprints"]).
             patch = await _sync_sprints(state)
 
         else:
@@ -396,16 +398,76 @@ async def _sync_story_deps(state: PMPipelineState) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# PHASE 7 — Sprints
+# PHASE STAFFING — Sprints (créés en Jira après matching validé)
 # ──────────────────────────────────────────────────────────────
 
 async def _sync_sprints(state: PMPipelineState) -> dict:
-    sprints   = state.get("sprints") or []
-    story_map = state.get("jira_story_map") or {}
-    print(f"\n[JIRA SYNC] >>> SPRINTS : {len(sprints)} sprints a creer dans Jira")
+    """
+    Après validation PM du staffing :
+      1. Persiste les affectations en `staffing_assignments` (DB)
+      2. Persiste les sprints en `sprints` (DB) → récupère leurs db_ids
+      3. Crée les sprints dans Jira et ajoute les stories
+      4. Met à jour pm.sprints.jira_sprint_id
+
+    La persistance DB est faite ici (et non dans node_staffing) pour que le
+    PM puisse modifier les affectations avant que les tables ne soient
+    écrites. node_jira_sync ne tourne que sur validation approuvée.
+    """
+    from agents.pm.agents.staffing.steps.matching.repository import persist_assignments
+    from agents.pm.agents.staffing.steps.story_distribution.repository import (
+        persist_sprints, update_sprint_jira_id,
+    )
+
+    sprints    = state.get("sprints") or []
+    project_id = state.get("project_id")
+    print(f"\n[JIRA SYNC] >>> STAFFING : persistance DB + {len(sprints)} sprints Jira")
+
+    # ── 1. Persistance staffing_assignments ────────────────────
+    staffing       = state.get("staffing") or {}
+    steps          = staffing.get("steps") or {}
+    matching_dump  = (steps.get("matching") or {}).get("result")
+    distrib_result = (steps.get("story_distribution") or {}).get("result")
+
+    if project_id and matching_dump:
+        try:
+            n = await persist_assignments(project_id, matching_dump)
+            print(f"[JIRA SYNC]   ↳ {n} affectation(s) persistées en DB")
+        except Exception as e:
+            print(f"[JIRA SYNC]   ⚠ persistance staffing_assignments échouée : {e}")
+
+    # ── 1b. Dériver crm.assignments depuis les affectations persistées ──
+    if project_id and matching_dump:
+        try:
+            from datetime import date as _date
+            from agents.pm.agents.staffing.steps.matching.crm_repository import upsert_crm_assignments
+            _sprint_start: _date | None = None
+            _sprint_end:   _date | None = None
+            if sprints:
+                _starts = [s["start_date"] for s in sprints if s.get("start_date")]
+                _ends   = [s["end_date"]   for s in sprints if s.get("end_date")]
+                if _starts:
+                    _sprint_start = _date.fromisoformat(min(_starts))
+                if _ends:
+                    _sprint_end = _date.fromisoformat(max(_ends))
+            m = await upsert_crm_assignments(project_id, _sprint_start, _sprint_end)
+            print(f"[JIRA SYNC]   ↳ {m} crm.assignment(s) upsertés (allocation% calculé)")
+        except Exception as e:
+            print(f"[JIRA SYNC]   ⚠ upsert crm.assignments échoué : {e}")
+
+    # ── 2. Persistance sprints (récupère les db_ids + jira_sprint_id préservés) ──
+    db_id_by_sn:   dict[int, int]      = {}
+    jira_id_by_sn: dict[int, int | None] = {}
+    if project_id and distrib_result:
+        try:
+            persisted = await persist_sprints(project_id, distrib_result)
+            db_id_by_sn   = {s["sprint_number"]: s["db_id"]          for s in persisted}
+            jira_id_by_sn = {s["sprint_number"]: s.get("jira_sprint_id") for s in persisted}
+            print(f"[JIRA SYNC]   ↳ {len(persisted)} sprint(s) persistés en DB")
+        except Exception as e:
+            print(f"[JIRA SYNC]   ⚠ persistance sprints échouée : {e}")
 
     if not sprints:
-        print("[JIRA SYNC] SKIP — state['sprints'] est vide")
+        print("[JIRA SYNC] SKIP Jira sprints — state['sprints'] est vide")
         return {}
 
     jira_project_key = state.get("jira_project_key", "")
@@ -415,30 +477,79 @@ async def _sync_sprints(state: PMPipelineState) -> dict:
         print("[JIRA SYNC] ERREUR — Board Jira introuvable pour le projet")
         return {}
 
+    # ── 3. Résolution db_story_id → jira_issue_key via DB ──────
+    db_stories   = await get_stories(project_id) if project_id else []
+    jira_by_dbid = {s.id: s.jira_issue_key for s in db_stories if s.jira_issue_key}
+    if not jira_by_dbid:
+        print("[JIRA SYNC] ⚠ aucune story n'a de clé Jira — sprints créés sans stories")
+
     sprint_map = {}
+    skipped    = 0
     errors     = 0
-    for i, sprint in enumerate(sprints):
+    for sprint in sprints:
+        sn = sprint.get("sprint_number")
         try:
+            # ── Dédup : sprint Jira déjà créé pour ce sprint_number ? ──
+            # Si oui, on saute le create_sprint (évite les doublons type
+            # "Sprint 1" + "IS Sprint 1" dans Jira) et on add juste les
+            # stories restantes (idempotent côté Jira API).
+            existing_jira_id = jira_id_by_sn.get(sn)
+            if existing_jira_id:
+                sprint_id = existing_jira_id
+                sprint_map[sn] = sprint_id
+                skipped += 1
+                story_ids = sprint.get("story_ids") or []
+                issue_keys = [
+                    jira_by_dbid[sid]
+                    for sid in story_ids
+                    if sid in jira_by_dbid
+                ]
+                if issue_keys:
+                    actions.add_issues_to_sprint(sprint_id, issue_keys)
+                print(
+                    f"[JIRA SYNC]   [SKIP] Sprint {sn} déjà dans Jira "
+                    f"(jira_id={sprint_id}) — {len(issue_keys)} stories (re)addées"
+                )
+                continue
+
+            # ── Création neuve dans Jira ───────────────────────
             sprint_id = actions.create_sprint(
                 board_id   = board_id,
                 name       = sprint["name"],
                 start_date = sprint.get("start_date", ""),
                 end_date   = sprint.get("end_date", ""),
             )
-            if sprint_id:
-                sprint_map[i] = sprint_id
-                story_ids  = sprint.get("story_ids") or []
-                issue_keys = [
-                    story_map.get(str(sid)) or story_map.get(sid)
-                    for sid in story_ids
-                    if story_map.get(str(sid)) or story_map.get(sid)
-                ]
-                if issue_keys:
-                    actions.add_issues_to_sprint(sprint_id, issue_keys)
-                print(f"[JIRA SYNC]   [OK] Sprint {i+1} '{sprint['name']}' → id={sprint_id} ({len(issue_keys)} stories)")
+            if not sprint_id:
+                continue
+
+            sprint_map[sn] = sprint_id
+
+            # Add stories au sprint Jira via db_story_id → jira_key
+            story_ids = sprint.get("story_ids") or []
+            issue_keys = [
+                jira_by_dbid[sid]
+                for sid in story_ids
+                if sid in jira_by_dbid
+            ]
+            if issue_keys:
+                actions.add_issues_to_sprint(sprint_id, issue_keys)
+
+            # ── 4. Bouclage : update pm.sprints.jira_sprint_id ──
+            db_id = db_id_by_sn.get(sn)
+            if db_id:
+                try:
+                    await update_sprint_jira_id(db_id, sprint_id)
+                except Exception as upd_err:
+                    print(f"[JIRA SYNC]   ⚠ update pm.sprints jira_sprint_id échec sprint {sn}: {upd_err}")
+
+            print(
+                f"[JIRA SYNC]   [OK] Sprint {sn} '{sprint['name']}' "
+                f"→ jira_id={sprint_id} ({len(issue_keys)}/{len(story_ids)} stories addées)"
+            )
         except Exception as e:
             errors += 1
-            print(f"[JIRA SYNC]   [ERREUR] Sprint {i+1} : {e}")
+            print(f"[JIRA SYNC]   [ERREUR] Sprint {sn} : {e}")
 
-    print(f"\n[JIRA SYNC] Sprints : {len(sprint_map)} crees, {errors} erreurs")
+    created_count = len(sprint_map) - skipped
+    print(f"\n[JIRA SYNC] Sprints : {created_count} créés, {skipped} déjà existants, {errors} erreurs")
     return {"jira_sprint_map": sprint_map}

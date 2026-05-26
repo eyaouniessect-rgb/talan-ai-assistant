@@ -12,7 +12,13 @@
 #   slack_get_user_profile   → profil d'un utilisateur par son ID
 # ═══════════════════════════════════════════════════════════
 
+import os
+import httpx
 from agents.slack.mcp_client import call_mcp
+
+# Token Slack pour les appels directs (le MCP officiel n'expose pas reactions.remove,
+# on appelle donc Slack en direct pour cette opération).
+_SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 
 
 async def send_message(channel: str, text: str) -> dict:
@@ -100,11 +106,41 @@ async def read_channel(channel: str, limit: int = 20) -> dict:
         else:
             author_name = uid or "Inconnu"
 
+        # Normaliser les alias emoji Slack (+1 == thumbsup, -1 == thumbsdown).
+        # On agrège count ET la liste des user_ids qui ont réagi pour permettre
+        # au LLM de savoir QUI a posé chaque réaction.
+        _EMOJI_ALIASES = {"+1": "thumbsup", "-1": "thumbsdown"}
+        reactions_map: dict[str, dict] = {}
+        for r in msg.get("reactions", []):
+            name = r.get("name")
+            if not name:
+                continue
+            canonical = _EMOJI_ALIASES.get(name, name)
+            entry = reactions_map.setdefault(canonical, {"count": 0, "users": []})
+            entry["count"] += r.get("count", 0)
+            entry["users"].extend(r.get("users", []))
+
+        # Résoudre les user_ids en noms lisibles via user_map déjà chargé
+        reactions_list = []
+        for emoji_name, info in reactions_map.items():
+            user_names = []
+            for uid in info["users"]:
+                if uid in user_map:
+                    user_names.append(user_map[uid]["name"])
+                else:
+                    user_names.append(uid)
+            reactions_list.append({
+                "name": emoji_name,
+                "count": info["count"],
+                "reacted_by": user_names,
+            })
+
         enriched.append({
             "author_name": author_name,
             "author_type": "bot" if is_from_bot else "user",
             "text":        text,
             "ts":          ts,
+            "reactions":   reactions_list,
         })
 
     return {"ok": True, "messages": enriched, "total": len(enriched)}
@@ -206,6 +242,61 @@ async def add_reaction(channel: str, timestamp: str, reaction: str) -> dict:
         "timestamp": timestamp,
         "reaction": reaction,
     })
+
+
+async def _slack_api_call(method: str, payload: dict) -> dict:
+    """
+    Appelle directement l'API Slack (utilisé pour reactions.remove qui n'est pas
+    exposé par le MCP officiel).
+    """
+    if not _SLACK_BOT_TOKEN:
+        return {"ok": False, "error": "SLACK_BOT_TOKEN absent de l'environnement"}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"https://slack.com/api/{method}",
+            headers={
+                "Authorization": f"Bearer {_SLACK_BOT_TOKEN}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=payload,
+        )
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "error": f"réponse non-JSON: {r.text[:200]}"}
+
+
+async def remove_reaction(channel: str, timestamp: str, reaction: str) -> dict:
+    """
+    Retire un emoji réaction d'un message Slack.
+    Appelle directement Slack (pas via MCP) car le MCP officiel
+    @modelcontextprotocol/server-slack n'expose pas reactions.remove.
+    Retente avec l'alias si Slack répond 'no_reaction' (ex: 'thumbsup' ↔ '+1').
+    """
+    _REVERSE_ALIASES = {
+        "thumbsup": "+1", "+1": "thumbsup",
+        "thumbsdown": "-1", "-1": "thumbsdown",
+    }
+
+    result = await _slack_api_call("reactions.remove", {
+        "channel": channel,
+        "timestamp": timestamp,
+        "name": reaction,
+    })
+
+    # Si la réaction n'est pas trouvée et qu'un alias existe, retente avec l'alias.
+    if isinstance(result, dict) and not result.get("ok"):
+        err = (result.get("error") or "").lower()
+        if "no_reaction" in err and reaction in _REVERSE_ALIASES:
+            alias = _REVERSE_ALIASES[reaction]
+            result = await _slack_api_call("reactions.remove", {
+                "channel": channel,
+                "timestamp": timestamp,
+                "name": alias,
+            })
+
+    return result
 
 
 async def get_user_profile(user_id: str) -> dict:

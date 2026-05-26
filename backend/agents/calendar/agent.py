@@ -362,31 +362,188 @@ async def search_meetings(query: str) -> str:
 @tool
 async def lookup_user_by_name(name: str) -> str:
     """
-    Recherche un utilisateur dans la base de données par son prénom ou nom complet.
-    Retourne son email et ses informations. Utilise cet outil pour trouver l'email
-    d'un participant avant de créer une réunion.
+    Recherche un ou plusieurs utilisateurs dans la base par prénom ou nom complet.
+    Retourne pour chaque correspondance : name, email, department, team, job_title.
+    Permet de désambiguïser quand plusieurs personnes portent le même prénom
+    (ex: 2 Rim → l'une en Data, l'autre en Cloud).
+
+    L'utilisateur connecté est exclu des résultats (on n'invite pas soi-même).
+    Le match est ancré au DÉBUT d'un mot du nom (ex: "Rim" matche "Rim Boughanmi"
+    mais PAS "Karim Mzoughi").
     """
     try:
         from sqlalchemy import select, or_
+        from sqlalchemy.orm import selectinload
         from app.database.connection import AsyncSessionLocal
         from app.database.models.public.user import User
+        from app.database.models.hris import Employee, Team, Department
+
+        query = (name or "").strip()
+        if not query:
+            return json.dumps({"found": False, "message": "Nom vide"}, ensure_ascii=False)
 
         async with AsyncSessionLocal() as session:
-            search = f"%{name.lower()}%"
-            result = await session.execute(
-                select(User).where(
-                    or_(
-                        User.name.ilike(search),
-                    )
+            # ILIKE large pour ramener un sur-ensemble de candidats,
+            # puis filtre Python sur début de mot pour éviter "Rim" → "Karim".
+            broad = f"%{query.lower()}%"
+            stmt = (
+                select(User)
+                .where(or_(User.name.ilike(broad), User.email.ilike(broad)))
+                .options(
+                    selectinload(User.employee)
+                    .selectinload(Employee.team)
+                    .selectinload(Team.department)
                 )
             )
-            users = result.scalars().all()
+            result = await session.execute(stmt)
+            users = result.scalars().unique().all()
+
+            # Filtre word-boundary : chaque mot du nom doit commencer par le
+            # token correspondant de la requête (ex: "rim boug" → "Rim Boughanmi" ✅,
+            # "rim" → "Karim Mzoughi" ❌).
+            q_tokens = [t for t in query.lower().split() if t]
+
+            def _name_matches(full_name: str) -> bool:
+                words = (full_name or "").lower().split()
+                if not q_tokens or not words:
+                    return False
+                if len(q_tokens) == 1:
+                    return any(w.startswith(q_tokens[0]) for w in words)
+                # multi-mots : un mot du nom doit commencer par chacun des tokens
+                remaining = list(words)
+                for tok in q_tokens:
+                    hit = next((w for w in remaining if w.startswith(tok)), None)
+                    if not hit:
+                        return False
+                    remaining.remove(hit)
+                return True
+
+            users = [u for u in users if _name_matches(u.name) or query.lower() in (u.email or "").lower()]
+
+            # Exclut l'utilisateur connecté (on ne s'invite pas soi-même)
+            if _current_user_id:
+                users = [u for u in users if u.id != _current_user_id]
 
             if not users:
-                return json.dumps({"found": False, "message": f"Aucun utilisateur trouvé pour '{name}'"}, ensure_ascii=False)
+                return json.dumps(
+                    {"found": False, "message": f"Aucun utilisateur trouvé pour '{name}'"},
+                    ensure_ascii=False,
+                )
 
-            matches = [{"name": u.name, "email": u.email} for u in users]
-            return json.dumps({"found": True, "users": matches}, ensure_ascii=False)
+            def _dept_name(u: "User") -> "str | None":
+                emp = getattr(u, "employee", None)
+                if not emp or not emp.team:
+                    return None
+                dept = emp.team.department
+                if not dept or not dept.name:
+                    return None
+                raw = dept.name.value if hasattr(dept.name, "value") else str(dept.name)
+                return raw.replace("_", " ").title()
+
+            def _team_name(u: "User") -> "str | None":
+                emp = getattr(u, "employee", None)
+                return emp.team.name if emp and emp.team else None
+
+            def _job_title(u: "User") -> "str | None":
+                emp = getattr(u, "employee", None)
+                return emp.job_title if emp else None
+
+            matches = [
+                {
+                    "name":       u.name,
+                    "email":      u.email,
+                    "department": _dept_name(u),
+                    "team":       _team_name(u),
+                    "job_title":  _job_title(u),
+                }
+                for u in users
+            ]
+            return json.dumps(
+                {"found": True, "count": len(matches), "users": matches},
+                ensure_ascii=False,
+            )
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@tool
+async def get_my_team() -> str:
+    """
+    Retourne la liste des membres de l'équipe du consultant connecté
+    (même team_id), avec leur nom, email et job_title.
+    Le manager direct est également inclus s'il existe.
+    L'utilisateur connecté est exclu (on ne s'invite pas soi-même).
+
+    Utiliser quand l'utilisateur dit "mon équipe", "mes collègues",
+    "réunion avec mon équipe", "toute l'équipe", etc.
+    Ne JAMAIS demander la liste des participants si cet outil peut la fournir.
+    """
+    try:
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        from app.database.connection import AsyncSessionLocal
+        from app.database.models.hris import Employee, SeniorityEnum
+        from app.database.models.public.user import User
+
+        if not _current_user_id:
+            return json.dumps({"error": "user_id non disponible"}, ensure_ascii=False)
+
+        async with AsyncSessionLocal() as session:
+            # Récupère l'employé connecté pour trouver son team_id
+            res = await session.execute(
+                select(Employee).where(Employee.user_id == _current_user_id)
+            )
+            me = res.scalar_one_or_none()
+            if not me:
+                return json.dumps(
+                    {"error": "Profil employé introuvable pour l'utilisateur connecté"},
+                    ensure_ascii=False,
+                )
+            if not me.team_id:
+                return json.dumps(
+                    {"error": "Vous n'êtes assigné à aucune équipe"},
+                    ensure_ascii=False,
+                )
+
+            # Tous les coéquipiers (même team_id) + le manager direct
+            stmt = (
+                select(Employee, User)
+                .join(User, Employee.user_id == User.id)
+                .where(
+                    (Employee.team_id == me.team_id)
+                    | (Employee.id == me.manager_id)
+                )
+                .options(selectinload(Employee.team))
+            )
+            rows = (await session.execute(stmt)).all()
+
+            members = []
+            seen = set()
+            for emp, usr in rows:
+                if usr.id == _current_user_id or usr.id in seen:
+                    continue
+                # Exclut le Directeur Général (seniority=PRINCIPAL) — il ne
+                # fait pas partie de l'équipe opérationnelle d'un consultant.
+                if emp.seniority == SeniorityEnum.PRINCIPAL:
+                    continue
+                seen.add(usr.id)
+                members.append({
+                    "name":      usr.name,
+                    "email":     usr.email,
+                    "job_title": emp.job_title,
+                    "is_manager": emp.id == me.manager_id,
+                })
+
+            if not members:
+                return json.dumps(
+                    {"found": False, "message": "Aucun coéquipier trouvé dans votre équipe"},
+                    ensure_ascii=False,
+                )
+
+            return json.dumps(
+                {"found": True, "count": len(members), "members": members},
+                ensure_ascii=False,
+            )
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -445,6 +602,7 @@ TOOLS = [
     search_meetings,
     lookup_user_by_name,
     get_my_manager,
+    get_my_team,
 ]
 
 
@@ -634,6 +792,14 @@ def _normalize(text: str) -> str:
 def _detect_ui_hint(text: str) -> "dict | None":
     """Analyse la réponse pour suggérer un composant UI interactif au frontend."""
     t = _normalize(text)
+
+    # ── Désambiguïsation d'homonymes ─────────────────────
+    # L'agent demande à l'utilisateur de choisir entre plusieurs personnes
+    # portant le même prénom. On signale needs_input mais sans Oui/Non.
+    if ("laquelle" in t or "lequel" in t) and (
+        "il existe" in t or "personnes" in t or "departement" in t or "equipe" in t
+    ):
+        return {"type": "user_disambiguation"}
 
     # ── Choix en ligne / présentiel ──────────────────────
     if ("en ligne" in t or "presentiel" in t or "distanciel" in t) and "?" in t:
